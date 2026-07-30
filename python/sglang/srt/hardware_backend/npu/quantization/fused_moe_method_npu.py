@@ -861,8 +861,6 @@ class NPUW4A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
             layer.w2_weight.data.transpose(1, 2).contiguous(), requires_grad=False
         )
 
-<<<<<<< HEAD
-=======
         # layer.w13_weight.data = self.pack_int4_to_int8(layer.w13_weight.data)
         # layer.w2_weight.data = self.pack_int4_to_int8(layer.w2_weight.data)
 
@@ -870,7 +868,6 @@ class NPUW4A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
         if self._maybe_apply_fuseep_weights(layer):
             return
 
->>>>>>> 072edbaa8 (bugfix)
         layer.w13_weight.data = npu_format_cast(layer.w13_weight.data)
         layer.w2_weight.data = npu_format_cast(layer.w2_weight.data)
 
