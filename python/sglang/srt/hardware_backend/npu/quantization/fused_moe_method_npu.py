@@ -476,6 +476,37 @@ def maybe_apply_fuseep_weights(layer: torch.nn.Module) -> bool:
     process_fuseep_weights(layer)
     return True
 
+def _summarize_layer_moe_param(param) -> str:
+    if param is None:
+        return "None"
+    tensor = param.data if isinstance(param, torch.nn.Parameter) else param
+    if not isinstance(tensor, torch.Tensor):
+        return f"type={type(tensor).__name__}"
+    return (
+        f"shape={tuple(tensor.shape)},dtype={tensor.dtype},device={tensor.device.type}"
+    )
+
+
+def _print_layer_moe_params_before_fuseep(layer: torch.nn.Module) -> None:
+    names = [
+        "w13_weight",
+        "w2_weight",
+        "w13_weight_scale",
+        "w2_weight_scale",
+        "w13_scale_bias",
+        "w2_scale_bias",
+        "w13_bias",
+        "w2_bias",
+        "w13_weight_offset",
+        "w2_weight_offset",
+    ]
+    parts = []
+    for name in names:
+        if hasattr(layer, name):
+            parts.append(
+                f"{name}={_summarize_layer_moe_param(getattr(layer, name))}"
+            )
+    print(f"[process_weights_after_loading] {' | '.join(parts)}", flush=True)
 
 class _NPUFusedMoEMethodBase(FusedMoEMethodBase):
 
@@ -830,6 +861,16 @@ class NPUW4A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
             layer.w2_weight.data.transpose(1, 2).contiguous(), requires_grad=False
         )
 
+<<<<<<< HEAD
+=======
+        # layer.w13_weight.data = self.pack_int4_to_int8(layer.w13_weight.data)
+        # layer.w2_weight.data = self.pack_int4_to_int8(layer.w2_weight.data)
+
+        _print_layer_moe_params_before_fuseep(layer)
+        if self._maybe_apply_fuseep_weights(layer):
+            return
+
+>>>>>>> 072edbaa8 (bugfix)
         layer.w13_weight.data = npu_format_cast(layer.w13_weight.data)
         layer.w2_weight.data = npu_format_cast(layer.w2_weight.data)
 
