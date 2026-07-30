@@ -112,7 +112,6 @@ def forward_fuseep(
             fuse_mode=fuse_mode,
         )
         return hidden_states
->>>>>>> 072edbaa8 (bugfix)
 
 
 def _permute_w13_weight_scale(w: torch.Tensor, tile_n: int) -> torch.Tensor:
