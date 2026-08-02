@@ -971,13 +971,28 @@ _BACKEND_API_PATHS = {
 
 _EMBEDDING_BACKENDS = frozenset(("sglang-embedding", "vllm-embedding"))
 
+_SGLANG_CACHE_FLUSH_SERVER_TIMEOUT_SECONDS = 60
+_SGLANG_CACHE_FLUSH_CLIENT_TIMEOUT_SECONDS = 65
+
 
 def flush_server_cache(base_url: str, backend: str) -> None:
     """Flush an engine's prefix cache after benchmark warmup."""
     cache_endpoint = (
         "/reset_prefix_cache" if backend.startswith("vllm") else "/flush_cache"
     )
-    response = requests.post(base_url + cache_endpoint, headers=get_auth_headers())
+    request_kwargs: Dict[str, Any] = {"headers": get_auth_headers()}
+    if backend.startswith("sglang"):
+        # Warmup responses can arrive before the scheduler removes the finished
+        # requests. Let the server defer the flush until it becomes idle.
+        request_kwargs.update(
+            {
+                "params": {
+                    "timeout": _SGLANG_CACHE_FLUSH_SERVER_TIMEOUT_SECONDS,
+                },
+                "timeout": _SGLANG_CACHE_FLUSH_CLIENT_TIMEOUT_SECONDS,
+            }
+        )
+    response = requests.post(base_url + cache_endpoint, **request_kwargs)
     response.raise_for_status()
 
 
