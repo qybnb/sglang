@@ -1566,14 +1566,26 @@ class Scheduler(
         self.result_queue: Deque[
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
-        enable_profiling = os.getenv("SGLANG_NPU_PROFILING",
-                                     "0") == "1" and torch.distributed.get_rank() == 0  # envs.SGLANG_NPU_PROFILING.get()
-        prof_bs = int(os.getenv("SGLANG_NPU_PROFILING_BS", 1))  # envs.SGLANG_NPU_PROFILING_BS.get()
-        prof_step = int(os.getenv("SGLANG_NPU_PROFILING_STEP", 10))  # envs.SGLANG_NPU_PROFILING_STEP.get()
-        profiling_stage: str = os.getenv("SGLANG_NPU_PROFILING_STAGE",
-                                         "decode")  # envs.SGLANG_NPU_PROFILING_STAGE.get()
+
+        enable_profiling: bool = (
+            os.getenv("ENABLE_PROFILING", "0") == "1" and self.ps.tp_rank == 0
+        )
+        prof_bs: int = int(os.getenv("PROFILING_BS", "1"))
+        profiling_stage: str = os.getenv("PROFILING_STAGE", "decode")
+        prof_active_steps: int = int(os.getenv("PROFILING_STEP", "5"))
+        prof_skip_first_steps = 1
+        prof_wait_steps = 1
+        prof_warmup_steps = 1
+        prof_total_steps = (
+            prof_skip_first_steps
+            + prof_wait_steps
+            + prof_warmup_steps
+            + prof_active_steps
+        )
         if enable_profiling:
             prof_cnt = 0
+            prof_started = False
+            prof_stopped = False
             import torch_npu
 
             experimental_config = torch_npu.profiler._ExperimentalConfig(
@@ -1592,7 +1604,11 @@ class Scheduler(
                     profiling_path
                 ),
                 schedule=torch_npu.profiler.schedule(
-                    wait=1, warmup=1, active=10, repeat=1, skip_first=1
+                    wait=prof_wait_steps,
+                    warmup=prof_warmup_steps,
+                    active=prof_active_steps,
+                    repeat=1,
+                    skip_first=prof_skip_first_steps,
                 ),
                 record_shapes=True,
                 profile_memory=True,
@@ -1639,32 +1655,40 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
-                if enable_profiling:
-                    is_prof_stage = False
-                    if (
-                            profiling_stage == "decode" and batch.forward_mode.is_decode()
-                    ) or (
-                            profiling_stage == "prefill" and batch.forward_mode.is_extend()
-                    ):
-                        is_prof_stage = True
+                is_prof_stage = False
+                if enable_profiling and not prof_stopped:
+                    is_prof_stage = (
+                        profiling_stage == "decode"
+                        and batch.forward_mode.is_decode()
+                    )
+                    # or (
+                    #     profiling_stage == "prefill"
+                    #     and batch.forward_mode.is_extend()
+                    # )
 
-                    if len(batch.reqs) >= prof_bs and prof_cnt == 0 and is_prof_stage:
+                    if (
+                        not prof_started
+                        and is_prof_stage
+                        and len(batch.reqs) >= prof_bs
+                    ):
                         prof.start()
-                        prof_cnt += 1
-                    if prof_cnt > 0 and is_prof_stage:
-                        prof_cnt += 1
-                    if prof_cnt == prof_step and is_prof_stage:
-                        torch.npu.synchronize()
-                        prof.stop()
+                        prof_started = True
+
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
+
                 if (
-                        enable_profiling
-                        and prof_cnt > 0
-                        and prof_cnt < prof_step
-                        and is_prof_stage
+                    enable_profiling
+                    and prof_started
+                    and not prof_stopped
+                    and is_prof_stage
                 ):
                     prof.step()
+                    prof_cnt += 1
+                    if prof_cnt >= prof_total_steps:
+                        torch.npu.synchronize()
+                        prof.stop()
+                        prof_stopped = True
             else:
                 batch_result = None
 
