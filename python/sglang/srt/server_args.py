@@ -5690,9 +5690,9 @@ class ServerArgs:
                 f"Ascend fused EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
             fuse_mode = envs.SGLANG_NPU_FUSED_MOE_MODE.get()
-            if fuse_mode not in [1, 2]:
+            if fuse_mode not in [1, 2, 3]:
                 raise ValueError(
-                    f"Wrong value of {fuse_mode=}, the NPU only support 1 or 2."
+                    f"Wrong value of {fuse_mode=}; the NPU supports only 1, 2, or 3."
                 )
             elif fuse_mode == 2:
                 assert (

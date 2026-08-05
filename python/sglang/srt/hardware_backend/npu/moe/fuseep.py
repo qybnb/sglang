@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.distributed import get_tp_group
+from sglang.srt.distributed import get_moe_ep_group
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import FusedMoEMode, npu_format_cast
 from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
@@ -29,7 +29,7 @@ _PARAMS_BYTES = 2  # bf16 — Ascend's Dispatch & Combine does not support fp16
 def _get_fuseep_buffer(layer: FusedMoE):
     DeepEPBuffer.set_dispatch_mode_as_low_latency()
     return DeepEPBuffer.get_deepep_buffer(
-        get_tp_group().device_group,
+        get_moe_ep_group().device_group,
         layer.hidden_size,
         _PARAMS_BYTES,
         DeepEPMode.LOW_LATENCY,
@@ -58,8 +58,14 @@ def forward_fuseep(
         weight_scales1 = to_list(layer.w13_weight_scale)
         weight_scales2 = to_list(layer.w2_weight_scale)
 
-        weight_scales1 = [t.squeeze(0) if (t.dim() == 2 and t.shape[0] == 1) else t for t in weight_scales1]
-        weight_scales2 = [t.squeeze(0) if (t.dim() == 2 and t.shape[0] == 1) else t for t in weight_scales2]
+        weight_scales1 = [
+            t.squeeze(0) if (t.dim() == 2 and t.shape[0] == 1) else t
+            for t in weight_scales1
+        ]
+        weight_scales2 = [
+            t.squeeze(0) if (t.dim() == 2 and t.shape[0] == 1) else t
+            for t in weight_scales2
+        ]
 
         # l1_bias = layer.w13_weight_scale
         # l2_bias = layer.w13_weight_scale
@@ -67,11 +73,9 @@ def forward_fuseep(
         # import deepep.bufferf
         buf = _get_fuseep_buffer(layer)
         # print(f"================= {weight1.shape=} {weight1.dtype=}", flush=True)
-        expert_per_rank =max(1,layer.num_experts//int(get_moe_expert_parallel_world_size()))
-        num_max_dispatch_tokens_per_rank = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
-        # There is a trade-off between memory and performance, which can be configured here via settings.
-        #max_recv_token_num = max(1, num_max_dispatch_tokens_per_rank * int(get_moe_expert_parallel_world_size()) * min(layer.top_k, expert_per_rank))
-        max_recv_token_num = 131072
+        num_max_dispatch_tokens_per_rank = (
+            envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+        )
         out, _ = buf.fused_deep_moe(
             x=hidden_states,
             topk_idx=topk_output.topk_ids.to(torch.int32),

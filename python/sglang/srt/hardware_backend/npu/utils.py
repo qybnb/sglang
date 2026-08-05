@@ -464,6 +464,7 @@ class NPUACLFormat(IntEnum):
 class FusedMoEMode(IntEnum):
     FUSED_DEEP_MOE = 1
     DISPATCH_FFN_COMBINE = 2
+    MEGA_MOE = 3
 
 
 def _call_once(fn: Callable):
