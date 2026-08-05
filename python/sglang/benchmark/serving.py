@@ -1539,8 +1539,17 @@ async def benchmark(
                 "internal_states" in server_info_json
                 and server_info_json["internal_states"]
             ):
-                accept_length = server_info_json["internal_states"][0].get(
-                    "avg_spec_accept_length", None
+                # /server_info returns one scheduler state per DP rank.
+                internal_states = server_info_json["internal_states"]
+                accept_lengths = [
+                    state["avg_spec_accept_length"]
+                    for state in internal_states
+                    if state.get("avg_spec_accept_length") is not None
+                ]
+                accept_length = (
+                    sum(accept_lengths) / len(accept_lengths)
+                    if accept_lengths
+                    else None
                 )
             else:
                 accept_length = None
