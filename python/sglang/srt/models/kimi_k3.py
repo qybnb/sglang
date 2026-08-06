@@ -97,6 +97,46 @@ from sglang.srt.hardware_backend.npu.utils import situ_and_mul, apply_attn_res
 logger = logging.getLogger(__name__)
 
 
+def _log_kimi_k3_npu_prefill_cp_input(
+    *,
+    attention_type: str,
+    layer_id: int,
+    hidden_states: torch.Tensor,
+    forward_batch: ForwardBatch,
+) -> None:
+    """Log whether NPU prefill CP feeds full or rank-local tokens to attention."""
+    parallel = get_parallel()
+    if (
+        not is_npu()
+        or parallel.attn_cp_size <= 1
+        or not forward_batch.forward_mode.is_context_parallel_extend()
+    ):
+        return
+
+    extend_seq_lens_cpu = getattr(forward_batch, "extend_seq_lens_cpu", None)
+    if extend_seq_lens_cpu is None:
+        full_extend_tokens = None
+    elif isinstance(extend_seq_lens_cpu, torch.Tensor):
+        full_extend_tokens = int(extend_seq_lens_cpu.sum().item())
+    else:
+        full_extend_tokens = sum(int(length) for length in extend_seq_lens_cpu)
+
+    logger.info(
+        "[KIMI_K3_NPU_PCP_INPUT] attention=%s layer=%d "
+        "cp_rank=%d cp_size=%d attn_tp_rank=%d attn_tp_size=%d "
+        "local_tokens=%d full_extend_tokens=%s has_cp_metadata=%s",
+        attention_type,
+        layer_id,
+        parallel.attn_cp_rank,
+        parallel.attn_cp_size,
+        parallel.attn_tp_rank,
+        parallel.attn_tp_size,
+        hidden_states.shape[0],
+        full_extend_tokens,
+        forward_batch.attn_cp_metadata is not None,
+    )
+
+
 class _NoopRotaryEmbedding(nn.Module):
     """Preserve Kimi MLA's skip_rope semantics on backends that call RoPE."""
 
@@ -149,6 +189,12 @@ class KimiMLAAttention(DeepseekV2AttentionMLA):
         zero_allocator: BumpAllocator,
         **kwargs,
     ):
+        _log_kimi_k3_npu_prefill_cp_input(
+            attention_type="MLA",
+            layer_id=self.layer_id,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+        )
         if hidden_states.shape[0] == 0:
             return hidden_states
 
@@ -702,6 +748,12 @@ class KimiDeltaAttention(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ) -> None:
+        _log_kimi_k3_npu_prefill_cp_input(
+            attention_type="KDA",
+            layer_id=self.layer_idx,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+        )
         if hidden_states.shape[0] == 0:
             return hidden_states
 
