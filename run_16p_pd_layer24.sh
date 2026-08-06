@@ -29,6 +29,13 @@ if [[ ! -f "${MODEL_PATH}/config.json" ]]; then
     exit 2
 fi
 
+# SGLang probes its own loopback HTTP endpoint during startup. Proxy variables
+# can redirect that warmup request to an unrelated router/proxy and make an
+# otherwise healthy server terminate after the warmup timeout.
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
+export NO_PROXY="${NO_PROXY:+${NO_PROXY},}127.0.0.1,localhost"
+export no_proxy="${NO_PROXY}"
+
 PREFILL_PORT="${PREFILL_PORT:-30000}"
 DECODE_PORT="${DECODE_PORT:-30100}"
 ROUTER_PORT="${ROUTER_PORT:-6688}"
