@@ -51,6 +51,28 @@ def _apply_deepseek_ocr_overrides(config, model):
     config._name_or_path = model
 
 
+def _apply_model_override_args(config, overrides: dict) -> None:
+    """Apply model overrides without replacing nested config objects.
+
+    ``PretrainedConfig.update`` assigns values directly, so an override such
+    as ``{"text_config": {"num_hidden_layers": 24}}`` would replace a
+    multimodal model's ``text_config`` object with a plain dictionary.  Walk
+    existing config objects and dictionaries recursively instead.
+    """
+    for key, value in overrides.items():
+        current_value = (
+            config.get(key) if isinstance(config, dict) else getattr(config, key, None)
+        )
+        if isinstance(value, dict) and isinstance(current_value, dict):
+            _apply_model_override_args(current_value, value)
+        elif isinstance(value, dict) and hasattr(current_value, "update"):
+            _apply_model_override_args(current_value, value)
+        elif isinstance(config, dict):
+            config[key] = value
+        else:
+            setattr(config, key, value)
+
+
 @register_model_config_parser("hf")
 class HfModelConfigParser(ModelConfigParserBase):
     def parse(
@@ -231,7 +253,7 @@ def get_config(
     )
 
     if model_override_args:
-        config.update(model_override_args)
+        _apply_model_override_args(config, model_override_args)
 
     if is_gguf:
         if config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:

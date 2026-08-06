@@ -99,8 +99,10 @@ from sglang.srt.model_loader.weight_utils import (
     fastsafetensors_weights_iterator,
     filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
+    filter_kimi_k3_safetensors_files_for_layer_limit,
     get_gguf_extra_tensor_names,
     get_quant_config,
+    is_kimi_k3_weight_within_layer_limit,
     gguf_quant_weights_iterator,
     initialize_dummy_weights,
     maybe_add_mtp_safetensors,
@@ -548,6 +550,7 @@ class DefaultModelLoader(BaseModelLoader):
             source.model_or_path, source.revision, source.fall_back_to_pt
         )
 
+        weight_name_filter = None
         if use_safetensors and source.model_config is not None:
             hf_weights_files = maybe_add_mtp_safetensors(
                 hf_weights_files,
@@ -555,6 +558,29 @@ class DefaultModelLoader(BaseModelLoader):
                 "model.safetensors.index.json",
                 source.model_config.hf_config,
             )
+            hf_config = source.model_config.hf_config
+            text_overrides = source.model_config.model_override_args.get(
+                "text_config", {}
+            )
+            if (
+                getattr(hf_config, "model_type", None) == "kimi_k3"
+                and isinstance(text_overrides, dict)
+                and "num_hidden_layers" in text_overrides
+            ):
+                hf_weights_files = (
+                    filter_kimi_k3_safetensors_files_for_layer_limit(
+                        hf_weights_files,
+                        hf_folder,
+                        "model.safetensors.index.json",
+                        int(text_overrides["num_hidden_layers"]),
+                    )
+                )
+                num_hidden_layers = int(text_overrides["num_hidden_layers"])
+                weight_name_filter = lambda name: (
+                    is_kimi_k3_weight_within_layer_limit(
+                        name, num_hidden_layers
+                    )
+                )
 
         if self.load_config.load_format == LoadFormat.NPCACHE:
             # Currently np_cache only support *.bin checkpoints
@@ -577,6 +603,7 @@ class DefaultModelLoader(BaseModelLoader):
             if self.load_config.load_format == LoadFormat.FASTSAFETENSORS:
                 weights_iterator = fastsafetensors_weights_iterator(
                     hf_weights_files,
+                    weight_name_filter=weight_name_filter,
                 )
             elif use_multithread:
                 weights_iterator = buffered_multi_thread_safetensors_weights_iterator(
@@ -588,6 +615,7 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch=weight_loader_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
+                    weight_name_filter=weight_name_filter,
                 )
             else:
                 weights_iterator = safetensors_weights_iterator(
@@ -596,6 +624,7 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch=weight_loader_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
+                    weight_name_filter=weight_name_filter,
                 )
 
         else:

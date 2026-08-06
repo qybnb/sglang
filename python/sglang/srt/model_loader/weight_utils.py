@@ -668,6 +668,127 @@ def filter_duplicate_safetensors_files(
     return hf_weights_files
 
 
+_KIMI_K3_LANGUAGE_LAYER_PATTERNS = (
+    re.compile(r"^language_model\.model\.layers\.(\d+)\."),
+    re.compile(r"^model\.layers\.(\d+)\."),
+)
+
+
+def get_kimi_k3_language_layer_id(weight_name: str) -> Optional[int]:
+    for pattern in _KIMI_K3_LANGUAGE_LAYER_PATTERNS:
+        match = pattern.match(weight_name)
+        if match is not None:
+            return int(match.group(1))
+    return None
+
+
+def is_kimi_k3_weight_within_layer_limit(
+    weight_name: str, num_hidden_layers: int
+) -> bool:
+    layer_id = get_kimi_k3_language_layer_id(weight_name)
+    return layer_id is None or layer_id < num_hidden_layers
+
+
+def filter_kimi_k3_safetensors_files_for_layer_limit(
+    hf_weights_files: List[str],
+    hf_folder: str,
+    index_file: str,
+    num_hidden_layers: int,
+) -> List[str]:
+    """Skip shards that contain only truncated Kimi-K3 language layers.
+
+    Mixed shards remain in the list because they may also contain retained
+    tensors. The safetensors iterator's name filter avoids materializing
+    truncated tensors encountered in such a shard.
+    """
+    requested_index_path = os.path.join(hf_folder, index_file)
+    index_paths = [requested_index_path]
+    index_paths.extend(
+        path
+        for path in sorted(
+            glob.glob(os.path.join(hf_folder, "*.safetensors.index.json"))
+        )
+        if path != requested_index_path
+    )
+
+    index_file_name = None
+    weight_map = None
+    discovered_layer_ids = set()
+    for candidate in index_paths:
+        if not os.path.isfile(candidate):
+            continue
+        try:
+            with open(candidate) as f:
+                candidate_weight_map = json.load(f)["weight_map"]
+        except (KeyError, OSError, TypeError, json.JSONDecodeError):
+            logger.warning(
+                "Ignoring unreadable safetensors index while applying the "
+                "Kimi-K3 runtime layer limit: %s",
+                candidate,
+                exc_info=True,
+            )
+            continue
+
+        candidate_layer_ids = {
+            layer_id
+            for weight_name in candidate_weight_map
+            if (layer_id := get_kimi_k3_language_layer_id(weight_name)) is not None
+        }
+        if candidate_layer_ids:
+            index_file_name = candidate
+            weight_map = candidate_weight_map
+            discovered_layer_ids = candidate_layer_ids
+            break
+
+    if index_file_name is None or weight_map is None:
+        logger.warning(
+            "Cannot filter Kimi-K3 shards for the %d-layer runtime limit "
+            "because no matching *.safetensors.index.json was found in %s; "
+            "all weight files will be scanned.",
+            num_hidden_layers,
+            hf_folder,
+        )
+        return hf_weights_files
+
+    retained_weight_files = set()
+    for weight_name, weight_file in weight_map.items():
+        if is_kimi_k3_weight_within_layer_limit(weight_name, num_hidden_layers):
+            retained_weight_files.add(os.path.join(hf_folder, weight_file))
+
+    checkpoint_num_layers = max(discovered_layer_ids) + 1
+    if not 1 <= num_hidden_layers <= checkpoint_num_layers:
+        raise ValueError(
+            "Kimi-K3 runtime num_hidden_layers must be in "
+            f"[1, {checkpoint_num_layers}], got {num_hidden_layers}"
+        )
+
+    missing_retained_layers = set(range(num_hidden_layers)) - discovered_layer_ids
+    if missing_retained_layers:
+        raise ValueError(
+            "Kimi-K3 checkpoint index is missing retained layers: "
+            f"{sorted(missing_retained_layers)}"
+        )
+
+    indexed_weight_files = {
+        os.path.join(hf_folder, weight_file) for weight_file in weight_map.values()
+    }
+    filtered_files = [
+        path
+        for path in hf_weights_files
+        if path not in indexed_weight_files or path in retained_weight_files
+    ]
+    logger.info(
+        "Kimi-K3 runtime layer limit %d/%d using %s: loading %d/%d "
+        "safetensors shards",
+        num_hidden_layers,
+        checkpoint_num_layers,
+        os.path.basename(index_file_name),
+        len(filtered_files),
+        len(hf_weights_files),
+    )
+    return filtered_files
+
+
 def maybe_add_mtp_safetensors(
     hf_weights_files: List[str], hf_folder: str, index_file: str, hf_config
 ) -> List[str]:
@@ -933,6 +1054,7 @@ def safetensors_weights_iterator(
     prefetch: bool = False,
     prefetch_num_threads: int = 4,
     drop_cache_after_load: bool = False,
+    weight_name_filter: Optional[Callable[[str], bool]] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
     enable_tqdm = (
@@ -955,17 +1077,20 @@ def safetensors_weights_iterator(
             with open(st_file, "rb") as f:
                 result = safetensors.torch.load(f.read())
                 for name in sorted(result.keys()):
-                    yield name, result[name]
+                    if weight_name_filter is None or weight_name_filter(name):
+                        yield name, result[name]
         else:
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
                 for name in f.keys():
-                    yield name, f.get_tensor(name)
+                    if weight_name_filter is None or weight_name_filter(name):
+                        yield name, f.get_tensor(name)
         if drop_cache_after_load:
             _drop_file_cache_after_load(st_file)
 
 
 def fastsafetensors_weights_iterator(
     hf_weights_files: List[str],
+    weight_name_filter: Optional[Callable[[str], bool]] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """
     Iterate over the weights in the model safetensor files
@@ -1011,6 +1136,8 @@ def fastsafetensors_weights_iterator(
             try:
                 keys = list(fb.key_to_rank_lidx.keys())
                 for k in keys:
+                    if weight_name_filter is not None and not weight_name_filter(k):
+                        continue
                     t = fb.get_tensor(k)
                     yield k, t
             finally:
@@ -1024,6 +1151,7 @@ def multi_thread_safetensors_weights_iterator(
     max_workers: int,
     disable_mmap: bool = False,
     drop_cache_after_load: bool = False,
+    weight_name_filter: Optional[Callable[[str], bool]] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Multi-Thread iterate over the weights in the model safetensor files."""
     enable_tqdm = (
@@ -1034,9 +1162,19 @@ def multi_thread_safetensors_weights_iterator(
         if disable_mmap:
             with open(st_file, "rb") as f:
                 result = safetensors.torch.load(f.read())
+            if weight_name_filter is not None:
+                result = {
+                    key: tensor
+                    for key, tensor in result.items()
+                    if weight_name_filter(key)
+                }
         else:
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
-                result = {k: f.get_tensor(k) for k in f.keys()}
+                result = {
+                    k: f.get_tensor(k)
+                    for k in f.keys()
+                    if weight_name_filter is None or weight_name_filter(k)
+                }
 
         return st_file, result
 
@@ -1070,6 +1208,7 @@ def buffered_multi_thread_safetensors_weights_iterator(
     prefetch: bool = False,
     prefetch_num_threads: int = 4,
     drop_cache_after_load: bool = False,
+    weight_name_filter: Optional[Callable[[str], bool]] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Multi-threaded safetensor loader with bounded memory via a sliding window.
 
@@ -1089,9 +1228,19 @@ def buffered_multi_thread_safetensors_weights_iterator(
         if disable_mmap:
             with open(st_file, "rb") as f:
                 result = safetensors.torch.load(f.read())
+            if weight_name_filter is not None:
+                result = {
+                    key: tensor
+                    for key, tensor in result.items()
+                    if weight_name_filter(key)
+                }
         else:
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
-                result = {k: f.get_tensor(k) for k in f.keys()}
+                result = {
+                    k: f.get_tensor(k)
+                    for k in f.keys()
+                    if weight_name_filter is None or weight_name_filter(k)
+                }
         return result
 
     # Sliding window: max_workers loading + 1 prefetched.

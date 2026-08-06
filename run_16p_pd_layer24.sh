@@ -4,9 +4,9 @@
 # GPU/NPU 0-7: prefill, 8-15: decode.
 #
 # Usage:
-#   MODEL_PATH=/path/to/Kimi-K3-layer24 ./run_16p_pd_layer24.sh prefill
-#   MODEL_PATH=/path/to/Kimi-K3-layer24 ./run_16p_pd_layer24.sh decode
-#   MODEL_PATH=/path/to/Kimi-K3-layer24 ./run_16p_pd_layer24.sh router
+#   MODEL_PATH=/path/to/full/Kimi-K3 ./run_16p_pd_layer24.sh prefill
+#   MODEL_PATH=/path/to/full/Kimi-K3 ./run_16p_pd_layer24.sh decode
+#   MODEL_PATH=/path/to/full/Kimi-K3 ./run_16p_pd_layer24.sh router
 #
 set -euo pipefail
 
@@ -35,6 +35,11 @@ ROUTER_PORT="${ROUTER_PORT:-6688}"
 BOOTSTRAP_PORT="${BOOTSTRAP_PORT:-8998}"
 MF_STORE_PORT="${MF_STORE_PORT:-24669}"
 TP_SIZE="${TP_SIZE:-8}"
+NUM_HIDDEN_LAYERS="${NUM_HIDDEN_LAYERS:-24}"
+if [[ ! "${NUM_HIDDEN_LAYERS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "NUM_HIDDEN_LAYERS must be a positive integer." >&2
+    exit 2
+fi
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.84}"
 MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-32768}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-16}"
@@ -73,6 +78,7 @@ COMMON_ARGS=(
     --model-loader-extra-config '{"enable_multithread_load": true}'
     --model-path "${MODEL_PATH}"
     --tokenizer-path "${MODEL_PATH}"
+    --json-model-override-args "{\"text_config\":{\"num_hidden_layers\":${NUM_HIDDEN_LAYERS}}}"
     --trust-remote-code
     --attention-backend ascend
     --device npu
@@ -93,7 +99,7 @@ COMMON_ARGS=(
 case "${ROLE}" in
     prefill)
         LOG_FILE="${LOG_DIR}/prefill_$(date '+%Y-%m-%d_%H-%M-%S').log"
-        echo "Starting Kimi-K3 layer24 prefill on NPU 0-7; log=${LOG_FILE}"
+        echo "Starting Kimi-K3 ${NUM_HIDDEN_LAYERS}-layer prefill on NPU 0-7; log=${LOG_FILE}"
         python3 -m sglang.launch_server \
             "${COMMON_ARGS[@]}" \
             --base-gpu-id 0 \
@@ -107,7 +113,7 @@ case "${ROLE}" in
         ;;
     decode)
         LOG_FILE="${LOG_DIR}/decode_$(date '+%Y-%m-%d_%H-%M-%S').log"
-        echo "Starting Kimi-K3 layer24 decode on NPU 8-15; log=${LOG_FILE}"
+        echo "Starting Kimi-K3 ${NUM_HIDDEN_LAYERS}-layer decode on NPU 8-15; log=${LOG_FILE}"
         python3 -m sglang.launch_server \
             "${COMMON_ARGS[@]}" \
             --base-gpu-id 8 \
