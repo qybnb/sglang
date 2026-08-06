@@ -42,9 +42,14 @@ ROUTER_PORT="${ROUTER_PORT:-6688}"
 BOOTSTRAP_PORT="${BOOTSTRAP_PORT:-8998}"
 MF_STORE_PORT="${MF_STORE_PORT:-24669}"
 TP_SIZE="${TP_SIZE:-8}"
+DP_SIZE="${DP_SIZE:-2}"
 NUM_HIDDEN_LAYERS="${NUM_HIDDEN_LAYERS:-24}"
 if [[ ! "${NUM_HIDDEN_LAYERS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "NUM_HIDDEN_LAYERS must be a positive integer." >&2
+    exit 2
+fi
+if [[ ! "${DP_SIZE}" =~ ^[2-9][0-9]*$ ]] || (( TP_SIZE % DP_SIZE != 0 )); then
+    echo "DP_SIZE must be greater than 1 and evenly divide TP_SIZE (got DP_SIZE=${DP_SIZE}, TP_SIZE=${TP_SIZE})." >&2
     exit 2
 fi
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.84}"
@@ -92,6 +97,9 @@ COMMON_ARGS=(
     --quantization modelslim
     --dtype bfloat16
     --tp-size "${TP_SIZE}"
+    --enable-dp-attention
+    --dp-size "${DP_SIZE}"
+    --enable-dp-lm-head
     --page-size "${PAGE_SIZE}"
     --mem-fraction-static "${MEM_FRACTION_STATIC}"
     --max-total-tokens "${MAX_TOTAL_TOKENS}"
@@ -129,7 +137,7 @@ case "${ROLE}" in
             --disaggregation-decode-extra-slots 8 \
             --chunked-prefill-size -1 \
             --deepep-mode low_latency \
-            --cuda-graph-bs 1 4 8 16 \
+            --cuda-graph-bs 8 \
             --port "${DECODE_PORT}" 2>&1 | tee "${LOG_FILE}"
         ;;
     router)
