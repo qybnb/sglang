@@ -1027,6 +1027,20 @@ class NPUW4A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
     ):
         from sgl_kernel_npu.activation.swiglu_quant import swiglu_quant
 
+        # An idle DP-attention rank can receive no tokens from DeepEP. Avoid
+        # passing per_token_scale=[None] to npu_grouped_matmul, but keep the
+        # caller on the DeepEP combine path so all EP ranks remain synchronized.
+        if hidden_states.shape[0] == 0:
+            return hidden_states.to(dtype=output_dtype)
+
+        # Older/inter-node Ascend DeepEP paths can still return BF16 even when
+        # the W4A8 dispatcher requests INT8. Quantize the received, already
+        # expert-grouped tokens locally in that compatibility case.
+        if hidden_states_scale is None:
+            hidden_states, hidden_states_scale = torch.ops.npu.npu_dynamic_quant(
+                hidden_states
+            )
+
         hidden_states = torch.ops.npu.npu_grouped_matmul(
             x=[hidden_states],
             weight=[layer.w13_weight],

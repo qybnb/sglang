@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -548,6 +549,14 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         # However, doing this would incur an unknown synchronization error, but keeping
         # `handle` as a member variable works.
 
+        dispatch_kwargs = {}
+        if _is_npu and "quant_mode" in inspect.signature(buffer.dispatch).parameters:
+            # Newer Ascend DeepEP intranode kernels no longer consult
+            # DEEP_NORMAL_MODE_USE_INT8_QUANT in normal dispatch. Without an
+            # explicit mode they return BF16 and no per-token scale, which is
+            # incompatible with W4A8 grouped matmul.
+            dispatch_kwargs["quant_mode"] = self.deepep_output_dtype.value
+
         _deepep_precompile_tp_barrier()
         (
             recv_x,
@@ -569,6 +578,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
             expert_alignment=128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1,
             config=DeepEPConfig.get_instance().normal_dispatch_config,
+            **dispatch_kwargs,
         )
         get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
             num_recv_tokens_per_expert,
