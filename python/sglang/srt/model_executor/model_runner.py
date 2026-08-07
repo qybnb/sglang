@@ -128,6 +128,7 @@ from sglang.srt.layers.cp.utils import (
     get_cp_strategy,
 )
 from sglang.srt.layers.dp_attention import (
+    get_attention_cp_group,
     get_attention_tp_group,
     initialize_dp_attention,
 )
@@ -1350,6 +1351,43 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             if is_npu():
                 register_sgl_tp_rank(self.gpu_id)
+
+            # HCCL communicators allocate their large device buffers lazily on
+            # the first collective.  Prefill CP introduces separate TP, CP and
+            # attention-TP communicators; if they are first touched after the
+            # KV/state pools consume the static-memory budget, DeepEP's first
+            # NotifyDispatch can fail while allocating its HCCL resources.
+            # Warm each distinct communicator before taking the baseline memory
+            # measurement below so cache sizing accounts for those buffers.
+            if (
+                is_npu()
+                and self.server_args.disaggregation_mode == "prefill"
+                and self.attn_cp_size > 1
+            ):
+                warmup_start = time.perf_counter()
+                seen_groups = set()
+                warmed_groups = []
+                warmup_tensor = torch.zeros(1, device=self.device)
+                for group_name, coordinator in (
+                    ("tp", get_tp_group()),
+                    ("attn_cp", get_attention_cp_group()),
+                    ("attn_tp", get_attention_tp_group()),
+                ):
+                    if coordinator.world_size <= 1:
+                        continue
+                    group_handle = coordinator.device_group
+                    group_key = id(group_handle)
+                    if group_key in seen_groups:
+                        continue
+                    seen_groups.add(group_key)
+                    dist.all_reduce(warmup_tensor, group=group_handle)
+                    warmed_groups.append(f"{group_name}:{coordinator.world_size}")
+                current_platform.synchronize()
+                logger.info(
+                    "NPU prefill-CP HCCL warmup completed in %.3fs (%s)",
+                    time.perf_counter() - warmup_start,
+                    ", ".join(warmed_groups),
+                )
 
             # Pre-warm NCCL/RCCL to eliminate cold-start latency in first request
             # Controlled by --pre-warm-nccl flag (default: enabled on AMD GPUs)
