@@ -78,8 +78,12 @@ class AscendTransferEngine(MooncakeTransferEngine):
             self.store_url, self.session_id, self.role, self.npu_id, trans_op_type
         )
         if ret_value != 0:
-            logger.error("Ascend Transfer Engine initialization failed.")
-            raise RuntimeError("Ascend Transfer Engine initialization failed.")
+            raise RuntimeError(
+                "Ascend Transfer Engine initialization failed: "
+                f"ret={ret_value}, role={self.role}, store_url={self.store_url}, "
+                f"session_id={self.session_id}, npu_id={self.npu_id}, "
+                f"protocol={transfer_protocol or 'sdma'}"
+            )
 
     def batch_register(self, ptrs: List[int], lengths: List[int]):
         try:

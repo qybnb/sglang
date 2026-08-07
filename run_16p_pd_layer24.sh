@@ -141,9 +141,15 @@ export SGLANG_MAMBA_CONV_DTYPE="${SGLANG_MAMBA_CONV_DTYPE:-bfloat16}"
 # Both PD nodes must register with the same MemFabric config store.  The store
 # is created by the rank-0 prefill process and therefore lives on PREFILL_HOST.
 export ASCEND_MF_STORE_URL="${ASCEND_MF_STORE_URL:-tcp://${PREFILL_HOST}:${MF_STORE_PORT}}"
-# Prefill and decode are on different hosts, so SDMA cannot be used for the
-# KV/KDA-state transfer.  Callers may override this for a different fabric.
-export ASCEND_MF_TRANSFER_PROTOCOL="${ASCEND_MF_TRANSFER_PROTOCOL:-device_rdma}"
+# A3/SuperPod uses the default SDMA MemFabric path. Atlas A2 deployments with
+# a configured RoCE fabric can override this with device_rdma.
+export ASCEND_MF_TRANSFER_PROTOCOL="${ASCEND_MF_TRANSFER_PROTOCOL:-sdma}"
+export ASCEND_MF_LOG_LEVEL="${ASCEND_MF_LOG_LEVEL:-1}"
+if [[ "${ROLE}" == "prefill" ]]; then
+    export SGLANG_HOST_IP="${SGLANG_HOST_IP:-${PREFILL_HOST}}"
+elif [[ "${ROLE}" == "decode" ]]; then
+    export SGLANG_HOST_IP="${SGLANG_HOST_IP:-${DECODE_HOST}}"
+fi
 # K3 uses the model-boundary CP-v2 path: shard embeddings before the text
 # backbone and gather hidden states before logits.  The legacy MLA CP path
 # assumes attention-TP=1 and cannot represent the CP4 x attention-TP2 layout.
@@ -176,7 +182,8 @@ case "${ROLE}" in
         LOG_FILE="${LOG_DIR}/prefill_$(date '+%Y-%m-%d_%H-%M-%S').log"
         echo "Starting Kimi-K3 ${NUM_HIDDEN_LAYERS}-layer prefill at ${PREFILL_HOST} on NPU ${PREFILL_BASE_GPU_ID}-$((PREFILL_BASE_GPU_ID + TP_SIZE - 1))" \
             "(TP=${TP_SIZE}, DP=${PREFILL_DP_SIZE}, CP=${PREFILL_CP_SIZE}, attention-TP=${PREFILL_ATTN_TP_SIZE}," \
-            "HCCL=${HCCL_BUFFSIZE}MB, DeepEP-round=${DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS}x${DEEPEP_NORMAL_LONG_SEQ_ROUND});" \
+            "HCCL=${HCCL_BUFFSIZE}MB, MF=${ASCEND_MF_TRANSFER_PROTOCOL}," \
+            "DeepEP-round=${DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS}x${DEEPEP_NORMAL_LONG_SEQ_ROUND});" \
             "log=${LOG_FILE}"
         python3 -m sglang.launch_server \
             "${COMMON_ARGS[@]}" \
@@ -198,7 +205,8 @@ case "${ROLE}" in
     decode)
         LOG_FILE="${LOG_DIR}/decode_$(date '+%Y-%m-%d_%H-%M-%S').log"
         echo "Starting Kimi-K3 ${NUM_HIDDEN_LAYERS}-layer decode at ${DECODE_HOST} on NPU ${DECODE_BASE_GPU_ID}-$((DECODE_BASE_GPU_ID + TP_SIZE - 1))" \
-            "(TP=${TP_SIZE}, DP=${DECODE_DP_SIZE}, CP=1, attention-TP=$((TP_SIZE / DECODE_DP_SIZE))); log=${LOG_FILE}"
+            "(TP=${TP_SIZE}, DP=${DECODE_DP_SIZE}, CP=1, attention-TP=$((TP_SIZE / DECODE_DP_SIZE))," \
+            "MF=${ASCEND_MF_TRANSFER_PROTOCOL}); log=${LOG_FILE}"
         python3 -m sglang.launch_server \
             "${COMMON_ARGS[@]}" \
             --host "${DECODE_HOST}" \
