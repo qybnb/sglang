@@ -110,7 +110,23 @@ export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-lo}"
 export STREAMS_PER_DEVICE="${STREAMS_PER_DEVICE:-32}"
 export DEEP_NORMAL_MODE_USE_INT8_QUANT="${DEEP_NORMAL_MODE_USE_INT8_QUANT:-1}"
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK="${SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK:-64}"
-export HCCL_BUFFSIZE="${HCCL_BUFFSIZE:-1200}"
+# Prefill CP4 x attention-TP2 leaves at most CHUNKED_PREFILL_SIZE / 8 routed
+# tokens on each rank.  Stream DeepEP normal dispatch/combine in 512-token
+# rounds so its HCCL workspace does not compete with the KDA/MLA cache pool.
+# Decode keeps the previously validated low-latency buffer size.
+if [[ "${ROLE}" == "prefill" ]]; then
+    DEEPEP_PREFILL_TOKENS_PER_ROUND="${DEEPEP_PREFILL_TOKENS_PER_ROUND:-512}"
+    DEEPEP_PREFILL_ROUNDS="$(( \
+        (CHUNKED_PREFILL_SIZE + DEEPEP_PREFILL_TOKENS_PER_ROUND - 1) \
+        / DEEPEP_PREFILL_TOKENS_PER_ROUND \
+    ))"
+    export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS="${DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS:-${DEEPEP_PREFILL_TOKENS_PER_ROUND}}"
+    export DEEPEP_NORMAL_LONG_SEQ_ROUND="${DEEPEP_NORMAL_LONG_SEQ_ROUND:-${DEEPEP_PREFILL_ROUNDS}}"
+    export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ="${DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ:-1}"
+    export HCCL_BUFFSIZE="${PREFILL_HCCL_BUFFSIZE:-${HCCL_BUFFSIZE:-600}}"
+else
+    export HCCL_BUFFSIZE="${DECODE_HCCL_BUFFSIZE:-${HCCL_BUFFSIZE:-1200}}"
+fi
 export HCCL_OP_EXPANSION_MODE="${HCCL_OP_EXPANSION_MODE:-AIV}"
 export SGLANG_MAMBA_CONV_DTYPE="${SGLANG_MAMBA_CONV_DTYPE:-bfloat16}"
 export ASCEND_MF_STORE_URL="${ASCEND_MF_STORE_URL:-tcp://127.0.0.1:${MF_STORE_PORT}}"
@@ -146,7 +162,9 @@ case "${ROLE}" in
     prefill)
         LOG_FILE="${LOG_DIR}/prefill_$(date '+%Y-%m-%d_%H-%M-%S').log"
         echo "Starting Kimi-K3 ${NUM_HIDDEN_LAYERS}-layer prefill on NPU 0-7" \
-            "(TP=${TP_SIZE}, DP=${PREFILL_DP_SIZE}, CP=${PREFILL_CP_SIZE}, attention-TP=${PREFILL_ATTN_TP_SIZE}); log=${LOG_FILE}"
+            "(TP=${TP_SIZE}, DP=${PREFILL_DP_SIZE}, CP=${PREFILL_CP_SIZE}, attention-TP=${PREFILL_ATTN_TP_SIZE}," \
+            "HCCL=${HCCL_BUFFSIZE}MB, DeepEP-round=${DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS}x${DEEPEP_NORMAL_LONG_SEQ_ROUND});" \
+            "log=${LOG_FILE}"
         python3 -m sglang.launch_server \
             "${COMMON_ARGS[@]}" \
             --base-gpu-id 0 \
