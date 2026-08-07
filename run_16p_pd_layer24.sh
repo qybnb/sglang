@@ -85,11 +85,10 @@ if (( PREFILL_ATTN_TP_SIZE < 2 )); then
         "TP${TP_SIZE}/DP${PREFILL_DP_SIZE}/CP${PREFILL_CP_SIZE} would replicate full KDA attention weights." >&2
     exit 2
 fi
-# Prefill CP increases resident attention weights.  With K3-24L,
-# mem_fraction_static=0.84 leaves the hybrid-state budget slightly negative
-# after model loading.  Prefill has CUDA graph disabled, so reserve 10% for
-# activations and use the remaining 90% for weights + MLA/KDA cache pools.
-PREFILL_MEM_FRACTION_STATIC="${PREFILL_MEM_FRACTION_STATIC:-${MEM_FRACTION_STATIC:-0.90}}"
+# Prefill CP increases resident attention weights and owns three HCCL
+# communicators. They are pre-warmed before cache profiling, so 93% is needed
+# for weights plus the MLA/KDA pools while still leaving 7% runtime slack.
+PREFILL_MEM_FRACTION_STATIC="${PREFILL_MEM_FRACTION_STATIC:-${MEM_FRACTION_STATIC:-0.93}}"
 DECODE_MEM_FRACTION_STATIC="${DECODE_MEM_FRACTION_STATIC:-${MEM_FRACTION_STATIC:-0.84}}"
 MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-32768}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-16}"
@@ -132,7 +131,7 @@ if [[ "${ROLE}" == "prefill" ]]; then
     export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS="${DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS:-${DEEPEP_PREFILL_TOKENS_PER_ROUND}}"
     export DEEPEP_NORMAL_LONG_SEQ_ROUND="${DEEPEP_NORMAL_LONG_SEQ_ROUND:-${DEEPEP_PREFILL_ROUNDS}}"
     export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ="${DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ:-1}"
-    export HCCL_BUFFSIZE="${PREFILL_HCCL_BUFFSIZE:-${HCCL_BUFFSIZE:-600}}"
+    export HCCL_BUFFSIZE="${PREFILL_HCCL_BUFFSIZE:-${HCCL_BUFFSIZE:-400}}"
 else
     export HCCL_BUFFSIZE="${DECODE_HCCL_BUFFSIZE:-${HCCL_BUFFSIZE:-1200}}"
 fi
