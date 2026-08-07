@@ -50,7 +50,11 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     set_tc_piecewise_forward_context,
 )
 from sglang.srt.utils import is_hip
-from sglang.srt.utils.common import ceil_align, require_mlp_sync
+from sglang.srt.utils.common import (
+    ceil_align,
+    get_current_device_stream_fast,
+    require_mlp_sync,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -345,7 +349,15 @@ class EagerRunner(BaseRunner):
                     )
             elif cp_v2_active:
                 # CP-V2: drive .model directly to gather across CP ranks before logits.
-                hidden_states = model_runner.model.model(
+                cp_model_getter = getattr(
+                    model_runner.model, "get_context_parallel_model", None
+                )
+                cp_model = (
+                    cp_model_getter()
+                    if cp_model_getter is not None
+                    else model_runner.model.model
+                )
+                hidden_states = cp_model(
                     forward_batch.input_ids,
                     forward_positions,
                     forward_batch,
@@ -362,7 +374,7 @@ class EagerRunner(BaseRunner):
                     hidden_states = cp_gather_after_forward(
                         hidden_states,
                         forward_batch,
-                        torch.cuda.current_stream(),
+                        get_current_device_stream_fast(),
                     )
                     ret = model_runner.model.logits_processor(
                         forward_batch.input_ids,

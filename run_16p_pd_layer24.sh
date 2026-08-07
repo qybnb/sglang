@@ -52,6 +52,12 @@ if [[ ! "${DP_SIZE}" =~ ^[2-9][0-9]*$ ]] || (( TP_SIZE % DP_SIZE != 0 )); then
     echo "DP_SIZE must be greater than 1 and evenly divide TP_SIZE (got DP_SIZE=${DP_SIZE}, TP_SIZE=${TP_SIZE})." >&2
     exit 2
 fi
+PREFILL_CP_SIZE="${PREFILL_CP_SIZE:-$((TP_SIZE / DP_SIZE))}"
+if [[ ! "${PREFILL_CP_SIZE}" =~ ^[2-9][0-9]*$ ]] || (( PREFILL_CP_SIZE != TP_SIZE / DP_SIZE )); then
+    echo "PREFILL_CP_SIZE must equal TP_SIZE / DP_SIZE for the current MLA CP topology" \
+        "(got PREFILL_CP_SIZE=${PREFILL_CP_SIZE}, TP_SIZE=${TP_SIZE}, DP_SIZE=${DP_SIZE})." >&2
+    exit 2
+fi
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.84}"
 MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-32768}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-16}"
@@ -121,6 +127,9 @@ case "${ROLE}" in
             --disaggregation-mode prefill \
             --disaggregation-transfer-backend ascend \
             --disaggregation-bootstrap-port "${BOOTSTRAP_PORT}" \
+            --attn-cp-size "${PREFILL_CP_SIZE}" \
+            --enable-prefill-cp \
+            --cp-strategy zigzag \
             --chunked-prefill-size "${CHUNKED_PREFILL_SIZE}" \
             --deepep-mode normal \
             --disable-cuda-graph \

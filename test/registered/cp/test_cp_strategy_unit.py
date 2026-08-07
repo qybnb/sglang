@@ -4,6 +4,11 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.attention.linear.kda_cp import (
+    all_gather_cp_heads,
+    head_to_sequence_a2a,
+    sequence_to_head_a2a,
+)
 from sglang.srt.layers.cp.base import (
     ContextParallelStrategyKind,
     get_cp_strategy,
@@ -37,6 +42,26 @@ class _FakeCPGroup:
 
     def cp_all_gather_into_tensor_async(self, output, input_tensor, stream):
         del input_tensor, stream
+        torch.cat(self.all_rank_tensors, dim=0, out=output)
+
+
+class _FakeA2AGroup:
+    def __init__(self, all_rank_sends, rank):
+        self.all_rank_sends = all_rank_sends
+        self.rank = rank
+
+    def all_to_all_single(self, output, input_tensor):
+        torch.testing.assert_close(input_tensor, self.all_rank_sends[self.rank])
+        for source_rank, source_send in enumerate(self.all_rank_sends):
+            output[source_rank].copy_(source_send[self.rank])
+
+
+class _FakeHeadGatherGroup:
+    def __init__(self, all_rank_tensors):
+        self.all_rank_tensors = all_rank_tensors
+
+    def all_gather_into_tensor(self, output, input_tensor):
+        del input_tensor
         torch.cat(self.all_rank_tensors, dim=0, out=output)
 
 
@@ -453,6 +478,117 @@ class TestCPZigzagStrategy(CustomTestCase):
         self.assertTrue(torch.equal(calls[0][0], q[:2]))
         self.assertTrue(torch.equal(calls[1][0], q[2:]))
         self.assertTrue(torch.equal(out, q + 100))
+
+    def test_kda_a2a_transposes_sequence_and_heads_roundtrip(self):
+        cp_size = 4
+        seq_lens = [11, 13]
+        extend_seq_lens = [9, 10]
+        num_heads = 8
+        heads_per_rank = num_heads // cp_size
+        x = torch.arange(
+            sum(extend_seq_lens) * num_heads * 2, dtype=torch.float32
+        ).view(sum(extend_seq_lens), num_heads, 2)
+
+        metadata = [
+            self._metadata_for_rank(
+                rank,
+                cp_size=cp_size,
+                seq_lens=seq_lens,
+                extend_seq_lens=extend_seq_lens,
+            )
+            for rank in range(cp_size)
+        ]
+        local_inputs = []
+        sequence_sends = []
+        for rank in range(cp_size):
+            fb = self._forward_batch(metadata[rank], extend_seq_lens)
+            local = ZigzagCPStrategy(cp_size=cp_size).shard_hidden_states(x, fb)
+            local_inputs.append(local)
+            max_tokens = metadata[rank].max_rank_len[0]
+            padded = torch.nn.functional.pad(
+                local,
+                [0, 0, 0, 0, 0, max_tokens - local.shape[0]],
+            )
+            sequence_sends.append(
+                padded.view(max_tokens, cp_size, heads_per_rank, 2)
+                .transpose(0, 1)
+                .contiguous()
+            )
+
+        head_shards = []
+        for rank in range(cp_size):
+            fb = self._forward_batch(metadata[rank], extend_seq_lens)
+            with get_parallel().override(
+                attn_cp_size=cp_size, attn_cp_rank=rank
+            ):
+                head_shard = sequence_to_head_a2a(
+                    local_inputs[rank],
+                    fb,
+                    group=_FakeA2AGroup(sequence_sends, rank),
+                )
+            expected = x[:, rank * heads_per_rank : (rank + 1) * heads_per_rank]
+            self.assertTrue(torch.equal(head_shard, expected))
+            head_shards.append(head_shard + 1000 * rank)
+
+        inverse_sends = []
+        for head_shard in head_shards:
+            natural_chunks = torch.split(head_shard, metadata[0].split_list, dim=0)
+            rank_order_chunks = [None] * len(natural_chunks)
+            for natural_index, rank_order_index in enumerate(
+                metadata[0].cp_reverse_index
+            ):
+                rank_order_chunks[rank_order_index] = natural_chunks[natural_index]
+            rank_order = torch.cat(rank_order_chunks, dim=0)
+            destination_chunks = torch.split(
+                rank_order, metadata[0].per_rank_actual_token, dim=0
+            )
+            send = head_shard.new_zeros(
+                cp_size,
+                metadata[0].max_rank_len[0],
+                heads_per_rank,
+                head_shard.shape[-1],
+            )
+            for destination_rank, chunk in enumerate(destination_chunks):
+                send[destination_rank, : chunk.shape[0]].copy_(chunk)
+            inverse_sends.append(send)
+
+        for rank in range(cp_size):
+            fb = self._forward_batch(metadata[rank], extend_seq_lens)
+            with get_parallel().override(
+                attn_cp_size=cp_size, attn_cp_rank=rank
+            ):
+                restored = head_to_sequence_a2a(
+                    head_shards[rank],
+                    fb,
+                    group=_FakeA2AGroup(inverse_sends, rank),
+                )
+            expected = local_inputs[rank].clone()
+            for head_rank in range(cp_size):
+                expected[
+                    :,
+                    head_rank * heads_per_rank : (head_rank + 1) * heads_per_rank,
+                ] += 1000 * head_rank
+            self.assertTrue(torch.equal(restored, expected))
+
+    def test_kda_state_head_all_gather(self):
+        cp_size = 4
+        local_states = [
+            torch.full((2, 3, 5), rank, dtype=torch.float32)
+            for rank in range(cp_size)
+        ]
+        group = _FakeHeadGatherGroup(
+            [state.movedim(1, 0).contiguous() for state in local_states]
+        )
+        expected = torch.cat(local_states, dim=1)
+
+        for rank in range(cp_size):
+            with get_parallel().override(
+                attn_cp_size=cp_size, attn_cp_rank=rank
+            ):
+                gathered = all_gather_cp_heads(
+                    local_states[rank], head_dim=1, group=group
+                )
+            self.assertTrue(torch.equal(gathered, expected))
 
 
 if __name__ == "__main__":

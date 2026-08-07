@@ -6,6 +6,12 @@ from sglang.srt.layers.attention.fla.chunk_delta_h import (
     CHUNK_SIZE as KDA_CHUNK_SIZE,
 )
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
+from sglang.srt.layers.attention.linear.kda_cp import (
+    all_gather_cp_heads,
+    head_to_sequence_a2a,
+    kda_use_prefill_cp,
+    sequence_to_head_a2a,
+)
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
@@ -42,6 +48,7 @@ elif is_cpu():
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.runtime_context import get_parallel
 
 
 def _npu_causal_conv1d_linear_verify(
@@ -642,6 +649,144 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # print(f"decode {torch.distributed.get_rank()=}: {layer.layer_id=}, KDA extend: q={torch.sum(q)=}, {torch.sum(conv_states)=}, {torch.sum(ret)=}", flush=True)
         return ret
 
+    @staticmethod
+    def _qkv_channels_to_heads(
+        tensor: torch.Tensor,
+        layer: RadixLinearAttention,
+        *,
+        num_heads: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Convert ``[..., Q|K|V channels]`` to ``[..., heads, Q|K|V dims]``."""
+        if num_heads is None:
+            num_heads = layer.num_q_heads
+        splits = [
+            num_heads * layer.head_q_dim,
+            num_heads * layer.head_k_dim,
+            num_heads * layer.head_v_dim,
+        ]
+        q, k, v = tensor.split(splits, dim=-1)
+        q = q.unflatten(-1, (num_heads, layer.head_q_dim))
+        k = k.unflatten(-1, (num_heads, layer.head_k_dim))
+        v = v.unflatten(-1, (num_heads, layer.head_v_dim))
+        if not (
+            layer.num_q_heads == layer.num_k_heads == layer.num_v_heads
+        ):
+            raise NotImplementedError(
+                "KDA prefill CP currently requires equal Q/K/V head counts."
+            )
+        return torch.cat((q, k, v), dim=-1)
+
+    @staticmethod
+    def _heads_to_qkv_channels(
+        tensor: torch.Tensor,
+        layer: RadixLinearAttention,
+    ) -> torch.Tensor:
+        """Inverse of :meth:`_qkv_channels_to_heads` for a chosen head count."""
+        q, k, v = tensor.split(
+            [layer.head_q_dim, layer.head_k_dim, layer.head_v_dim], dim=-1
+        )
+        return torch.cat(
+            (
+                q.flatten(-2),
+                k.flatten(-2),
+                v.flatten(-2),
+            ),
+            dim=-1,
+        )
+
+    def _transpose_kda_cp_inputs(
+        self,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+    ):
+        """Run the sequence->head A2A for projected QKV and KDA gates."""
+        parallel = get_parallel()
+        cp_size = parallel.attn_cp_size
+        if layer.num_q_heads % cp_size != 0:
+            raise ValueError(
+                "KDA prefill CP requires local KDA heads divisible by CP size: "
+                f"heads={layer.num_q_heads}, cp_size={cp_size}."
+            )
+
+        qkv_by_head = self._qkv_channels_to_heads(mixed_qkv, layer)
+        qkv_by_head = sequence_to_head_a2a(qkv_by_head, forward_batch)
+
+        if a.ndim != 4 or a.shape[0] != 1:
+            raise ValueError(f"Unexpected KDA gate shape under CP: {tuple(a.shape)}")
+        if b.ndim != 3 or b.shape[0] != 1:
+            raise ValueError(f"Unexpected KDA beta shape under CP: {tuple(b.shape)}")
+        gates = torch.cat((a.squeeze(0), b.squeeze(0).unsqueeze(-1)), dim=-1)
+        gates = sequence_to_head_a2a(gates, forward_batch)
+
+        heads_per_cp_rank = layer.num_q_heads // cp_size
+        mixed_qkv = self._heads_to_qkv_channels(qkv_by_head, layer)
+        a = gates[..., : layer.head_k_dim].unsqueeze(0)
+        b = gates[..., layer.head_k_dim].unsqueeze(0)
+        head_start = parallel.attn_cp_rank * heads_per_cp_rank
+        return mixed_qkv, a, b, head_start, heads_per_cp_rank
+
+    def _track_kda_cp_conv_state(
+        self,
+        layer: RadixLinearAttention,
+        mixed_qkv: torch.Tensor,
+        conv_states: torch.Tensor,
+        num_heads: int,
+    ) -> None:
+        """Save a full-head convolution checkpoint from the CP head shard."""
+        tracked = mixed_qkv[self.forward_metadata.track_conv_indices]
+        tracked_by_head = self._qkv_channels_to_heads(
+            tracked, layer, num_heads=num_heads
+        )
+        tracked_full = all_gather_cp_heads(tracked_by_head, head_dim=-2)
+        tracked_full = self._heads_to_qkv_channels(tracked_full, layer).transpose(
+            -1, -2
+        )
+        conv_states[self.forward_metadata.conv_states_mask_indices] = (
+            tracked_full.to(conv_states.dtype, copy=False)
+        )
+
+    def _sync_kda_cp_final_states(
+        self,
+        layer: RadixLinearAttention,
+        cache_indices: torch.Tensor,
+        conv_states: torch.Tensor,
+        ssm_states: torch.Tensor,
+        head_start: int,
+        num_heads: int,
+    ) -> None:
+        """Replicate final conv/KDA states so existing PD transfer stays valid."""
+        valid = cache_indices >= 0
+        if not bool(valid.any()):
+            return
+        active_indices = cache_indices[valid]
+
+        # Conv cache is channel-major [slot, Q|K|V channels, window]. Convert
+        # through a per-head representation so one collective reconstructs all
+        # three Q/K/V channel blocks.
+        active_conv = conv_states.index_select(0, active_indices).transpose(-1, -2)
+        active_conv_by_head = self._qkv_channels_to_heads(active_conv, layer)
+        active_conv_local = active_conv_by_head.narrow(-2, head_start, num_heads)
+        active_conv_full = all_gather_cp_heads(active_conv_local, head_dim=-2)
+        active_conv_full = self._heads_to_qkv_channels(
+            active_conv_full, layer
+        ).transpose(-1, -2)
+        conv_states.index_copy_(
+            0, active_indices, active_conv_full.to(conv_states.dtype, copy=False)
+        )
+
+        active_ssm_local = (
+            ssm_states.index_select(0, active_indices)
+            .narrow(1, head_start, num_heads)
+            .contiguous()
+        )
+        active_ssm_full = all_gather_cp_heads(active_ssm_local, head_dim=1)
+        ssm_states.index_copy_(
+            0, active_indices, active_ssm_full.to(ssm_states.dtype, copy=False)
+        )
+
     def forward_extend(
         self,
         layer: RadixLinearAttention,
@@ -664,28 +809,73 @@ class KDAAttnBackend(MambaAttnBackendBase):
         ssm_states = mamba_cache_params.temporal
 
         has_initial_state = forward_batch.extend_prefix_lens > 0
+        use_kda_cp = kda_use_prefill_cp(forward_batch)
+        head_start = 0
+        num_cp_heads = layer.num_q_heads
+
+        if use_kda_cp:
+            mixed_qkv, a, b, head_start, num_cp_heads = (
+                self._transpose_kda_cp_inputs(
+                    layer, forward_batch, mixed_qkv, a, b
+                )
+            )
 
         # Save the raw QKV convolution window at the last cacheable chunk
         # boundary. The shared metadata indexes flattened input tokens and the
         # destination ping-pong slots selected by MambaRadixCache.
         if self.forward_metadata.has_mamba_track_mask:
-            mixed_qkv_to_track = mixed_qkv[
-                self.forward_metadata.track_conv_indices
-            ].transpose(-1, -2)
-            conv_states[
-                self.forward_metadata.conv_states_mask_indices
-            ] = mixed_qkv_to_track.to(conv_states.dtype, copy=False)
+            if use_kda_cp:
+                self._track_kda_cp_conv_state(
+                    layer, mixed_qkv, conv_states, num_cp_heads
+                )
+            else:
+                mixed_qkv_to_track = mixed_qkv[
+                    self.forward_metadata.track_conv_indices
+                ].transpose(-1, -2)
+                conv_states[
+                    self.forward_metadata.conv_states_mask_indices
+                ] = mixed_qkv_to_track.to(conv_states.dtype, copy=False)
 
-        splits = [layer.q_dim, layer.k_dim, layer.v_dim]
-        q, k, v = mixed_qkv.transpose(0, 1).split(splits, dim=0)
-        q_conv_weight, k_conv_weight, v_conv_weight = layer.conv_weights.split(
-            splits, dim=0
+        splits = (
+            [
+                num_cp_heads * layer.head_q_dim,
+                num_cp_heads * layer.head_k_dim,
+                num_cp_heads * layer.head_v_dim,
+            ]
+            if use_kda_cp
+            else [layer.q_dim, layer.k_dim, layer.v_dim]
         )
-        q_conv_state, k_conv_state, v_conv_state = conv_states.split(splits, dim=-2)
+        q, k, v = mixed_qkv.transpose(0, 1).split(splits, dim=0)
+        full_splits = [layer.q_dim, layer.k_dim, layer.v_dim]
+        q_conv_weight, k_conv_weight, v_conv_weight = layer.conv_weights.split(
+            full_splits, dim=0
+        )
+        q_conv_state, k_conv_state, v_conv_state = conv_states.split(
+            full_splits, dim=-2
+        )
         if layer.bias is not None:
-            q_bias, k_bias, v_bias = layer.bias.split(splits, dim=0)
+            q_bias, k_bias, v_bias = layer.bias.split(full_splits, dim=0)
         else:
             q_bias, k_bias, v_bias = None, None, None
+
+        if use_kda_cp:
+            q_channel_start = head_start * layer.head_q_dim
+            k_channel_start = head_start * layer.head_k_dim
+            v_channel_start = head_start * layer.head_v_dim
+            q_channels = num_cp_heads * layer.head_q_dim
+            k_channels = num_cp_heads * layer.head_k_dim
+            v_channels = num_cp_heads * layer.head_v_dim
+
+            q_conv_weight = q_conv_weight.narrow(0, q_channel_start, q_channels)
+            k_conv_weight = k_conv_weight.narrow(0, k_channel_start, k_channels)
+            v_conv_weight = v_conv_weight.narrow(0, v_channel_start, v_channels)
+            q_conv_state = q_conv_state.narrow(-2, q_channel_start, q_channels)
+            k_conv_state = k_conv_state.narrow(-2, k_channel_start, k_channels)
+            v_conv_state = v_conv_state.narrow(-2, v_channel_start, v_channels)
+            if q_bias is not None:
+                q_bias = q_bias.narrow(0, q_channel_start, q_channels)
+                k_bias = k_bias.narrow(0, k_channel_start, k_channels)
+                v_bias = v_bias.narrow(0, v_channel_start, v_channels)
 
         def run_conv(x, weight, bias, state):
             # Note: at this point x is [C, T] (channel-first from
@@ -738,17 +928,48 @@ class KDAAttnBackend(MambaAttnBackendBase):
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
 
+        if use_kda_cp:
+            A_log = layer.A_log.narrow(2, head_start, num_cp_heads)
+            dt_bias = (
+                layer.dt_bias.view(layer.num_q_heads, layer.head_k_dim)
+                .narrow(0, head_start, num_cp_heads)
+                .flatten()
+            )
+            # A head slice of the full state pool is not contiguous: its
+            # per-slot stride still contains all heads, while the KDA kernels
+            # assume a densely packed [slot, local_head, K, V] pool. Compact
+            # only this batch's active states and remap the slot indices.
+            valid_cache_indices = cache_indices >= 0
+            safe_cache_indices = cache_indices.clamp_min(0)
+            ssm_states_for_kernel = (
+                ssm_states.index_select(0, safe_cache_indices)
+                .narrow(1, head_start, num_cp_heads)
+                .contiguous()
+            )
+            if not bool(valid_cache_indices.all()):
+                ssm_states_for_kernel[~valid_cache_indices].zero_()
+            kernel_cache_indices = torch.arange(
+                cache_indices.shape[0],
+                device=cache_indices.device,
+                dtype=cache_indices.dtype,
+            )
+        else:
+            A_log = layer.A_log
+            dt_bias = layer.dt_bias
+            ssm_states_for_kernel = ssm_states
+            kernel_cache_indices = cache_indices
+
         core_attn_out, _, h = self.kernel_dispatcher.extend(
             q=q,
             k=k,
             v=v,
             g=a,
             beta=b,
-            ssm_states=ssm_states,
-            cache_indices=cache_indices,
+            ssm_states=ssm_states_for_kernel,
+            cache_indices=kernel_cache_indices,
             query_start_loc=query_start_loc,
-            A_log=layer.A_log,
-            dt_bias=layer.dt_bias,
+            A_log=A_log,
+            dt_bias=dt_bias,
             lower_bound=getattr(layer, "lower_bound", None),
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             # target_verify / draft_extend_v2 also reach forward_extend; they must
@@ -759,6 +980,26 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 or forward_batch.forward_mode.is_draft_extend_v2()
             ),
         )
+        if use_kda_cp:
+            active_state_indices = cache_indices[valid_cache_indices]
+            if active_state_indices.numel() > 0:
+                ssm_states.narrow(1, head_start, num_cp_heads).index_copy_(
+                    0,
+                    active_state_indices,
+                    ssm_states_for_kernel[valid_cache_indices],
+                )
+            self._sync_kda_cp_final_states(
+                layer,
+                cache_indices,
+                conv_states,
+                ssm_states,
+                head_start,
+                num_cp_heads,
+            )
+            if h is not None:
+                # chunk_kda returns [1, num_chunks, heads, K, V].
+                h = all_gather_cp_heads(h, head_dim=2)
+
         if h is not None:
             # This branch's KDA kernels and recurrent-state pool both use the
             # [K, V] matrix layout.
@@ -768,7 +1009,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 ssm_states,
                 self.forward_metadata,
             )
+        if use_kda_cp:
+            core_attn_out = head_to_sequence_a2a(
+                core_attn_out.squeeze(0), forward_batch
+            ).unsqueeze(0)
         return core_attn_out
+
     def _forward_dspark_target_verify(
         self,
         layer: RadixLinearAttention,

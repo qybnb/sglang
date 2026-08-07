@@ -995,6 +995,99 @@ class AscendAttnBackend(AttentionBackend):
         attn_out = torch.cat([attn_out_prev, attn_out_next], dim=0)
         return attn_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
+    def do_cp_mla_attn_fia(
+        self,
+        q: torch.Tensor,
+        q_rope: Optional[torch.Tensor],
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """CP-aware paged MLA attention over the full gathered latent KV cache."""
+        cp_meta = forward_batch.attn_cp_metadata
+        split = cp_meta.total_q_prev_tokens
+        q = q.reshape(-1, layer.tp_q_head_num, self.kv_lora_rank)
+        q_prev, q_next = q[:split].contiguous(), q[split:].contiguous()
+
+        if q_rope is not None and q_rope.shape[-1] > 0:
+            q_rope = q_rope.reshape(
+                -1, layer.tp_q_head_num, self.qk_rope_head_dim
+            )
+            q_rope_prev = q_rope[:split].contiguous()
+            q_rope_next = q_rope[split:].contiguous()
+        else:
+            q_rope_prev = q_rope_next = None
+
+        kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        rope_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        if is_fia_nz():
+            kv_cache = _reshape_kv_for_fia_nz(
+                kv_cache, layer.tp_k_head_num, self.kv_lora_rank, self.page_size
+            )
+            if self.qk_rope_head_dim > 0:
+                rope_cache = _reshape_kv_for_fia_nz(
+                    rope_cache,
+                    layer.tp_k_head_num,
+                    self.qk_rope_head_dim,
+                    self.page_size,
+                )
+        else:
+            kv_cache = kv_cache.view(
+                -1, self.page_size, layer.tp_k_head_num * self.kv_lora_rank
+            )
+            if self.qk_rope_head_dim > 0:
+                rope_cache = rope_cache.view(
+                    -1,
+                    self.page_size,
+                    layer.tp_k_head_num * self.qk_rope_head_dim,
+                )
+
+        def run_half(
+            q_half: torch.Tensor,
+            q_rope_half: Optional[torch.Tensor],
+            q_lens: List[int],
+            kv_lens: List[int],
+        ) -> torch.Tensor:
+            rope_kwargs = {}
+            if q_rope_half is not None:
+                rope_kwargs = {
+                    "query_rope": q_rope_half,
+                    "key_rope": rope_cache,
+                }
+            output, _ = torch.ops.npu.npu_fused_infer_attention_score(
+                q_half,
+                kv_cache,
+                kv_cache,
+                block_table=self.forward_metadata.block_tables,
+                block_size=self.page_size,
+                num_heads=layer.tp_q_head_num,
+                num_key_value_heads=layer.tp_k_head_num,
+                input_layout="TND",
+                atten_mask=self.fia_mask,
+                sparse_mode=3,
+                next_tokens=0,
+                scale=layer.scaling,
+                actual_seq_lengths=np.cumsum(q_lens).tolist(),
+                actual_seq_lengths_kv=kv_lens,
+                **rope_kwargs,
+            )
+            return output
+
+        output_prev = run_half(
+            q_prev,
+            q_rope_prev,
+            cp_meta.actual_seq_q_prev_list,
+            cp_meta.kv_len_prev_list,
+        )
+        output_next = run_half(
+            q_next,
+            q_rope_next,
+            cp_meta.actual_seq_q_next_list,
+            cp_meta.kv_len_next_list,
+        )
+        return torch.cat((output_prev, output_next), dim=0).view(
+            -1, layer.tp_q_head_num * self.kv_lora_rank
+        )
+
     def forward_sparse(
         self,
         q: torch.Tensor,
@@ -1157,14 +1250,13 @@ class AscendAttnBackend(AttentionBackend):
                 sinks=sinks,
             )
 
-        if not self.use_mla:
-            # Detect CP mode for prefill (context parallel)
-            is_cp_mode = (
-                forward_batch.forward_mode.is_context_parallel_extend()
-                and forward_batch.attn_cp_metadata is not None
-                and self.attn_cp_size > 1
-            )
+        is_cp_mode = (
+            forward_batch.forward_mode.is_context_parallel_extend()
+            and forward_batch.attn_cp_metadata is not None
+            and self.attn_cp_size > 1
+        )
 
+        if not self.use_mla:
             # In cross attention layer, when there is no vision input,the values of k and v is None
             if save_kv_cache and k is not None and v is not None:
                 if is_cp_mode:
@@ -1557,6 +1649,17 @@ class AscendAttnBackend(AttentionBackend):
                     attn_output = attn_output.view(
                         -1, layer.tp_q_head_num * layer.v_head_dim
                     )
+        elif is_cp_mode:
+            # MLA projections provide rank-local Q and a full-sequence latent KV
+            # after rebuild_cp_kv_cache. Persist that full KV on every CP rank,
+            # then evaluate only this rank's zigzag Q blocks against the paged
+            # cache. This path is prefill-only; decode has attn_cp_size == 1.
+            if k is None or k_rope is None:
+                raise ValueError("MLA prefill CP requires both latent K and K-RoPE")
+            self.token_to_kv_pool.set_kv_buffer(
+                layer, forward_batch.out_cache_loc, k, k_rope
+            )
+            return self.do_cp_mla_attn_fia(q, q_rope, layer, forward_batch)
         elif sum(forward_batch.extend_prefix_lens_cpu) > 0:
             # This branch adds support for prefix cache for GLM-4.7-Flash.
             # When using the MLA architecture, if qk head dim equals v head dim and the head count is not a power of 2,

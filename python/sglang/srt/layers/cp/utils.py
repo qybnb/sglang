@@ -35,6 +35,7 @@ from sglang.srt.layers.cp.zigzag import (
 
 CP_V2_DEFAULT_MODEL_CLASSES = frozenset(
     {
+        "KimiK3ForConditionalGeneration",
         "Qwen3MoeForCausalLM",
     }
 )

@@ -148,6 +148,10 @@ class KimiMLAAttention(DeepseekV2AttentionMLA):
     """DeepSeek MLA with K3's optional per-head output gate."""
 
     def __init__(self, *args, config: KimiLinearConfig, prefix: str = "", **kwargs):
+        kwargs.setdefault(
+            "mla_enable_prefill_cp",
+            get_global_server_args().enable_prefill_context_parallel,
+        )
         super().__init__(*args, config=config, prefix=prefix, **kwargs)
         # o_proj does not all-reduce; the caller (KimiDecoderLayer) handles
         # the reduce at the correct point for either the attn_residual path
@@ -1176,7 +1180,14 @@ class KimiLinearModel(nn.Module):
         forward_batch: ForwardBatch,
         inputs_embeds: torch.Tensor | None = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        input_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if input_embeds is not None:
+            if inputs_embeds is not None:
+                raise ValueError(
+                    "Only one of input_embeds and inputs_embeds may be provided."
+                )
+            inputs_embeds = input_embeds
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -1953,6 +1964,18 @@ class KimiK3ForConditionalGeneration(nn.Module):
     @property
     def lm_head(self):
         return self.language_model.lm_head
+
+    @property
+    def logits_processor(self):
+        return self.language_model.logits_processor
+
+    @property
+    def capture_aux_hidden_states(self):
+        return self.language_model.capture_aux_hidden_states
+
+    def get_context_parallel_model(self):
+        """Return the text backbone used before the CP output gather."""
+        return self.language_model.model
 
     @property
     def start_layer(self) -> int:
