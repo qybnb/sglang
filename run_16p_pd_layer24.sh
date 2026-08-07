@@ -1,39 +1,48 @@
 #!/usr/bin/env bash
 #
-# Single-node Kimi-K3 PD deployment for 16 Ascend NPUs with 64 GiB HBM each.
-# GPU/NPU 0-7: prefill, 8-15: decode.
+# Two-node Kimi-K3 PD deployment with 8 Ascend NPUs per node.
+# 80.5.17.37, NPU 0-7: prefill.
+# 80.5.17.38, NPU 0-7: decode.
 #
 # Usage:
 #   MODEL_PATH=/path/to/full/Kimi-K3 ./run_16p_pd_layer24.sh prefill
 #   MODEL_PATH=/path/to/full/Kimi-K3 ./run_16p_pd_layer24.sh decode
-#   MODEL_PATH=/path/to/full/Kimi-K3 ./run_16p_pd_layer24.sh router
+#   ./run_16p_pd_layer24.sh router
 #
 set -euo pipefail
 
 ROLE="${1:-}"
 if [[ "${ROLE}" != "prefill" && "${ROLE}" != "decode" && "${ROLE}" != "router" ]]; then
-    echo "Usage: MODEL_PATH=/path/to/model $0 {prefill|decode|router}" >&2
+    echo "Usage: MODEL_PATH=/path/to/model $0 {prefill|decode} | $0 router" >&2
     exit 2
 fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PYTHONPATH="${REPO_ROOT}/python:${PYTHONPATH:-}"
 
+PREFILL_HOST="${PREFILL_HOST:-80.5.17.37}"
+DECODE_HOST="${DECODE_HOST:-80.5.17.38}"
+ROUTER_HOST="${ROUTER_HOST:-0.0.0.0}"
+PREFILL_BASE_GPU_ID="${PREFILL_BASE_GPU_ID:-0}"
+DECODE_BASE_GPU_ID="${DECODE_BASE_GPU_ID:-0}"
+
 MODEL_PATH="${MODEL_PATH:-}"
-if [[ -z "${MODEL_PATH}" ]]; then
-    echo "MODEL_PATH is required." >&2
-    exit 2
-fi
-if [[ ! -f "${MODEL_PATH}/config.json" ]]; then
-    echo "Invalid MODEL_PATH; config.json not found: ${MODEL_PATH}" >&2
-    exit 2
+if [[ "${ROLE}" != "router" ]]; then
+    if [[ -z "${MODEL_PATH}" ]]; then
+        echo "MODEL_PATH is required." >&2
+        exit 2
+    fi
+    if [[ ! -f "${MODEL_PATH}/config.json" ]]; then
+        echo "Invalid MODEL_PATH; config.json not found: ${MODEL_PATH}" >&2
+        exit 2
+    fi
 fi
 
 # SGLang probes its own loopback HTTP endpoint during startup. Proxy variables
 # can redirect that warmup request to an unrelated router/proxy and make an
 # otherwise healthy server terminate after the warmup timeout.
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
-export NO_PROXY="${NO_PROXY:+${NO_PROXY},}127.0.0.1,localhost"
+export NO_PROXY="${NO_PROXY:+${NO_PROXY},}127.0.0.1,localhost,${PREFILL_HOST},${DECODE_HOST}"
 export no_proxy="${NO_PROXY}"
 
 PREFILL_PORT="${PREFILL_PORT:-30000}"
@@ -129,7 +138,12 @@ else
 fi
 export HCCL_OP_EXPANSION_MODE="${HCCL_OP_EXPANSION_MODE:-AIV}"
 export SGLANG_MAMBA_CONV_DTYPE="${SGLANG_MAMBA_CONV_DTYPE:-bfloat16}"
-export ASCEND_MF_STORE_URL="${ASCEND_MF_STORE_URL:-tcp://127.0.0.1:${MF_STORE_PORT}}"
+# Both PD nodes must register with the same MemFabric config store.  The store
+# is created by the rank-0 prefill process and therefore lives on PREFILL_HOST.
+export ASCEND_MF_STORE_URL="${ASCEND_MF_STORE_URL:-tcp://${PREFILL_HOST}:${MF_STORE_PORT}}"
+# Prefill and decode are on different hosts, so SDMA cannot be used for the
+# KV/KDA-state transfer.  Callers may override this for a different fabric.
+export ASCEND_MF_TRANSFER_PROTOCOL="${ASCEND_MF_TRANSFER_PROTOCOL:-device_rdma}"
 # K3 uses the model-boundary CP-v2 path: shard embeddings before the text
 # backbone and gather hidden states before logits.  The legacy MLA CP path
 # assumes attention-TP=1 and cannot represent the CP4 x attention-TP2 layout.
@@ -155,19 +169,19 @@ COMMON_ARGS=(
     --reasoning-parser kimi_k3
     --moe-a2a-backend deepep
     --watchdog-timeout 9000
-    --host 127.0.0.1
 )
 
 case "${ROLE}" in
     prefill)
         LOG_FILE="${LOG_DIR}/prefill_$(date '+%Y-%m-%d_%H-%M-%S').log"
-        echo "Starting Kimi-K3 ${NUM_HIDDEN_LAYERS}-layer prefill on NPU 0-7" \
+        echo "Starting Kimi-K3 ${NUM_HIDDEN_LAYERS}-layer prefill at ${PREFILL_HOST} on NPU ${PREFILL_BASE_GPU_ID}-$((PREFILL_BASE_GPU_ID + TP_SIZE - 1))" \
             "(TP=${TP_SIZE}, DP=${PREFILL_DP_SIZE}, CP=${PREFILL_CP_SIZE}, attention-TP=${PREFILL_ATTN_TP_SIZE}," \
             "HCCL=${HCCL_BUFFSIZE}MB, DeepEP-round=${DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS}x${DEEPEP_NORMAL_LONG_SEQ_ROUND});" \
             "log=${LOG_FILE}"
         python3 -m sglang.launch_server \
             "${COMMON_ARGS[@]}" \
-            --base-gpu-id 0 \
+            --host "${PREFILL_HOST}" \
+            --base-gpu-id "${PREFILL_BASE_GPU_ID}" \
             --dp-size "${PREFILL_DP_SIZE}" \
             --mem-fraction-static "${PREFILL_MEM_FRACTION_STATIC}" \
             --disaggregation-mode prefill \
@@ -183,11 +197,12 @@ case "${ROLE}" in
         ;;
     decode)
         LOG_FILE="${LOG_DIR}/decode_$(date '+%Y-%m-%d_%H-%M-%S').log"
-        echo "Starting Kimi-K3 ${NUM_HIDDEN_LAYERS}-layer decode on NPU 8-15" \
+        echo "Starting Kimi-K3 ${NUM_HIDDEN_LAYERS}-layer decode at ${DECODE_HOST} on NPU ${DECODE_BASE_GPU_ID}-$((DECODE_BASE_GPU_ID + TP_SIZE - 1))" \
             "(TP=${TP_SIZE}, DP=${DECODE_DP_SIZE}, CP=1, attention-TP=$((TP_SIZE / DECODE_DP_SIZE))); log=${LOG_FILE}"
         python3 -m sglang.launch_server \
             "${COMMON_ARGS[@]}" \
-            --base-gpu-id 8 \
+            --host "${DECODE_HOST}" \
+            --base-gpu-id "${DECODE_BASE_GPU_ID}" \
             --dp-size "${DECODE_DP_SIZE}" \
             --mem-fraction-static "${DECODE_MEM_FRACTION_STATIC}" \
             --disaggregation-mode decode \
@@ -199,13 +214,13 @@ case "${ROLE}" in
             --port "${DECODE_PORT}" 2>&1 | tee "${LOG_FILE}"
         ;;
     router)
-        echo "Starting PD router on port ${ROUTER_PORT}"
+        echo "Starting PD router at ${ROUTER_HOST}:${ROUTER_PORT}; prefill=${PREFILL_HOST}:${PREFILL_PORT}, decode=${DECODE_HOST}:${DECODE_PORT}"
         python3 -m sglang_router.launch_router \
             --pd-disaggregation \
             --policy cache_aware \
-            --prefill "http://127.0.0.1:${PREFILL_PORT}" "${BOOTSTRAP_PORT}" \
-            --decode "http://127.0.0.1:${DECODE_PORT}" \
-            --host 0.0.0.0 \
+            --prefill "http://${PREFILL_HOST}:${PREFILL_PORT}" "${BOOTSTRAP_PORT}" \
+            --decode "http://${DECODE_HOST}:${DECODE_PORT}" \
+            --host "${ROUTER_HOST}" \
             --port "${ROUTER_PORT}"
         ;;
 esac
