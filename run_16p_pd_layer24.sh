@@ -76,7 +76,12 @@ if (( PREFILL_ATTN_TP_SIZE < 2 )); then
         "TP${TP_SIZE}/DP${PREFILL_DP_SIZE}/CP${PREFILL_CP_SIZE} would replicate full KDA attention weights." >&2
     exit 2
 fi
-MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.84}"
+# Prefill CP increases resident attention weights.  With K3-24L,
+# mem_fraction_static=0.84 leaves the hybrid-state budget slightly negative
+# after model loading.  Prefill has CUDA graph disabled, so reserve 10% for
+# activations and use the remaining 90% for weights + MLA/KDA cache pools.
+PREFILL_MEM_FRACTION_STATIC="${PREFILL_MEM_FRACTION_STATIC:-${MEM_FRACTION_STATIC:-0.90}}"
+DECODE_MEM_FRACTION_STATIC="${DECODE_MEM_FRACTION_STATIC:-${MEM_FRACTION_STATIC:-0.84}}"
 MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-32768}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-16}"
 CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-4096}"
@@ -124,7 +129,6 @@ COMMON_ARGS=(
     --enable-dp-attention
     --enable-dp-lm-head
     --page-size "${PAGE_SIZE}"
-    --mem-fraction-static "${MEM_FRACTION_STATIC}"
     --max-total-tokens "${MAX_TOTAL_TOKENS}"
     --max-running-requests "${MAX_RUNNING_REQUESTS}"
     --mamba-ssm-dtype bfloat16
@@ -143,6 +147,7 @@ case "${ROLE}" in
             "${COMMON_ARGS[@]}" \
             --base-gpu-id 0 \
             --dp-size "${PREFILL_DP_SIZE}" \
+            --mem-fraction-static "${PREFILL_MEM_FRACTION_STATIC}" \
             --disaggregation-mode prefill \
             --disaggregation-transfer-backend ascend \
             --disaggregation-bootstrap-port "${BOOTSTRAP_PORT}" \
@@ -162,6 +167,7 @@ case "${ROLE}" in
             "${COMMON_ARGS[@]}" \
             --base-gpu-id 8 \
             --dp-size "${DECODE_DP_SIZE}" \
+            --mem-fraction-static "${DECODE_MEM_FRACTION_STATIC}" \
             --disaggregation-mode decode \
             --disaggregation-transfer-backend ascend \
             --disaggregation-decode-extra-slots 8 \
