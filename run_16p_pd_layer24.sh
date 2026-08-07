@@ -42,20 +42,38 @@ ROUTER_PORT="${ROUTER_PORT:-6688}"
 BOOTSTRAP_PORT="${BOOTSTRAP_PORT:-8998}"
 MF_STORE_PORT="${MF_STORE_PORT:-24669}"
 TP_SIZE="${TP_SIZE:-8}"
-DP_SIZE="${DP_SIZE:-2}"
+# Prefill CP consumes ranks from the attention-parallel dimension.  KDA's
+# token->head A2A requires the pre-projection weights owned by each CP rank, so
+# TP8/DP2/CP4 collapses attention TP to 1 and replicates the full KDA attention
+# weights on every rank.  That topology does not fit K3-24L on a 64 GiB NPU.
+# Keep two-way attention TP on prefill while preserving DP2 on decode.
+PREFILL_DP_SIZE="${PREFILL_DP_SIZE:-1}"
+DECODE_DP_SIZE="${DECODE_DP_SIZE:-${DP_SIZE:-2}}"
 NUM_HIDDEN_LAYERS="${NUM_HIDDEN_LAYERS:-24}"
 if [[ ! "${NUM_HIDDEN_LAYERS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "NUM_HIDDEN_LAYERS must be a positive integer." >&2
     exit 2
 fi
-if [[ ! "${DP_SIZE}" =~ ^[2-9][0-9]*$ ]] || (( TP_SIZE % DP_SIZE != 0 )); then
-    echo "DP_SIZE must be greater than 1 and evenly divide TP_SIZE (got DP_SIZE=${DP_SIZE}, TP_SIZE=${TP_SIZE})." >&2
+for role_dp_name in PREFILL_DP_SIZE DECODE_DP_SIZE; do
+    role_dp_size="${!role_dp_name}"
+    if [[ ! "${role_dp_size}" =~ ^[1-9][0-9]*$ ]] || (( TP_SIZE % role_dp_size != 0 )); then
+        echo "${role_dp_name} must be positive and evenly divide TP_SIZE" \
+            "(got ${role_dp_name}=${role_dp_size}, TP_SIZE=${TP_SIZE})." >&2
+        exit 2
+    fi
+done
+PREFILL_CP_SIZE="${PREFILL_CP_SIZE:-4}"
+PREFILL_ATTN_PARALLEL_SIZE=$((TP_SIZE / PREFILL_DP_SIZE))
+if [[ ! "${PREFILL_CP_SIZE}" =~ ^[2-9][0-9]*$ ]] \
+    || (( PREFILL_ATTN_PARALLEL_SIZE % PREFILL_CP_SIZE != 0 )); then
+    echo "PREFILL_CP_SIZE must be greater than 1 and divide TP_SIZE / PREFILL_DP_SIZE" \
+        "(got CP=${PREFILL_CP_SIZE}, TP=${TP_SIZE}, Prefill-DP=${PREFILL_DP_SIZE})." >&2
     exit 2
 fi
-PREFILL_CP_SIZE="${PREFILL_CP_SIZE:-$((TP_SIZE / DP_SIZE))}"
-if [[ ! "${PREFILL_CP_SIZE}" =~ ^[2-9][0-9]*$ ]] || (( PREFILL_CP_SIZE != TP_SIZE / DP_SIZE )); then
-    echo "PREFILL_CP_SIZE must equal TP_SIZE / DP_SIZE for the current MLA CP topology" \
-        "(got PREFILL_CP_SIZE=${PREFILL_CP_SIZE}, TP_SIZE=${TP_SIZE}, DP_SIZE=${DP_SIZE})." >&2
+PREFILL_ATTN_TP_SIZE=$((PREFILL_ATTN_PARALLEL_SIZE / PREFILL_CP_SIZE))
+if (( PREFILL_ATTN_TP_SIZE < 2 )); then
+    echo "Prefill attention TP must be at least 2 for K3-24L on 64 GiB NPU; " \
+        "TP${TP_SIZE}/DP${PREFILL_DP_SIZE}/CP${PREFILL_CP_SIZE} would replicate full KDA attention weights." >&2
     exit 2
 fi
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.84}"
@@ -104,7 +122,6 @@ COMMON_ARGS=(
     --dtype bfloat16
     --tp-size "${TP_SIZE}"
     --enable-dp-attention
-    --dp-size "${DP_SIZE}"
     --enable-dp-lm-head
     --page-size "${PAGE_SIZE}"
     --mem-fraction-static "${MEM_FRACTION_STATIC}"
@@ -120,10 +137,12 @@ COMMON_ARGS=(
 case "${ROLE}" in
     prefill)
         LOG_FILE="${LOG_DIR}/prefill_$(date '+%Y-%m-%d_%H-%M-%S').log"
-        echo "Starting Kimi-K3 ${NUM_HIDDEN_LAYERS}-layer prefill on NPU 0-7; log=${LOG_FILE}"
+        echo "Starting Kimi-K3 ${NUM_HIDDEN_LAYERS}-layer prefill on NPU 0-7" \
+            "(TP=${TP_SIZE}, DP=${PREFILL_DP_SIZE}, CP=${PREFILL_CP_SIZE}, attention-TP=${PREFILL_ATTN_TP_SIZE}); log=${LOG_FILE}"
         python3 -m sglang.launch_server \
             "${COMMON_ARGS[@]}" \
             --base-gpu-id 0 \
+            --dp-size "${PREFILL_DP_SIZE}" \
             --disaggregation-mode prefill \
             --disaggregation-transfer-backend ascend \
             --disaggregation-bootstrap-port "${BOOTSTRAP_PORT}" \
@@ -137,10 +156,12 @@ case "${ROLE}" in
         ;;
     decode)
         LOG_FILE="${LOG_DIR}/decode_$(date '+%Y-%m-%d_%H-%M-%S').log"
-        echo "Starting Kimi-K3 ${NUM_HIDDEN_LAYERS}-layer decode on NPU 8-15; log=${LOG_FILE}"
+        echo "Starting Kimi-K3 ${NUM_HIDDEN_LAYERS}-layer decode on NPU 8-15" \
+            "(TP=${TP_SIZE}, DP=${DECODE_DP_SIZE}, CP=1, attention-TP=$((TP_SIZE / DECODE_DP_SIZE))); log=${LOG_FILE}"
         python3 -m sglang.launch_server \
             "${COMMON_ARGS[@]}" \
             --base-gpu-id 8 \
+            --dp-size "${DECODE_DP_SIZE}" \
             --disaggregation-mode decode \
             --disaggregation-transfer-backend ascend \
             --disaggregation-decode-extra-slots 8 \
