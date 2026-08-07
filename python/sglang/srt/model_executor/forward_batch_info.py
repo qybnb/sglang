@@ -1128,6 +1128,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
 
         # Local import: a module-level cp_utils import here is circular (#27014).
+        from sglang.srt.layers.cp.utils import is_cp_v2_active
         from sglang.srt.layers.utils.cp_utils import get_cp_padding_align_size
 
         assert self.global_num_tokens_cpu is not None
@@ -1173,9 +1174,25 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         else:
             num_tokens = global_num_tokens[0]
 
+        local_buffer_len = num_tokens
+        if is_cp_v2_active(self):
+            cp_size = get_parallel().attn_cp_size
+            if num_tokens % cp_size != 0:
+                raise ValueError(
+                    "CP-v2 requires the padded token count to be divisible by "
+                    f"CP size, got tokens={num_tokens}, cp_size={cp_size}."
+                )
+            # The attention-TP all-gather is performed independently inside
+            # each CP rank, so its output buffer contains only that CP rank's
+            # token shard rather than the complete prefill sequence.
+            local_buffer_len = num_tokens // cp_size
+
         self.global_dp_buffer_len = buffer_len
         set_dp_buffer_len(
-            buffer_len, num_tokens, dp_padding_mode.is_max_len(), global_num_tokens
+            buffer_len,
+            local_buffer_len,
+            dp_padding_mode.is_max_len(),
+            global_num_tokens,
         )
         set_is_extend_in_batch(self.is_extend_in_batch)
 

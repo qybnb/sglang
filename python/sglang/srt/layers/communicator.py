@@ -207,6 +207,14 @@ class ScatterMode(Enum):
     @staticmethod
     def model_input_output():
         """The scatter mode for model forward pass input and output data"""
+        # CP-v2 shards tokens across the CP dimension before entering the model,
+        # but keeps each CP-local shard replicated inside its attention-TP
+        # group.  Treating that input as SCATTERED would incorrectly all-gather
+        # it once more over attention TP.
+        from sglang.srt.layers.cp.utils import enable_cp_v2
+
+        if enable_cp_v2() and get_parallel().attn_cp_size > 1:
+            return ScatterMode.TP_ATTN_FULL
         if is_dsa_enable_prefill_cp() or is_mla_prefill_cp_enabled():
             return ScatterMode.SCATTERED
 

@@ -114,6 +114,10 @@ export HCCL_BUFFSIZE="${HCCL_BUFFSIZE:-1200}"
 export HCCL_OP_EXPANSION_MODE="${HCCL_OP_EXPANSION_MODE:-AIV}"
 export SGLANG_MAMBA_CONV_DTYPE="${SGLANG_MAMBA_CONV_DTYPE:-bfloat16}"
 export ASCEND_MF_STORE_URL="${ASCEND_MF_STORE_URL:-tcp://127.0.0.1:${MF_STORE_PORT}}"
+# K3 uses the model-boundary CP-v2 path: shard embeddings before the text
+# backbone and gather hidden states before logits.  The legacy MLA CP path
+# assumes attention-TP=1 and cannot represent the CP4 x attention-TP2 layout.
+export SGLANG_ENABLE_CP_V2="${SGLANG_ENABLE_CP_V2:-1}"
 
 COMMON_ARGS=(
     --model-loader-extra-config '{"enable_multithread_load": true}'

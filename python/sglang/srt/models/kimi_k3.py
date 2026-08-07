@@ -31,6 +31,7 @@ from sglang.srt.layers.communicator import (
     ScatterMode,
     get_attn_tp_context,
 )
+from sglang.srt.layers.cp.utils import enable_cp_v2
 from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
@@ -95,6 +96,15 @@ from sglang.srt.utils.common import BumpAllocator, add_prefix, set_weight_attrs
 from sglang.srt.hardware_backend.npu.utils import situ_and_mul, apply_attn_res
 
 logger = logging.getLogger(__name__)
+
+
+def _use_kimi_attn_tp_token_scatter() -> bool:
+    """Whether K3 partitions CP-local tokens over attention TP for MoE/MLP."""
+    parallel = get_parallel()
+    return parallel.attn_tp_size > 1 and (
+        is_dp_attention_enabled()
+        or (enable_cp_v2() and parallel.attn_cp_size > 1)
+    )
 
 
 def _log_kimi_k3_npu_prefill_cp_input(
@@ -241,7 +251,7 @@ class KimiMLP(nn.Module):
     ) -> None:
         super().__init__()
         if tp_rank is None or tp_size is None:
-            if is_dp_attention_enabled():
+            if _use_kimi_attn_tp_token_scatter():
                 tp_rank = get_parallel().attn_tp_rank
                 tp_size = get_parallel().attn_tp_size
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -393,7 +403,7 @@ class KimiMoE(nn.Module):
 
     def _forward_shared_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Run the TP-sharded shared MLP while keeping MoE tokens scattered."""
-        if not (is_dp_attention_enabled() and get_parallel().attn_tp_size > 1):
+        if not _use_kimi_attn_tp_token_scatter():
             return self.shared_experts(hidden_states)
 
         gathered_hidden_states = get_local_dp_buffer(get_attention_tp_group())
@@ -409,8 +419,7 @@ class KimiMoE(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_size)
 
         use_attn_tp_comm = (
-            is_dp_attention_enabled()
-            and get_parallel().attn_tp_size > 1
+            _use_kimi_attn_tp_token_scatter()
             and get_moe_a2a_backend().is_none()
         )
         if use_attn_tp_comm:
@@ -479,7 +488,7 @@ class KimiMoE(nn.Module):
             )[get_parallel().attn_tp_rank]
         elif (
             self.tp_size > 1
-            and not is_dp_attention_enabled()
+            and not _use_kimi_attn_tp_token_scatter()
             and get_moe_a2a_backend().is_none()
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
@@ -926,7 +935,7 @@ class KimiDecoderLayer(nn.Module):
             is_previous_layer_sparse=is_previous_layer_sparse,
             is_next_layer_sparse=is_next_layer_sparse,
         )
-        if is_dp_attention_enabled():
+        if _use_kimi_attn_tp_token_scatter():
             if layer_idx == 0:
                 self.layer_scatter_modes.layer_input_mode = (
                     ScatterMode.model_input_output()
@@ -1008,8 +1017,10 @@ class KimiDecoderLayer(nn.Module):
             block_residual = torch.cat(
                 (block_residual, prefix_sum.unsqueeze(1)), dim=1
             )
-            if self.layer_idx == 0 and is_dp_attention_enabled() and self.attn_tp_size > 1:
-                block_residual = block_residual.tensor_split(self.attn_tp_size)[self.attn_tp_rank]
+            if self.layer_idx == 0 and _use_kimi_attn_tp_token_scatter():
+                block_residual = block_residual.tensor_split(self.attn_tp_size)[
+                    self.attn_tp_rank
+                ]
             prefix_sum = None
 
         # Reuse framework: prepare_attn (input_layernorm + AllGather SCATTERED→TP_ATTN_FULL)
@@ -1025,7 +1036,7 @@ class KimiDecoderLayer(nn.Module):
         )
 
         # Reuse framework: prepare_mlp (reduce_scatter TP_ATTN_FULL->SCATTERED, skip layernorm)
-        if is_dp_attention_enabled():
+        if _use_kimi_attn_tp_token_scatter():
             hidden_states, _ = self.layer_communicator.prepare_mlp(
                 hidden_states, None, forward_batch, skip_layernorm=True
             )
@@ -1048,7 +1059,7 @@ class KimiDecoderLayer(nn.Module):
             hidden_states = self.mlp(hidden_states)
         else:
             # Dense MLP: needs TP_ATTN_FULL
-            if self.attn_tp_size > 1 and is_dp_attention_enabled():
+            if _use_kimi_attn_tp_token_scatter():
                 hidden_states_full = get_local_dp_buffer(
                     get_attention_tp_group()
                 )
@@ -1230,7 +1241,7 @@ class KimiLinearModel(nn.Module):
                 captured_hidden = self._dspark_capture_stream(
                     i, hidden_states, residual
                 )
-                if is_dp_attention_enabled() and get_parallel().attn_tp_size > 1:
+                if _use_kimi_attn_tp_token_scatter():
                     attn_tp_size = get_parallel().attn_tp_size
                     expected_num_tokens = captured_hidden.shape[0] * attn_tp_size
                     if expected_num_tokens != forward_batch.input_ids.shape[0]:
@@ -1271,7 +1282,7 @@ class KimiLinearModel(nn.Module):
                     hidden_states, _ = self.norm(hidden_states, residual)
                 # when dp-attention and attn-tp != 1, the output is Scattered,
                 # should do AllGather to make it TP-ATTN-FULL for final output
-                if is_dp_attention_enabled() and get_parallel().attn_tp_size > 1:
+                if _use_kimi_attn_tp_token_scatter():
                     gathered = get_local_dp_buffer(
                         get_attention_tp_group()
                     )
