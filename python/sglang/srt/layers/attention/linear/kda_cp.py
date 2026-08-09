@@ -1,18 +1,18 @@
 """Context-parallel communication helpers for KDA prefill.
 
-KDA is recurrent along the token dimension, so a rank-local token shard cannot
-be scanned independently.  The prefill path transposes the CP layout with an
-all-to-all:
+The established fallback transposes token and head sharding with an all-to-all.
+The FLA backend adapts flash-linear-attention PR 691's affine recurrent-state
+composition to SGLang's two-segment zigzag layout. It keeps QKV rank-local and
+only all-gathers the much smaller per-segment state transforms.
 
-    local tokens x all local-TP heads
-        -> all tokens x a CP shard of the heads
-
-After the full-sequence KDA scan, the inverse all-to-all restores the original
-rank-local token layout.  Decode never enters these helpers.
+Decode never enters these helpers.
 """
 
 from __future__ import annotations
 
+import os
+from dataclasses import dataclass
+from itertools import accumulate
 from typing import Any, Optional
 
 import torch
@@ -23,8 +23,40 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 
 
+@dataclass(frozen=True)
+class KDAFLACPContext:
+    """Operator-level CP metadata for the PR-691-style KDA path."""
+
+    group: Any
+    cp_size: int
+    cp_rank: int
+    batch_size: int
+    split_list: tuple[int, ...]
+    local_segment_lens: tuple[int, ...]
+    local_cu_seqlens: torch.Tensor
+    local_segment_slots: tuple[int, ...]
+    rank_segment_slots: tuple[tuple[int, ...], ...]
+    fixed_segment_sources: tuple[int, ...]
+    max_rank_segments: int
+    fixed_segment_lens: tuple[int, ...]
+    track_after_slots: tuple[int, ...]
+    track_state_indices: torch.Tensor
+
+    @property
+    def num_local_segments(self) -> int:
+        return len(self.local_segment_lens)
+
+    @property
+    def num_fixed_segments(self) -> int:
+        # Reserve two subsegments for every natural zigzag block.  Normally only
+        # part 0 is populated; part 1 is used when a radix checkpoint splits a
+        # block. Collectives send only rank-owned segments, padded to the maximum
+        # rank segment count.
+        return self.batch_size * 2 * self.cp_size * 2
+
+
 def kda_use_prefill_cp(forward_batch: Any) -> bool:
-    """Whether this forward should run the KDA sequence/head all-to-all."""
+    """Whether this forward needs a context-parallel KDA implementation."""
     parallel = get_parallel()
     server_args = get_global_server_args()
     mode = forward_batch.forward_mode
@@ -39,8 +71,31 @@ def kda_use_prefill_cp(forward_batch: Any) -> bool:
     )
 
 
+def kda_use_fla_prefill_cp(forward_batch: Any) -> bool:
+    """Whether PR-691-style state composition can handle this KDA batch."""
+    server_args = get_global_server_args()
+    prefill_backend = (
+        getattr(server_args, "linear_attn_prefill_backend", None)
+        or getattr(server_args, "linear_attn_backend", "triton")
+    )
+    metadata = getattr(forward_batch, "attn_cp_metadata", None)
+    has_nonempty_zigzag_blocks = bool(
+        metadata is not None
+        and getattr(metadata, "split_list", None)
+        and min(metadata.split_list) > 0
+    )
+    return bool(
+        kda_use_prefill_cp(forward_batch)
+        and getattr(server_args, "kda_cp_backend", "a2a") == "fla"
+        and prefill_backend == "triton"
+        and os.getenv("SGLANG_KDA_TORCH_NATIVE_EXTEND", "0") != "1"
+        and has_nonempty_zigzag_blocks
+    )
+
+
 def _validate_zigzag_metadata(metadata: Any, cp_size: int) -> None:
     required = (
+        "bs",
         "split_list",
         "cp_reverse_index",
         "reverse_split_len",
@@ -58,6 +113,408 @@ def _validate_zigzag_metadata(metadata: Any, cp_size: int) -> None:
             "KDA CP metadata/group size mismatch: "
             f"metadata={len(metadata.per_rank_actual_token)}, cp_size={cp_size}"
         )
+
+
+def build_kda_fla_cp_context(
+    forward_batch: Any,
+    *,
+    device: torch.device,
+    group: Optional[Any] = None,
+) -> KDAFLACPContext:
+    """Build local segment offsets for a zigzag-sharded KDA invocation.
+
+    A tracked radix boundary may fall inside one natural zigzag block.  Split
+    only that block at the exact cache boundary, making the recurrent and
+    convolution state at the boundary directly observable without gathering
+    token activations.
+    """
+    if group is None:
+        cached = getattr(forward_batch, "kda_fla_cp_context", None)
+        if cached is not None:
+            return cached
+    parallel = get_parallel()
+    cp_size = parallel.attn_cp_size
+    cp_rank = parallel.attn_cp_rank
+    metadata = forward_batch.attn_cp_metadata
+    _validate_zigzag_metadata(metadata, cp_size)
+    bs = int(metadata.bs)
+    blocks_per_request = 2 * cp_size
+    split_list = tuple(int(length) for length in metadata.split_list)
+    if min(split_list) <= 0:
+        raise ValueError("KDA FLA CP requires every zigzag block to be non-empty")
+
+    track_mask_tensor = getattr(forward_batch, "mamba_track_mask", None)
+    if track_mask_tensor is None:
+        track_mask = [False] * bs
+    else:
+        track_mask = [
+            bool(value) for value in track_mask_tensor.detach().cpu().tolist()[:bs]
+        ]
+        if len(track_mask) != bs:
+            raise ValueError("KDA FLA CP track mask does not match batch size")
+
+    track_offsets = [-1] * bs
+    if any(track_mask):
+        track_seqlens = getattr(forward_batch, "mamba_track_seqlens", None)
+        track_indices = getattr(forward_batch, "mamba_track_indices", None)
+        if track_seqlens is None or track_indices is None:
+            raise ValueError("KDA FLA CP radix tracking metadata is incomplete")
+        track_seqlens_cpu = track_seqlens.detach().cpu().tolist()[:bs]
+        prefix_lens_cpu = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+        if prefix_lens_cpu is None:
+            prefix_lens_cpu = (
+                forward_batch.extend_prefix_lens.detach().cpu().tolist()[:bs]
+            )
+        cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
+        for request_id, should_track in enumerate(track_mask):
+            if not should_track:
+                continue
+            reported_extend_offset = int(track_seqlens_cpu[request_id]) - int(
+                prefix_lens_cpu[request_id]
+            )
+            # The scheduler may add one to force an intermediate-h lookup.  The
+            # actual radix state is always the preceding cache-chunk boundary,
+            # which is exactly the same alignment used for the conv checkpoint.
+            track_offsets[request_id] = (
+                reported_extend_offset // cache_chunk_size
+            ) * cache_chunk_size
+
+    fixed_segment_lens = [0] * (bs * blocks_per_request * 2)
+    track_after_slots = [-1] * bs
+    for request_id in range(bs):
+        cursor = 0
+        request_total = sum(
+            split_list[
+                request_id * blocks_per_request : (request_id + 1)
+                * blocks_per_request
+            ]
+        )
+        track_offset = track_offsets[request_id]
+        if track_mask[request_id] and not 0 < track_offset <= request_total:
+            raise ValueError(
+                "KDA FLA CP radix checkpoint is outside the extend range: "
+                f"request={request_id}, offset={track_offset}, extend={request_total}."
+            )
+        for block_id in range(blocks_per_request):
+            block_len = split_list[request_id * blocks_per_request + block_id]
+            fixed_slot = ((request_id * blocks_per_request + block_id) * 2)
+            block_end = cursor + block_len
+            if cursor < track_offset < block_end:
+                fixed_segment_lens[fixed_slot] = track_offset - cursor
+                fixed_segment_lens[fixed_slot + 1] = block_end - track_offset
+                track_after_slots[request_id] = fixed_slot
+            else:
+                fixed_segment_lens[fixed_slot] = block_len
+                if track_offset == block_end:
+                    track_after_slots[request_id] = fixed_slot
+            cursor = block_end
+        if track_mask[request_id] and track_after_slots[request_id] < 0:
+            raise ValueError(
+                f"KDA FLA CP could not place request {request_id}'s radix checkpoint"
+            )
+
+    rank_segment_slots_list = []
+    fixed_segment_sources = [-1] * len(fixed_segment_lens)
+    for rank in range(cp_size):
+        rank_slots = []
+        for block_id in (rank, blocks_per_request - rank - 1):
+            for request_id in range(bs):
+                fixed_slot = ((request_id * blocks_per_request + block_id) * 2)
+                for part_id in range(2):
+                    if fixed_segment_lens[fixed_slot + part_id] > 0:
+                        fixed_segment_sources[fixed_slot + part_id] = len(rank_slots)
+                        rank_slots.append(fixed_slot + part_id)
+        rank_segment_slots_list.append(tuple(rank_slots))
+
+    rank_segment_slots = tuple(rank_segment_slots_list)
+    local_segment_slots = rank_segment_slots[cp_rank]
+    local_segment_lens = tuple(
+        fixed_segment_lens[fixed_slot] for fixed_slot in local_segment_slots
+    )
+    local_cu_seqlens = torch.tensor(
+        [0, *accumulate(local_segment_lens)],
+        dtype=torch.int32,
+        device=device,
+    )
+    track_state_indices = torch.full((bs,), -1, dtype=torch.int64, device=device)
+    if any(track_mask):
+        track_indices = forward_batch.mamba_track_indices.to(
+            device=device, dtype=torch.int64
+        )[:bs]
+        mask_device = torch.tensor(track_mask, dtype=torch.bool, device=device)
+        track_state_indices = torch.where(
+            mask_device, track_indices, track_state_indices
+        )
+
+    context = KDAFLACPContext(
+        group=group or get_attention_cp_group(),
+        cp_size=cp_size,
+        cp_rank=cp_rank,
+        batch_size=bs,
+        split_list=split_list,
+        local_segment_lens=local_segment_lens,
+        local_cu_seqlens=local_cu_seqlens,
+        local_segment_slots=local_segment_slots,
+        rank_segment_slots=rank_segment_slots,
+        fixed_segment_sources=tuple(fixed_segment_sources),
+        max_rank_segments=max(len(rank_slots) for rank_slots in rank_segment_slots),
+        fixed_segment_lens=tuple(fixed_segment_lens),
+        track_after_slots=tuple(track_after_slots),
+        track_state_indices=track_state_indices,
+    )
+    if group is None:
+        forward_batch.kda_fla_cp_context = context
+    return context
+
+
+def _all_gather_fixed_shape(
+    local: torch.Tensor, context: KDAFLACPContext
+) -> torch.Tensor:
+    gathered = local.new_empty(
+        (context.cp_size * local.shape[0], *local.shape[1:])
+    )
+    context.group.all_gather_into_tensor(gathered, local.contiguous())
+    return gathered.view(context.cp_size, *local.shape)
+
+
+def _natural_block_owner_rank(block_id: int, cp_size: int) -> int:
+    if block_id < cp_size:
+        return block_id
+    return 2 * cp_size - block_id - 1
+
+
+def compose_kda_cp_affine_states(
+    local_affine: torch.Tensor,
+    initial_state_source: torch.Tensor,
+    initial_state_indices: torch.Tensor,
+    context: KDAFLACPContext,
+) -> torch.Tensor:
+    """Compose all zigzag segment transforms and return local initial states.
+
+    ``local_affine`` stores ``[H | M]`` for every local segment such that
+    ``state_out = M @ state_in + H``. All ranks gather these compact transforms,
+    walk the natural block order, and independently derive identical final
+    request states. This is the inference counterpart of FLA PR 691's forward
+    pre-processing and merge kernels.
+    """
+    bs = context.batch_size
+    expected_segments = context.num_local_segments
+    if local_affine.ndim != 4 or local_affine.shape[0] != expected_segments:
+        raise ValueError(
+            "KDA FLA CP affine tensor must be [local_segments, heads, K, V+K], "
+            f"got {tuple(local_affine.shape)} for bs={bs}."
+        )
+    key_dim = local_affine.shape[-2]
+    value_dim = local_affine.shape[-1] - key_dim
+    if value_dim <= 0:
+        raise ValueError("KDA FLA CP affine tensor has an invalid value dimension")
+    if initial_state_indices.numel() != bs:
+        raise ValueError(
+            "KDA FLA CP state indices must match batch size: "
+            f"indices={initial_state_indices.numel()}, bs={bs}."
+        )
+    if tuple(initial_state_source.shape[-2:]) != (key_dim, value_dim):
+        raise ValueError(
+            "KDA FLA CP state shape does not match affine transform: "
+            f"state={tuple(initial_state_source.shape[-2:])}, "
+            f"affine={(key_dim, value_dim)}."
+        )
+
+    padded_affine = local_affine.new_zeros(
+        context.max_rank_segments, *local_affine.shape[1:]
+    )
+    identity_transform = local_affine.new_zeros(*local_affine.shape[1:])
+    identity = torch.eye(
+        key_dim, dtype=padded_affine.dtype, device=padded_affine.device
+    ).view(1, key_dim, key_dim)
+    identity_transform[..., value_dim:].copy_(identity)
+    padded_affine.copy_(identity_transform)
+    padded_affine[:expected_segments].copy_(local_affine)
+    gathered = _all_gather_fixed_shape(padded_affine, context)
+    valid = initial_state_indices >= 0
+    safe_indices = initial_state_indices.clamp_min(0).to(torch.int64)
+    state = initial_state_source.index_select(0, safe_indices).float()
+    state = state * valid.view(bs, 1, 1, 1)
+    local_initial = state.new_empty(expected_segments, *state.shape[1:])
+    local_slot_to_index = {
+        fixed_slot: local_index
+        for local_index, fixed_slot in enumerate(context.local_segment_slots)
+    }
+    tracked_state = torch.empty_like(state)
+    tracked_state_is_set = [False] * bs
+    blocks_per_request = 2 * context.cp_size
+
+    for block_id in range(blocks_per_request):
+        owner_rank = _natural_block_owner_rank(block_id, context.cp_size)
+        for part_id in range(2):
+            fixed_slots = [
+                ((request_id * blocks_per_request + block_id) * 2 + part_id)
+                for request_id in range(bs)
+            ]
+            source_segments = [
+                context.fixed_segment_sources[fixed_slot]
+                for fixed_slot in fixed_slots
+            ]
+            if all(source_segment < 0 for source_segment in source_segments):
+                continue
+            if owner_rank == context.cp_rank:
+                for request_id, fixed_slot in enumerate(fixed_slots):
+                    local_index = local_slot_to_index.get(fixed_slot)
+                    if local_index is not None:
+                        local_initial[local_index].copy_(state[request_id])
+            transforms = torch.stack(
+                [
+                    (
+                        gathered[owner_rank, source_segment]
+                        if source_segment >= 0
+                        else identity_transform
+                    )
+                    for source_segment in source_segments
+                ]
+            ).float()
+            additive = transforms[..., :value_dim]
+            transition = transforms[..., value_dim:]
+            state = torch.matmul(transition, state) + additive
+            for request_id, fixed_slot in enumerate(fixed_slots):
+                if context.track_after_slots[request_id] == fixed_slot:
+                    tracked_state[request_id].copy_(state[request_id])
+                    tracked_state_is_set[request_id] = True
+
+    active_indices = initial_state_indices[valid].to(torch.int64)
+    if active_indices.numel() > 0:
+        initial_state_source.index_copy_(
+            0,
+            active_indices,
+            state[valid].to(initial_state_source.dtype),
+        )
+    track_valid = context.track_state_indices >= 0
+    if bool(track_valid.any()):
+        for request_id in track_valid.nonzero(as_tuple=True)[0].cpu().tolist():
+            if not tracked_state_is_set[request_id]:
+                raise RuntimeError(
+                    "KDA FLA CP did not produce a requested radix checkpoint"
+                )
+        initial_state_source.index_copy_(
+            0,
+            context.track_state_indices[track_valid],
+            tracked_state[track_valid].to(initial_state_source.dtype),
+        )
+    return local_initial
+
+
+def prepare_kda_cp_conv_states(
+    local_x: torch.Tensor,
+    conv_state_source: torch.Tensor,
+    cache_indices: torch.Tensor,
+    context: KDAFLACPContext,
+    has_initial_state: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Build exact initial causal-conv windows for both local zigzag blocks.
+
+    Only ``kernel_size - 1`` raw QKV tokens per segment are gathered. Prefix
+    convolution state seeds block 0; gathered tails advance the rolling window
+    in natural order. The final full-head state is written on every CP rank.
+    """
+    if local_x.ndim != 2 or conv_state_source.ndim != 3:
+        raise ValueError(
+            "KDA FLA CP conv expects local [tokens, channels] and state "
+            f"[slots, channels, window], got {tuple(local_x.shape)} and "
+            f"{tuple(conv_state_source.shape)}."
+        )
+    bs = context.batch_size
+    window = conv_state_source.shape[-1]
+    channels = local_x.shape[-1]
+    if conv_state_source.shape[-2] != channels:
+        raise ValueError("KDA FLA CP conv channel count does not match cache")
+    if cache_indices.numel() != bs:
+        raise ValueError("KDA FLA CP conv cache indices do not match batch size")
+    if sum(context.local_segment_lens) != local_x.shape[0]:
+        raise ValueError(
+            "KDA FLA CP conv token count does not match local zigzag segments: "
+            f"tokens={local_x.shape[0]}, segments={sum(context.local_segment_lens)}."
+        )
+
+    segments = torch.split(local_x, context.local_segment_lens, dim=0)
+    padded_tails = local_x.new_zeros(
+        context.max_rank_segments, window, channels
+    )
+    for segment_id, segment in enumerate(segments):
+        take = min(window, segment.shape[0])
+        if take:
+            padded_tails[segment_id, -take:].copy_(segment[-take:])
+    gathered_tails = _all_gather_fixed_shape(padded_tails, context)
+
+    valid = cache_indices >= 0
+    use_prefix = valid
+    if has_initial_state is not None:
+        if has_initial_state.numel() != bs:
+            raise ValueError(
+                "KDA FLA CP conv initial-state mask does not match batch size"
+            )
+        use_prefix = valid & has_initial_state.to(
+            device=valid.device, dtype=torch.bool
+        )
+    safe_indices = cache_indices.clamp_min(0).to(torch.int64)
+    prefix_state = conv_state_source.index_select(0, safe_indices)
+    prefix_state = prefix_state * use_prefix.view(bs, 1, 1)
+    local_initial = prefix_state.new_empty(
+        context.num_local_segments, channels, window
+    )
+    local_slot_to_index = {
+        fixed_slot: local_index
+        for local_index, fixed_slot in enumerate(context.local_segment_slots)
+    }
+    final_states = []
+    tracked_states = torch.empty_like(prefix_state)
+    tracked_state_is_set = [False] * bs
+    blocks_per_request = 2 * context.cp_size
+
+    for request_id in range(bs):
+        rolling = prefix_state[request_id]
+        for block_id in range(blocks_per_request):
+            owner_rank = _natural_block_owner_rank(block_id, context.cp_size)
+            for part_id in range(2):
+                fixed_slot = (
+                    (request_id * blocks_per_request + block_id) * 2 + part_id
+                )
+                local_index = local_slot_to_index.get(fixed_slot)
+                if local_index is not None:
+                    local_initial[local_index].copy_(rolling)
+                take = min(window, context.fixed_segment_lens[fixed_slot])
+                if take:
+                    source_segment = context.fixed_segment_sources[fixed_slot]
+                    if source_segment < 0:
+                        raise RuntimeError(
+                            "KDA FLA CP conv segment has no owning rank source"
+                        )
+                    tail = gathered_tails[
+                        owner_rank, source_segment, -take:
+                    ].transpose(0, 1)
+                    rolling = torch.cat((rolling, tail), dim=-1)[..., -window:]
+                if context.track_after_slots[request_id] == fixed_slot:
+                    tracked_states[request_id].copy_(rolling)
+                    tracked_state_is_set[request_id] = True
+        final_states.append(rolling)
+    active_indices = cache_indices[valid].to(torch.int64)
+    if active_indices.numel() > 0:
+        conv_state_source.index_copy_(
+            0,
+            active_indices,
+            torch.stack(final_states)[valid].to(conv_state_source.dtype),
+        )
+    track_valid = context.track_state_indices >= 0
+    if bool(track_valid.any()):
+        for request_id in track_valid.nonzero(as_tuple=True)[0].cpu().tolist():
+            if not tracked_state_is_set[request_id]:
+                raise RuntimeError(
+                    "KDA FLA CP did not produce a requested conv checkpoint"
+                )
+        conv_state_source.index_copy_(
+            0,
+            context.track_state_indices[track_valid],
+            tracked_states[track_valid].to(conv_state_source.dtype),
+        )
+    return local_initial
 
 
 def _rank_order_to_natural(x: torch.Tensor, metadata: Any) -> torch.Tensor:
@@ -198,8 +655,13 @@ def all_gather_cp_heads(
 
 
 __all__ = [
+    "KDAFLACPContext",
     "all_gather_cp_heads",
+    "build_kda_fla_cp_context",
+    "compose_kda_cp_affine_states",
     "head_to_sequence_a2a",
+    "kda_use_fla_prefill_cp",
     "kda_use_prefill_cp",
+    "prepare_kda_cp_conv_states",
     "sequence_to_head_a2a",
 ]

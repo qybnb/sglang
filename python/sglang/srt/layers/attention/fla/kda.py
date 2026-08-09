@@ -4,7 +4,7 @@
 # the following copyright notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch.nn as nn
@@ -21,6 +21,9 @@ from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
 from sglang.srt.layers.attention.fla.op import exp, log
 from sglang.srt.layers.attention.fla.solve_tril import solve_tril
 from sglang.srt.layers.attention.fla.utils import is_amd
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.attention.linear.kda_cp import KDAFLACPContext
 
 BT_LIST_AUTOTUNE = [32, 64, 128]
 NUM_WARPS_AUTOTUNE = [2, 4, 8, 16] if is_amd else [4, 8, 16, 32]
@@ -1144,6 +1147,7 @@ def chunk_kda_fwd(
     initial_state: torch.Tensor,
     initial_state_indices: torch.Tensor,
     cu_seqlens: torch.LongTensor | None = None,
+    cp_context: Optional["KDAFLACPContext"] = None,
 ):
     chunk_size = 64
     g = chunk_local_cumsum(g, chunk_size=chunk_size, cu_seqlens=cu_seqlens)
@@ -1168,6 +1172,60 @@ def chunk_kda_fwd(
         cu_seqlens=cu_seqlens,
     )
     del A
+
+    if cp_context is not None:
+        # PR 691 represents every local recurrent segment as the affine map
+        #     state_out = M @ state_in + H.
+        # Reuse the existing delta-state kernel with augmented value columns:
+        # zero input columns seeded by an identity state produce M, while the
+        # normal value columns produce H. This keeps the adaptation compatible
+        # with the Ascend Triton fork without copying CUDA-specific FLA kernels.
+        from sglang.srt.layers.attention.linear.kda_cp import (
+            compose_kda_cp_affine_states,
+        )
+
+        if initial_state is None or initial_state_indices is None:
+            raise ValueError("KDA FLA CP requires an initial-state pool and indices")
+        num_segments = len(cu_seqlens) - 1
+        _, _, num_heads, key_dim = kg.shape
+        value_dim = u.shape[-1]
+        affine_state = torch.zeros(
+            num_segments,
+            num_heads,
+            key_dim,
+            value_dim + key_dim,
+            dtype=torch.float32,
+            device=k.device,
+        )
+        affine_state[..., value_dim:].copy_(
+            torch.eye(key_dim, dtype=torch.float32, device=k.device).view(
+                1, 1, key_dim, key_dim
+            )
+        )
+        affine_indices = torch.arange(
+            num_segments, dtype=torch.int32, device=k.device
+        )
+        augmented_u = torch.cat(
+            (u, u.new_zeros((*u.shape[:-1], key_dim))), dim=-1
+        )
+        chunk_gated_delta_rule_fwd_h(
+            k=kg,
+            w=w,
+            u=augmented_u,
+            gk=g,
+            initial_state=affine_state,
+            initial_state_indices=affine_indices,
+            save_new_value=False,
+            cu_seqlens=cu_seqlens,
+        )
+        initial_state = compose_kda_cp_affine_states(
+            affine_state,
+            initial_state,
+            initial_state_indices,
+            cp_context,
+        )
+        initial_state_indices = affine_indices
+
     h, v_new = chunk_gated_delta_rule_fwd_h(
         k=kg,
         w=w,
@@ -1204,6 +1262,7 @@ def chunk_kda(
     initial_state_indices: torch.Tensor = None,
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
+    cp_context: Optional["KDAFLACPContext"] = None,
     **kwargs,
 ):
     if scale is None:
@@ -1223,6 +1282,7 @@ def chunk_kda(
         initial_state=initial_state,
         initial_state_indices=initial_state_indices,
         cu_seqlens=cu_seqlens,
+        cp_context=cp_context,
     )
     return o, last_recurrent_state, h
 

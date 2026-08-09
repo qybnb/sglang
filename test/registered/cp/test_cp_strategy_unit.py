@@ -1,12 +1,17 @@
 import unittest
+from itertools import accumulate
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
 from sglang.srt.layers.attention.linear.kda_cp import (
+    KDAFLACPContext,
     all_gather_cp_heads,
+    build_kda_fla_cp_context,
+    compose_kda_cp_affine_states,
     head_to_sequence_a2a,
+    prepare_kda_cp_conv_states,
     sequence_to_head_a2a,
 )
 from sglang.srt.layers.cp.base import (
@@ -84,6 +89,16 @@ class _FakeHeadGatherGroup:
 
     def all_gather_into_tensor(self, output, input_tensor):
         del input_tensor
+        torch.cat(self.all_rank_tensors, dim=0, out=output)
+
+
+class _FakeFixedShapeGatherGroup:
+    def __init__(self, all_rank_tensors, rank):
+        self.all_rank_tensors = all_rank_tensors
+        self.rank = rank
+
+    def all_gather_into_tensor(self, output, input_tensor):
+        torch.testing.assert_close(input_tensor, self.all_rank_tensors[self.rank])
         torch.cat(self.all_rank_tensors, dim=0, out=output)
 
 
@@ -869,6 +884,212 @@ class TestCPZigzagStrategy(CustomTestCase):
                     local_states[rank], head_dim=1, group=group
                 )
             self.assertTrue(torch.equal(gathered, expected))
+
+    def test_kda_fla_cp_composes_zigzag_affine_states(self):
+        # Natural blocks apply: 2x+1, 3x+2, 4x+3, 5x+4.
+        # Zigzag CP2 owns [block0, block3] and [block1, block2].
+        all_rank_affine = [
+            torch.tensor([[[[1.0, 2.0]]], [[[4.0, 5.0]]]]),
+            torch.tensor([[[[2.0, 3.0]]], [[[3.0, 4.0]]]]),
+        ]
+        expected_initial = [
+            torch.tensor([[[[7.0]]], [[[191.0]]]]),
+            torch.tensor([[[[15.0]]], [[[47.0]]]]),
+        ]
+        for rank in range(2):
+            state_pool = torch.tensor([[[[7.0]]]])
+            context = KDAFLACPContext(
+                group=_FakeFixedShapeGatherGroup(all_rank_affine, rank),
+                cp_size=2,
+                cp_rank=rank,
+                batch_size=1,
+                split_list=(1, 1, 1, 1),
+                local_segment_lens=(1, 1),
+                local_cu_seqlens=torch.tensor([0, 1, 2], dtype=torch.int32),
+                local_segment_slots=((0, 6), (2, 4))[rank],
+                rank_segment_slots=((0, 6), (2, 4)),
+                fixed_segment_sources=(0, -1, 0, -1, 1, -1, 1, -1),
+                max_rank_segments=2,
+                fixed_segment_lens=(1, 0, 1, 0, 1, 0, 1, 0),
+                track_after_slots=(-1,),
+                track_state_indices=torch.tensor([-1]),
+            )
+            local_initial = compose_kda_cp_affine_states(
+                all_rank_affine[rank],
+                state_pool,
+                torch.tensor([0], dtype=torch.int32),
+                context,
+            )
+            torch.testing.assert_close(local_initial, expected_initial[rank])
+            torch.testing.assert_close(state_pool, torch.tensor([[[[959.0]]]]))
+
+    def test_kda_fla_cp_builds_conv_windows_from_zigzag_tails(self):
+        # Natural tokens are [-2,-1,0] prefix + [1,2] [3] [4,5,6] [7,8].
+        local_inputs = [
+            torch.tensor([[1.0], [2.0], [7.0], [8.0]]),
+            torch.tensor([[3.0], [4.0], [5.0], [6.0]]),
+        ]
+        all_rank_tails = [
+            torch.tensor([[[0.0], [1.0], [2.0]], [[0.0], [7.0], [8.0]]]),
+            torch.tensor([[[0.0], [0.0], [3.0]], [[4.0], [5.0], [6.0]]]),
+        ]
+        local_lens = [(2, 2), (1, 3)]
+        expected_initial = [
+            torch.tensor([[[-2.0, -1.0, 0.0]], [[4.0, 5.0, 6.0]]]),
+            torch.tensor([[[0.0, 1.0, 2.0]], [[1.0, 2.0, 3.0]]]),
+        ]
+
+        for rank in range(2):
+            state_pool = torch.tensor([[[-2.0, -1.0, 0.0]]])
+            context = KDAFLACPContext(
+                group=_FakeFixedShapeGatherGroup(all_rank_tails, rank),
+                cp_size=2,
+                cp_rank=rank,
+                batch_size=1,
+                split_list=(2, 1, 3, 2),
+                local_segment_lens=local_lens[rank],
+                local_cu_seqlens=torch.tensor(
+                    [0, local_lens[rank][0], sum(local_lens[rank])],
+                    dtype=torch.int32,
+                ),
+                local_segment_slots=((0, 6), (2, 4))[rank],
+                rank_segment_slots=((0, 6), (2, 4)),
+                fixed_segment_sources=(0, -1, 0, -1, 1, -1, 1, -1),
+                max_rank_segments=2,
+                fixed_segment_lens=(2, 0, 1, 0, 3, 0, 2, 0),
+                track_after_slots=(-1,),
+                track_state_indices=torch.tensor([-1]),
+            )
+            local_initial = prepare_kda_cp_conv_states(
+                local_inputs[rank],
+                state_pool,
+                torch.tensor([0], dtype=torch.int32),
+                context,
+            )
+            torch.testing.assert_close(local_initial, expected_initial[rank])
+            torch.testing.assert_close(
+                state_pool, torch.tensor([[[6.0, 7.0, 8.0]]])
+            )
+
+    def test_kda_fla_cp_splits_block_at_radix_checkpoint(self):
+        metadata = SimpleNamespace(
+            bs=1,
+            split_list=[131] * 8,
+            cp_reverse_index=list(range(8)),
+            reverse_split_len=[131] * 8,
+            per_rank_actual_token=[262] * 4,
+            max_rank_len=[262] * 4,
+        )
+        forward_batch = SimpleNamespace(
+            attn_cp_metadata=metadata,
+            mamba_track_mask=torch.tensor([True]),
+            mamba_track_seqlens=torch.tensor([1048]),
+            mamba_track_indices=torch.tensor([9]),
+            extend_prefix_lens=torch.tensor([0]),
+            extend_prefix_lens_cpu=[0],
+        )
+        with get_parallel().override(attn_cp_size=4, attn_cp_rank=0), patch(
+            "sglang.srt.layers.attention.linear.kda_cp.get_global_server_args",
+            return_value=SimpleNamespace(mamba_cache_chunk_size=128),
+        ):
+            context = build_kda_fla_cp_context(
+                forward_batch, device=torch.device("cpu"), group=object()
+            )
+
+        # Rank 0 owns natural blocks 0 and 7.  The 1024-token radix boundary
+        # falls 107 tokens into block 7, so only that block is split.
+        self.assertEqual(context.local_segment_lens, (131, 107, 24))
+        self.assertEqual(context.local_segment_slots, (0, 14, 15))
+        self.assertEqual(context.max_rank_segments, 3)
+        self.assertEqual(context.track_after_slots, (14,))
+        self.assertEqual(context.track_state_indices.tolist(), [9])
+
+    def test_kda_fla_cp_tracks_split_affine_and_conv_states(self):
+        local_affine = [
+            torch.tensor([[[[1.0, 2.0]]], [[[5.0, 6.0]]]]),
+            torch.tensor(
+                [[[[2.0, 3.0]]], [[[3.0, 4.0]]], [[[4.0, 5.0]]]]
+            ),
+        ]
+        local_slots = [(0, 6), (2, 4, 5)]
+        local_lens = [(2, 2), (2, 1, 1)]
+        fixed_lens = (2, 0, 2, 0, 1, 1, 2, 0)
+
+        fixed_affine = []
+        for rank in range(2):
+            padded = torch.tensor([[[[0.0, 1.0]]]]).repeat(3, 1, 1, 1)
+            padded[: len(local_affine[rank])] = local_affine[rank]
+            fixed_affine.append(padded)
+
+        local_x = [
+            torch.tensor([[1.0], [2.0], [7.0], [8.0]]),
+            torch.tensor([[3.0], [4.0], [5.0], [6.0]]),
+        ]
+        fixed_tails = []
+        for rank in range(2):
+            padded = torch.zeros(3, 3, 1)
+            for segment_id, segment in enumerate(
+                torch.split(local_x[rank], local_lens[rank])
+            ):
+                take = min(3, segment.shape[0])
+                padded[segment_id, -take:] = segment[-take:]
+            fixed_tails.append(padded)
+
+        expected_affine_initial = [
+            torch.tensor([[[[7.0]]], [[[959.0]]]]),
+            torch.tensor([[[[15.0]]], [[[47.0]]], [[[191.0]]]]),
+        ]
+        expected_conv_initial = [
+            torch.tensor([[[-2.0, -1.0, 0.0]], [[4.0, 5.0, 6.0]]]),
+            torch.tensor(
+                [[[0.0, 1.0, 2.0]], [[2.0, 3.0, 4.0]], [[3.0, 4.0, 5.0]]]
+            ),
+        ]
+
+        for rank in range(2):
+            common = dict(
+                cp_size=2,
+                cp_rank=rank,
+                batch_size=1,
+                split_list=(2, 2, 2, 2),
+                local_segment_lens=local_lens[rank],
+                local_cu_seqlens=torch.tensor(
+                    [0, *accumulate(local_lens[rank])],
+                    dtype=torch.int32,
+                ),
+                local_segment_slots=local_slots[rank],
+                rank_segment_slots=tuple(local_slots),
+                fixed_segment_sources=(0, -1, 0, -1, 1, 2, 1, -1),
+                max_rank_segments=3,
+                fixed_segment_lens=fixed_lens,
+                track_after_slots=(4,),
+                track_state_indices=torch.tensor([1]),
+            )
+            state_pool = torch.zeros(2, 1, 1, 1)
+            state_pool[0] = 7
+            affine_context = KDAFLACPContext(
+                group=_FakeFixedShapeGatherGroup(fixed_affine, rank), **common
+            )
+            affine_initial = compose_kda_cp_affine_states(
+                local_affine[rank], state_pool, torch.tensor([0]), affine_context
+            )
+            torch.testing.assert_close(
+                affine_initial, expected_affine_initial[rank]
+            )
+            torch.testing.assert_close(state_pool[0], torch.tensor([[[5759.0]]]))
+            torch.testing.assert_close(state_pool[1], torch.tensor([[[191.0]]]))
+
+            conv_pool = torch.zeros(2, 1, 3)
+            conv_pool[0] = torch.tensor([[-2.0, -1.0, 0.0]])
+            conv_context = KDAFLACPContext(
+                group=_FakeFixedShapeGatherGroup(fixed_tails, rank), **common
+            )
+            conv_initial = prepare_kda_cp_conv_states(
+                local_x[rank], conv_pool, torch.tensor([0]), conv_context
+            )
+            torch.testing.assert_close(conv_initial, expected_conv_initial[rank])
+            torch.testing.assert_close(conv_pool[0], torch.tensor([[6.0, 7.0, 8.0]]))
+            torch.testing.assert_close(conv_pool[1], torch.tensor([[3.0, 4.0, 5.0]]))
 
 
 if __name__ == "__main__":

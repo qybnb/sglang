@@ -632,6 +632,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
         lower_bound: Optional[float] = None,
         **kwargs,
     ) -> tuple[torch.Tensor, None, Optional[torch.Tensor]]:
+        cp_context = kwargs.get("cp_context")
         # Early input check (before any kernel call)
         import os as _os_early
         if _os_early.getenv("SGLANG_KDA_DEBUG", "0") == "1" and A_log is not None:
@@ -651,6 +652,10 @@ class TritonKDAKernel(LinearAttnKernelBase):
                   f"q_shape={list(q.shape)}",
                   file=_sys_early.stderr, flush=True)
         if _KDA_USE_TORCH_NATIVE_EXTEND and A_log is not None:
+            if cp_context is not None:
+                raise NotImplementedError(
+                    "KDA torch-native extend does not support the FLA CP backend"
+                )
             import os as _os
             if _os.getenv("SGLANG_KDA_DEBUG", "0") == "1":
                 import sys as _sys
@@ -694,6 +699,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
             A_log=None,
             dt_bias=None,
             lower_bound=lower_bound,
+            cp_context=cp_context,
         )
 
         # Debug: compare triton vs native on NPU

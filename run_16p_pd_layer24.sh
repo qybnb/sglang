@@ -57,11 +57,10 @@ ROUTER_PORT="${ROUTER_PORT:-6688}"
 BOOTSTRAP_PORT="${BOOTSTRAP_PORT:-8998}"
 MF_STORE_PORT="${MF_STORE_PORT:-24669}"
 TP_SIZE="${TP_SIZE:-8}"
-# Prefill CP consumes ranks from the attention-parallel dimension.  KDA's
-# token->head A2A requires the pre-projection weights owned by each CP rank, so
-# TP8/DP2/CP4 collapses attention TP to 1 and replicates the full KDA attention
-# weights on every rank.  That topology does not fit K3-24L on a 64 GiB NPU.
-# Keep two-way attention TP on prefill while preserving DP2 on decode.
+# Prefill CP consumes ranks from the attention-parallel dimension. TP8/DP2/CP4
+# would collapse attention TP to 1 and replicate the full attention weights on
+# every rank, which does not fit K3-24L on a 64 GiB NPU. Keep two-way attention
+# TP on prefill while preserving DP2 on decode.
 PREFILL_DP_SIZE="${PREFILL_DP_SIZE:-1}"
 DECODE_DP_SIZE="${DECODE_DP_SIZE:-${DP_SIZE:-2}}"
 NUM_HIDDEN_LAYERS="${NUM_HIDDEN_LAYERS:-24}"
@@ -102,6 +101,11 @@ CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-4096}"
 MLA_CP_BACKEND="${MLA_CP_BACKEND:-allgather}"
 if [[ "${MLA_CP_BACKEND}" != "allgather" && "${MLA_CP_BACKEND}" != "ring" ]]; then
     echo "MLA_CP_BACKEND must be allgather or ring (got ${MLA_CP_BACKEND})." >&2
+    exit 2
+fi
+KDA_CP_BACKEND="${KDA_CP_BACKEND:-fla}"
+if [[ "${KDA_CP_BACKEND}" != "a2a" && "${KDA_CP_BACKEND}" != "fla" ]]; then
+    echo "KDA_CP_BACKEND must be a2a or fla (got ${KDA_CP_BACKEND})." >&2
     exit 2
 fi
 PAGE_SIZE="${PAGE_SIZE:-128}"
@@ -194,7 +198,7 @@ case "${ROLE}" in
         LOG_FILE="${LOG_DIR}/prefill_$(date '+%Y-%m-%d_%H-%M-%S').log"
         echo "Starting Kimi-K3 ${NUM_HIDDEN_LAYERS}-layer prefill at ${PREFILL_HOST} (bind=${PREFILL_BIND_HOST}) on NPU ${PREFILL_BASE_GPU_ID}-$((PREFILL_BASE_GPU_ID + TP_SIZE - 1))" \
             "(TP=${TP_SIZE}, DP=${PREFILL_DP_SIZE}, CP=${PREFILL_CP_SIZE}, attention-TP=${PREFILL_ATTN_TP_SIZE}," \
-            "MLA-CP=${MLA_CP_BACKEND}, HCCL=${HCCL_BUFFSIZE}MB, MF=${ASCEND_MF_TRANSFER_PROTOCOL}," \
+            "MLA-CP=${MLA_CP_BACKEND}, KDA-CP=${KDA_CP_BACKEND}, HCCL=${HCCL_BUFFSIZE}MB, MF=${ASCEND_MF_TRANSFER_PROTOCOL}," \
             "DeepEP-round=${DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS}x${DEEPEP_NORMAL_LONG_SEQ_ROUND});" \
             "log=${LOG_FILE}"
         python3 -m sglang.launch_server \
@@ -210,6 +214,7 @@ case "${ROLE}" in
             --enable-prefill-cp \
             --cp-strategy zigzag \
             --mla-cp-backend "${MLA_CP_BACKEND}" \
+            --kda-cp-backend "${KDA_CP_BACKEND}" \
             --chunked-prefill-size "${CHUNKED_PREFILL_SIZE}" \
             --deepep-mode normal \
             --disable-cuda-graph \

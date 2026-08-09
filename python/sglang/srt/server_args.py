@@ -958,6 +958,19 @@ class ServerArgs:
             choices=("allgather", "ring"),
         ),
     ] = "allgather"
+    kda_cp_backend: A[
+        str,
+        Arg(
+            help=(
+                "KDA implementation used during prefill context parallelism. "
+                "'a2a' transposes sequence and head sharding. 'fla' uses the "
+                "flash-linear-attention PR 691 affine-state algorithm adapted "
+                "to SGLang's zigzag layout, including radix checkpoints, with "
+                "automatic A2A fallback for unsupported batches or kernels."
+            ),
+            choices=("a2a", "fla"),
+        ),
+    ] = "a2a"
     enable_dsa_prefill_context_parallel: A[bool, Arg(no_cli=True)] = False
     dsa_prefill_cp_mode: A[str, Arg(no_cli=True)] = "round-robin-split"
     enable_prefill_context_parallel: A[bool, Arg(no_cli=True)] = False
