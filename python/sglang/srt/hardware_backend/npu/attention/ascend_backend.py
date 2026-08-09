@@ -1133,8 +1133,8 @@ class AscendAttnBackend(AttentionBackend):
             -1, layer.tp_q_head_num * self.kv_lora_rank
         )
 
-    def _exchange_mla_cp_ring_kv(self, packed_kv: torch.Tensor) -> torch.Tensor:
-        """Rotate one compact latent-KV shard to the next CP rank."""
+    def _start_mla_cp_ring_kv_exchange(self, packed_kv: torch.Tensor):
+        """Start rotating one compact latent-KV shard to the next CP rank."""
         cp_group = get_attention_cp_group()
         cp_rank = cp_group.rank_in_group
         next_global_rank = cp_group.ranks[(cp_rank + 1) % cp_group.world_size]
@@ -1154,7 +1154,13 @@ class AscendAttnBackend(AttentionBackend):
                 cp_group.device_group,
             ),
         ]
-        for request in torch.distributed.batch_isend_irecv(ops):
+        requests = torch.distributed.batch_isend_irecv(ops)
+        return recv_kv, requests
+
+    @staticmethod
+    def _finish_mla_cp_ring_kv_exchange(recv_kv, requests):
+        """Wait for a previously started compact-KV rotation."""
+        for request in requests:
             request.wait()
         return recv_kv
 
@@ -1165,6 +1171,7 @@ class AscendAttnBackend(AttentionBackend):
         k_nope: torch.Tensor,
         k_rope: torch.Tensor,
         value: torch.Tensor,
+        seq_lens: torch.Tensor,
         layer: RadixAttention,
         causal: bool,
         previous_output: Optional[torch.Tensor],
@@ -1172,16 +1179,22 @@ class AscendAttnBackend(AttentionBackend):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute and online-merge one visible Q/KV block pair."""
         q_len = q_nope.shape[0]
-        kv_len = k_nope.shape[0]
-        seq_lens = torch.tensor([[q_len], [kv_len]], dtype=torch.int32)
-        output = q_nope.new_zeros(q_nope.shape)
-        softmax_lse = torch.zeros(
-            layer.tp_q_head_num,
-            q_len,
-            dtype=torch.float32,
-            device=q_nope.device,
-        )
         first_block = previous_output is None
+        if first_block != (previous_lse is None):
+            raise ValueError("MLA CP ring output and LSE must be initialized together")
+        if first_block:
+            output = q_nope.new_zeros(q_nope.shape)
+            softmax_lse = torch.zeros(
+                layer.tp_q_head_num,
+                q_len,
+                dtype=torch.float32,
+                device=q_nope.device,
+            )
+        else:
+            # ATB supports in-place online softmax merging. Reusing these two
+            # buffers avoids allocating output and LSE for every visible block.
+            output = previous_output
+            softmax_lse = previous_lse
         torch_npu.atb.npu_ring_mla(
             q_nope=q_nope,
             q_rope=q_rope,
@@ -1223,15 +1236,38 @@ class AscendAttnBackend(AttentionBackend):
         cp_group = get_attention_cp_group()
         cp_rank = cp_group.rank_in_group
         cp_size = cp_group.world_size
-        block_len = cp_meta.split_list[0]
+        bs = int(cp_meta.bs)
+        block_lens_prev = [int(length) for length in cp_meta.actual_seq_q_prev_list]
+        block_lens_next = [int(length) for length in cp_meta.actual_seq_q_next_list]
+        if (
+            len(block_lens_prev) != bs
+            or len(block_lens_next) != bs
+            or block_lens_prev != block_lens_next
+        ):
+            raise ValueError(
+                "MLA CP ring requires matching early/late zigzag block lengths "
+                f"for every request, got prev={block_lens_prev}, "
+                f"next={block_lens_next}."
+            )
         split = cp_meta.total_q_prev_tokens
+        next_tokens = cp_meta.total_q_next_tokens
+        if split != sum(block_lens_prev) or next_tokens != sum(block_lens_next):
+            raise ValueError("MLA CP ring token totals do not match CP metadata")
+        # Q and every source KV block have the same per-request lengths. Keep
+        # the [2, batch] form explicit so ATB also handles different lengths
+        # across requests in one batch.
+        ring_seq_lens = torch.tensor(
+            [block_lens_prev, block_lens_prev], dtype=torch.int32
+        )
 
         if not self._mla_cp_ring_logged:
             logger.info(
-                "MLA prefill CP ring active: cp_size=%d, block_len=%d, "
+                "MLA prefill CP ring active: cp_size=%d, batch_size=%d, "
+                "max_block_len=%d, "
                 "cache_backend=allgather",
                 cp_size,
-                block_len,
+                bs,
+                max(block_lens_prev),
             )
             self._mla_cp_ring_logged = True
 
@@ -1257,10 +1293,11 @@ class AscendAttnBackend(AttentionBackend):
                 "MLA CP ring expects one latent KV head, got "
                 f"K heads={latent_head_num}, K-RoPE heads={rope_head_num}."
             )
-        if local_latent_k.shape[0] != 2 * block_len:
+        local_token_count = split + next_tokens
+        if local_latent_k.shape[0] != local_token_count:
             raise ValueError(
                 "MLA CP ring local KV length must equal two zigzag blocks, got "
-                f"KV={local_latent_k.shape[0]}, block={block_len}."
+                f"KV={local_latent_k.shape[0]}, expected={local_token_count}."
             )
         latent_feature_size = latent_head_num * self.kv_lora_rank
 
@@ -1280,11 +1317,11 @@ class AscendAttnBackend(AttentionBackend):
             q_rope[:split].contiguous(),
             q_rope[split:].contiguous(),
         )
-        if q_nope_prev.shape[0] != block_len or q_nope_next.shape[0] != block_len:
+        if q_nope_prev.shape[0] != split or q_nope_next.shape[0] != next_tokens:
             raise ValueError(
-                "MLA CP ring local Q halves must match the zigzag block length, "
+                "MLA CP ring local Q halves must match the zigzag metadata, "
                 f"got prev={q_nope_prev.shape[0]}, next={q_nope_next.shape[0]}, "
-                f"block={block_len}."
+                f"expected_prev={split}, expected_next={next_tokens}."
             )
 
         local_k_nope, local_expanded_k_rope = k.split(
@@ -1294,6 +1331,14 @@ class AscendAttnBackend(AttentionBackend):
         output_next = lse_next = None
 
         for ring_step in range(cp_size):
+            recv_kv = exchange_requests = None
+            if ring_step + 1 < cp_size:
+                # Launch the next rotation before projection and attention so
+                # HCCL can transfer compact KV while ATB consumes this shard.
+                recv_kv, exchange_requests = (
+                    self._start_mla_cp_ring_kv_exchange(packed_kv)
+                )
+
             source_rank = (cp_rank - ring_step) % cp_size
             (
                 early_to_prev,
@@ -1323,12 +1368,12 @@ class AscendAttnBackend(AttentionBackend):
                     -1, layer.tp_k_head_num, -1
                 )
 
-            source_early_k = source_k_nope[:block_len].contiguous()
-            source_early_rope = source_k_rope[:block_len].contiguous()
-            source_early_v = source_value[:block_len].contiguous()
-            source_late_k = source_k_nope[block_len:].contiguous()
-            source_late_rope = source_k_rope[block_len:].contiguous()
-            source_late_v = source_value[block_len:].contiguous()
+            source_early_k = source_k_nope[:split].contiguous()
+            source_early_rope = source_k_rope[:split].contiguous()
+            source_early_v = source_value[:split].contiguous()
+            source_late_k = source_k_nope[split:].contiguous()
+            source_late_rope = source_k_rope[split:].contiguous()
+            source_late_v = source_value[split:].contiguous()
 
             # Local early Q block r sees early source blocks 0..r. Its own
             # block is causal; strictly earlier blocks need no mask.
@@ -1339,6 +1384,7 @@ class AscendAttnBackend(AttentionBackend):
                     source_early_k,
                     source_early_rope,
                     source_early_v,
+                    ring_seq_lens,
                     layer,
                     causal=source_rank == cp_rank,
                     previous_output=output_prev,
@@ -1353,6 +1399,7 @@ class AscendAttnBackend(AttentionBackend):
                     source_early_k,
                     source_early_rope,
                     source_early_v,
+                    ring_seq_lens,
                     layer,
                     causal=False,
                     previous_output=output_next,
@@ -1368,14 +1415,17 @@ class AscendAttnBackend(AttentionBackend):
                     source_late_k,
                     source_late_rope,
                     source_late_v,
+                    ring_seq_lens,
                     layer,
                     causal=source_rank == cp_rank,
                     previous_output=output_next,
                     previous_lse=lse_next,
                 )
 
-            if ring_step + 1 < cp_size:
-                packed_kv = self._exchange_mla_cp_ring_kv(packed_kv)
+            if exchange_requests is not None:
+                packed_kv = self._finish_mla_cp_ring_kv_exchange(
+                    recv_kv, exchange_requests
+                )
 
         assert output_prev is not None and output_next is not None
 

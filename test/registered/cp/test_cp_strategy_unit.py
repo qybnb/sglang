@@ -157,18 +157,24 @@ class TestCPStrategyUnit(CustomTestCase):
             self.assertTrue(use_npu_mla_cp_ring(forward_batch))
 
             metadata.bs = 2
+            metadata.split_list = [64] * 8 + [32] * 8
+            forward_batch.extend_prefix_lens_cpu = [0, 0]
+            self.assertIsNone(get_npu_mla_cp_ring_fallback_reason(forward_batch))
+            self.assertTrue(use_npu_mla_cp_ring(forward_batch))
+
+            metadata.split_list[-1] = 31
             self.assertEqual(
                 get_npu_mla_cp_ring_fallback_reason(forward_batch),
-                "only batch size 1 is supported",
+                "each request's zigzag blocks must have equal non-zero lengths",
             )
-            metadata.bs = 1
-            forward_batch.extend_prefix_lens_cpu = [1]
+            metadata.split_list = [64] * 8 + [32] * 8
+            forward_batch.extend_prefix_lens_cpu = [0, 1]
             self.assertEqual(
                 get_npu_mla_cp_ring_fallback_reason(forward_batch),
                 "prefix cache is not supported",
             )
-            forward_batch.extend_prefix_lens_cpu = [0]
-            metadata.split_list = [513] * 8
+            forward_batch.extend_prefix_lens_cpu = [0, 0]
+            metadata.split_list = [513] * 8 + [32] * 8
             self.assertIn(
                 "512-token",
                 get_npu_mla_cp_ring_fallback_reason(forward_batch),

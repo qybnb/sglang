@@ -105,11 +105,11 @@ def mla_use_prefill_cp(forward_batch, mla_enable_prefill_cp=None):
 def get_npu_mla_cp_ring_fallback_reason(forward_batch, attention=None):
     """Return why the experimental Ascend MLA CP ring path cannot run.
 
-    The first implementation deliberately targets the shape for which the ATB
-    ``npu_ring_mla`` contract is unambiguous: one request, no prefix cache, and
-    equally sized zigzag blocks no longer than its 512-token causal mask.
-    Unsupported batches keep using the established absorbed-MLA all-gather
-    path, so selecting ``--mla-cp-backend ring`` is safe for mixed workloads.
+    The ring path accepts no-prefix batches whose individual requests split
+    into equally sized zigzag blocks no longer than the 512-token ATB causal
+    mask. Unsupported batches keep using the established absorbed-MLA
+    all-gather path, so selecting ``--mla-cp-backend ring`` is safe for mixed
+    workloads.
     """
     server_args = get_global_server_args()
     if getattr(server_args, "mla_cp_backend", "allgather") != "ring":
@@ -125,8 +125,10 @@ def get_npu_mla_cp_ring_fallback_reason(forward_batch, attention=None):
     metadata = getattr(forward_batch, "attn_cp_metadata", None)
     if metadata is None:
         return "context-parallel metadata is missing"
-    if getattr(metadata, "bs", None) != 1:
-        return "only batch size 1 is supported"
+    bs = getattr(metadata, "bs", None)
+    if bs is None or int(bs) <= 0:
+        return "batch size must be positive"
+    bs = int(bs)
 
     prefix_lens = getattr(forward_batch, "extend_prefix_lens_cpu", None)
     if prefix_lens is not None and any(int(length) != 0 for length in prefix_lens):
@@ -134,14 +136,19 @@ def get_npu_mla_cp_ring_fallback_reason(forward_batch, attention=None):
 
     cp_size = get_parallel().attn_cp_size
     split_list = getattr(metadata, "split_list", None)
-    if split_list is None or len(split_list) != 2 * cp_size:
+    blocks_per_request = 2 * cp_size
+    if split_list is None or len(split_list) != bs * blocks_per_request:
         return "only the zigzag CP layout is supported"
-    if not split_list or min(split_list) <= 0 or len(set(split_list)) != 1:
-        return "zigzag blocks must have equal non-zero lengths"
-    if split_list[0] > MLA_CP_RING_MAX_CAUSAL_BLOCK_SIZE:
-        return (
-            "zigzag block length exceeds the 512-token npu_ring_mla causal mask"
-        )
+    for request_id in range(bs):
+        begin = request_id * blocks_per_request
+        request_blocks = split_list[begin : begin + blocks_per_request]
+        if min(request_blocks) <= 0 or len(set(request_blocks)) != 1:
+            return "each request's zigzag blocks must have equal non-zero lengths"
+        if request_blocks[0] > MLA_CP_RING_MAX_CAUSAL_BLOCK_SIZE:
+            return (
+                "zigzag block length exceeds the 512-token npu_ring_mla "
+                "causal mask"
+            )
     return None
 
 
