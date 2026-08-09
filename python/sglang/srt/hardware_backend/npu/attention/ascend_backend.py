@@ -1006,12 +1006,47 @@ class AscendAttnBackend(AttentionBackend):
         cp_meta = forward_batch.attn_cp_metadata
         split = cp_meta.total_q_prev_tokens
         q = q.reshape(-1, layer.tp_q_head_num, self.kv_lora_rank)
-        q_prev, q_next = q[:split].contiguous(), q[split:].contiguous()
 
         if q_rope is not None and q_rope.shape[-1] > 0:
             q_rope = q_rope.reshape(
                 -1, layer.tp_q_head_num, self.qk_rope_head_dim
             )
+        else:
+            q_rope = None
+
+        # With latent headDim=512 and RoPE, Ascend FIA only accepts a
+        # power-of-two Q-head count. K3 has 48 local heads at attention-TP2,
+        # so pad the independent Q heads to 64 and discard their outputs.
+        fia_q_head_num = self.q_head_num_padding or layer.tp_q_head_num
+        if fia_q_head_num < layer.tp_q_head_num:
+            raise ValueError(
+                "MLA FIA Q-head padding cannot be smaller than the layer head "
+                f"count, got padding={fia_q_head_num}, heads={layer.tp_q_head_num}."
+            )
+        if fia_q_head_num > layer.tp_q_head_num:
+            padding_head_num = fia_q_head_num - layer.tp_q_head_num
+            q = torch.cat(
+                [
+                    q,
+                    q.new_empty(q.shape[0], padding_head_num, self.kv_lora_rank),
+                ],
+                dim=1,
+            ).contiguous()
+            if q_rope is not None:
+                q_rope = torch.cat(
+                    [
+                        q_rope,
+                        q_rope.new_empty(
+                            q_rope.shape[0],
+                            padding_head_num,
+                            self.qk_rope_head_dim,
+                        ),
+                    ],
+                    dim=1,
+                ).contiguous()
+
+        q_prev, q_next = q[:split].contiguous(), q[split:].contiguous()
+        if q_rope is not None:
             q_rope_prev = q_rope[:split].contiguous()
             q_rope_next = q_rope[split:].contiguous()
         else:
@@ -1059,7 +1094,7 @@ class AscendAttnBackend(AttentionBackend):
                 kv_cache,
                 block_table=self.forward_metadata.block_tables,
                 block_size=self.page_size,
-                num_heads=layer.tp_q_head_num,
+                num_heads=fia_q_head_num,
                 num_key_value_heads=layer.tp_k_head_num,
                 input_layout="TND",
                 atten_mask=self.fia_mask,
@@ -1070,7 +1105,7 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_lengths_kv=kv_lens,
                 **rope_kwargs,
             )
-            return output
+            return output[:, : layer.tp_q_head_num, :]
 
         output_prev = run_half(
             q_prev,
