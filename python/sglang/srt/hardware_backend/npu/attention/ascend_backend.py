@@ -1028,7 +1028,7 @@ class AscendAttnBackend(AttentionBackend):
             q = torch.cat(
                 [
                     q,
-                    q.new_empty(q.shape[0], padding_head_num, self.kv_lora_rank),
+                    q.new_zeros(q.shape[0], padding_head_num, self.kv_lora_rank),
                 ],
                 dim=1,
             ).contiguous()
@@ -1036,7 +1036,7 @@ class AscendAttnBackend(AttentionBackend):
                 q_rope = torch.cat(
                     [
                         q_rope,
-                        q_rope.new_empty(
+                        q_rope.new_zeros(
                             q_rope.shape[0],
                             padding_head_num,
                             self.qk_rope_head_dim,
