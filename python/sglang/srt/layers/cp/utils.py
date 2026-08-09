@@ -48,23 +48,32 @@ def enable_cp_v2() -> bool:
     return bool(envs.SGLANG_ENABLE_CP_V2.get())
 
 
-def is_cp_v2_active(forward_batch) -> bool:
-    """Return whether the current forward batch is running through CP-v2."""
+def is_cp_v2_active(forward_batch, num_tokens: Optional[int] = None) -> bool:
+    """Return whether the current forward batch is running through CP-v2.
+
+    ``num_tokens`` lets callers planning padding evaluate the final token count
+    before ``forward_batch.input_ids`` is resized. The eager path omits it and
+    evaluates the already-padded input, so both stages use the same policy.
+    """
     if not enable_cp_v2():
         return False
     forward_mode = getattr(forward_batch, "forward_mode", None)
     if forward_mode is None or not forward_mode.is_context_parallel_extend():
+        return False
+    if getattr(forward_mode, "is_mixed", lambda: False)():
         return False
 
     strategy = get_cp_strategy()
     if strategy is None:
         return False
 
-    input_ids = getattr(forward_batch, "input_ids", None)
-    if input_ids is None:
-        return False
+    if num_tokens is None:
+        input_ids = getattr(forward_batch, "input_ids", None)
+        if input_ids is None:
+            return False
+        num_tokens = len(input_ids)
 
-    return strategy.can_apply(len(input_ids), forward_batch)
+    return strategy.can_apply(int(num_tokens), forward_batch)
 
 
 def prepare_cp_forward(forward_batch) -> None:

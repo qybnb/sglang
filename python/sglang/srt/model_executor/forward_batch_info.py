@@ -1175,7 +1175,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             num_tokens = global_num_tokens[0]
 
         local_buffer_len = num_tokens
-        if is_cp_v2_active(self):
+        if is_cp_v2_active(self, num_tokens=num_tokens):
             cp_size = get_parallel().attn_cp_size
             if num_tokens % cp_size != 0:
                 raise ValueError(

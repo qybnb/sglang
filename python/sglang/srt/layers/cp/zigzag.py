@@ -53,6 +53,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.runtime_context import get_parallel
 
 
 @dataclass
@@ -104,8 +105,43 @@ class ZigzagCPStrategy(ContextParallelStrategy):
 
         extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
         if extend_lens is None:
-            return True
-        return all(int(length) >= self.cp_size * 2 for length in extend_lens)
+            extend_lens = [num_tokens]
+        else:
+            extend_lens = [int(length) for length in extend_lens]
+
+        cp_segment_num = self.cp_size * 2
+        if any(length < cp_segment_num for length in extend_lens):
+            return False
+
+        # DP/attention-TP padding is appended to the final request. Mirror
+        # build_metadata here so planning and eager execution make the same CP
+        # decision from the prospective and materialized token counts.
+        pad_len = int(num_tokens) - sum(extend_lens)
+        if pad_len < 0:
+            return False
+        if pad_len > 0:
+            extend_lens[-1] += pad_len
+
+        # Kimi scatters each CP-local token shard across attention TP between
+        # attention and MoE/MLP. The current fixed-size buffers require all CP
+        # ranks to own the same number of tokens, and reduce-scatter requires
+        # that local count to divide attention TP. Ragged batches that do not
+        # meet these invariants safely fall back to the non-CP path.
+        per_rank_tokens = [0] * self.cp_size
+        for length in extend_lens:
+            base, rem = divmod(length, cp_segment_num)
+            for rank in range(self.cp_size):
+                mirror_rank = cp_segment_num - 1 - rank
+                per_rank_tokens[rank] += (
+                    base
+                    + int(rank < rem)
+                    + base
+                    + int(mirror_rank < rem)
+                )
+
+        if len(set(per_rank_tokens)) != 1:
+            return False
+        return per_rank_tokens[0] % get_parallel().attn_tp_size == 0
 
     def build_metadata(
         self,

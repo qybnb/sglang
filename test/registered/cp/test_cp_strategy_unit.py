@@ -41,6 +41,14 @@ class _ExtendMode:
     def is_context_parallel_extend(self):
         return True
 
+    def is_mixed(self):
+        return False
+
+
+class _MixedMode(_ExtendMode):
+    def is_mixed(self):
+        return True
+
 
 class _FakeCPGroup:
     def __init__(self, all_rank_tensors):
@@ -194,10 +202,55 @@ class TestCPZigzagStrategy(CustomTestCase):
 
         with patch(
             "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=True
-        ):
+        ), get_parallel().override(attn_tp_size=1):
             self.assertTrue(enable_cp_v2())
             self.assertTrue(is_cp_v2_active(active_batch))
             self.assertFalse(is_cp_v2_active(inactive_batch))
+
+    def test_cp_v2_uses_prospective_padded_token_count(self):
+        batch = SimpleNamespace(
+            input_ids=torch.arange(9),
+            forward_mode=_ExtendMode(),
+            extend_seq_lens_cpu=[9],
+        )
+
+        with (
+            patch(
+                "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get",
+                return_value=True,
+            ),
+            get_parallel().override(attn_tp_size=2),
+        ):
+            self.assertFalse(is_cp_v2_active(batch))
+            self.assertTrue(is_cp_v2_active(batch, num_tokens=16))
+
+    def test_cp_v2_rejects_mixed_and_unbalanced_ragged_batches(self):
+        mixed_batch = SimpleNamespace(
+            input_ids=torch.arange(16),
+            forward_mode=_MixedMode(),
+            extend_seq_lens_cpu=[16],
+        )
+        unsafe_ragged_batch = SimpleNamespace(
+            input_ids=torch.arange(40),
+            forward_mode=_ExtendMode(),
+            extend_seq_lens_cpu=[14, 14, 10],
+        )
+        safe_ragged_batch = SimpleNamespace(
+            input_ids=torch.arange(24),
+            forward_mode=_ExtendMode(),
+            extend_seq_lens_cpu=[9, 15],
+        )
+
+        with (
+            patch(
+                "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get",
+                return_value=True,
+            ),
+            get_parallel().override(attn_tp_size=2),
+        ):
+            self.assertFalse(is_cp_v2_active(mixed_batch))
+            self.assertFalse(is_cp_v2_active(unsafe_ragged_batch))
+            self.assertTrue(is_cp_v2_active(safe_ragged_batch))
 
     def _expected_metadata(self, *, rank, cp_size, seq_lens, extend_seq_lens):
         bs = len(extend_seq_lens)
