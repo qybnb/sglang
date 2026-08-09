@@ -24,6 +24,12 @@ from sglang.srt.layers.cp.utils import (
     is_cp_v2_active,
 )
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
+from sglang.srt.models.deepseek_common.attention_backend_handler import (
+    handle_attention_ascend,
+)
+from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods import (
+    AttnForwardMethod,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -68,6 +74,25 @@ class _FakeHeadGatherGroup:
 class TestCPStrategyUnit(CustomTestCase):
     def tearDown(self):
         init_cp_strategy(SimpleNamespace(enable_prefill_cp=False))
+
+    def test_ascend_prefill_cp_dispatches_to_mla(self):
+        forward_mode = SimpleNamespace(
+            is_extend=lambda: True,
+            is_target_verify=lambda: False,
+            is_draft_extend_v2=lambda: False,
+        )
+        forward_batch = SimpleNamespace(forward_mode=forward_mode)
+        attn = SimpleNamespace(use_dsa=False, mla_enable_prefill_cp=True)
+
+        with patch(
+            "sglang.srt.models.deepseek_common.attention_backend_handler."
+            "mla_use_prefill_cp",
+            return_value=True,
+        ) as use_prefill_cp:
+            method = handle_attention_ascend(attn, forward_batch)
+
+        self.assertEqual(method, AttnForwardMethod.MLA_NPU)
+        use_prefill_cp.assert_called_once_with(forward_batch, True)
 
     def test_strategy_kind_maps_cli_values(self):
         self.assertEqual(ContextParallelStrategyKind.NONE.value, 0)

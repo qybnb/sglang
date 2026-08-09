@@ -50,6 +50,11 @@ def handle_attention_ascend(attn, forward_batch):
     ):
         if hasattr(attn, "use_dsa") and attn.use_dsa:
             return AttnForwardMethod.DSA_NPU
+        elif mla_use_prefill_cp(forward_batch, attn.mla_enable_prefill_cp):
+            # Ascend normally expands latent KV into MHA K/V for prefill. CP
+            # instead needs the absorbed MLA path so forward_mla_prepare_npu
+            # can all-gather latent K and K-RoPE before entering the backend.
+            return AttnForwardMethod.MLA_NPU
         else:
             return AttnForwardMethod.MHA_NPU
     else:
