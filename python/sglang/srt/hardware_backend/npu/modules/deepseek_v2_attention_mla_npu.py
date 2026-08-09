@@ -117,9 +117,9 @@ def forward_mha_prepare_npu(
         k_pe = latent_cache[:, :, m.kv_lora_rank :]
         if m.rotary_emb is not None:
             q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
-        # The CP ring backend gathers this local latent KV after attention and
-        # then writes the full cache required by the current PD sender. Avoid a
-        # redundant rank-local write on the non-fused RoPE path.
+        # The CP ring backend rotates this local latent KV during attention
+        # and writes every received shard directly into its natural cache
+        # locations. Avoid a redundant rank-local cache write here.
         if not use_npu_mla_cp_ring(forward_batch):
             # this is for model kimi-vl-a3B-instruct
             get_token_to_kv_pool().set_kv_buffer(

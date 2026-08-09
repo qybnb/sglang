@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
+import torch.nn.functional as F
 import torch_npu
 from sgl_kernel_npu.attention.sinks_attention import (
     attention_sinks_prefill_triton,
@@ -28,8 +29,10 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_kv_cache,
+    get_zigzag_cp_rank_block_lengths,
     get_zigzag_cp_rank_chunk_indices,
     get_zigzag_mla_cp_ring_visibility,
+    pack_paged_prefix_cache,
 )
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -91,6 +94,15 @@ class ForwardMetadata:
     # prefix cache
     prefix_lens: Optional[torch.Tensor] = None
     flatten_prefix_block_tables: Optional[torch.Tensor] = None
+
+
+@dataclass
+class MLACPRingSourceLayout:
+    token_count: int
+    early_token_count: int
+    early_to_prev_seq_lens: torch.Tensor
+    early_to_next_seq_lens: torch.Tensor
+    late_to_next_seq_lens: torch.Tensor
 
 
 class AscendAttnMaskBuilder:
@@ -321,6 +333,70 @@ def _get_mla_cp_ring_cache_locs(forward_batch, layer, cp_size):
     )
     forward_batch.mla_cp_ring_cache_locs = cached_locs
     return cached_locs
+
+
+def _get_mla_cp_ring_source_layouts(forward_batch, cp_size, cp_rank):
+    """Build source-specific block lengths and ATB sequence metadata."""
+    cached_layouts = getattr(forward_batch, "mla_cp_ring_source_layouts", None)
+    if cached_layouts is not None:
+        return cached_layouts
+
+    metadata = forward_batch.attn_cp_metadata
+    bs = int(metadata.bs)
+    local_prev_lens = [int(length) for length in metadata.actual_seq_q_prev_list]
+    local_next_lens = [int(length) for length in metadata.actual_seq_q_next_list]
+    expected_prev_lens, expected_next_lens = get_zigzag_cp_rank_block_lengths(
+        metadata.split_list, bs, cp_size, cp_rank
+    )
+    if local_prev_lens != expected_prev_lens or local_next_lens != expected_next_lens:
+        raise ValueError(
+            "MLA CP ring local Q lengths do not match zigzag metadata: "
+            f"prev={local_prev_lens}/{expected_prev_lens}, "
+            f"next={local_next_lens}/{expected_next_lens}."
+        )
+
+    layouts = []
+    for source_rank in range(cp_size):
+        early_lens, late_lens = get_zigzag_cp_rank_block_lengths(
+            metadata.split_list, bs, cp_size, source_rank
+        )
+        early_to_prev, _, late_to_next = get_zigzag_mla_cp_ring_visibility(
+            cp_rank, source_rank
+        )
+        if early_to_prev and any(
+            kv_len < q_len
+            for q_len, kv_len in zip(local_prev_lens, early_lens)
+        ):
+            raise ValueError("MLA CP ring early KV length is shorter than early Q")
+        if any(
+            kv_len < q_len
+            for q_len, kv_len in zip(local_next_lens, early_lens)
+        ):
+            raise ValueError("MLA CP ring early KV length is shorter than late Q")
+        if late_to_next and any(
+            kv_len < q_len
+            for q_len, kv_len in zip(local_next_lens, late_lens)
+        ):
+            raise ValueError("MLA CP ring late KV length is shorter than late Q")
+
+        layouts.append(
+            MLACPRingSourceLayout(
+                token_count=sum(early_lens) + sum(late_lens),
+                early_token_count=sum(early_lens),
+                early_to_prev_seq_lens=torch.tensor(
+                    [local_prev_lens, early_lens], dtype=torch.int32
+                ),
+                early_to_next_seq_lens=torch.tensor(
+                    [local_next_lens, early_lens], dtype=torch.int32
+                ),
+                late_to_next_seq_lens=torch.tensor(
+                    [local_next_lens, late_lens], dtype=torch.int32
+                ),
+            )
+        )
+    cached_layouts = tuple(layouts)
+    forward_batch.mla_cp_ring_source_layouts = cached_layouts
+    return cached_layouts
 
 
 class AscendAttnBackend(AttentionBackend):
@@ -1199,6 +1275,52 @@ class AscendAttnBackend(AttentionBackend):
             request.wait()
         return recv_kv
 
+    def _load_mla_cp_ring_prefix_kv(
+        self, layer: RadixAttention, forward_batch: ForwardBatch
+    ):
+        """Load and expand an exactly packed radix prefix for ring attention."""
+        prefix_lens = [int(length) for length in forward_batch.extend_prefix_lens_cpu]
+        if len(prefix_lens) != int(forward_batch.attn_cp_metadata.bs):
+            raise ValueError(
+                "MLA CP ring prefix lengths do not match batch size: "
+                f"prefixes={len(prefix_lens)}, "
+                f"bs={forward_batch.attn_cp_metadata.bs}."
+            )
+        if not any(prefix_lens):
+            return prefix_lens, None, None, None
+        if (
+            self.forward_metadata.prefix_lens is None
+            or self.forward_metadata.flatten_prefix_block_tables is None
+        ):
+            raise ValueError("MLA CP ring prefix metadata is missing")
+
+        prefix_block_tables = self.forward_metadata.flatten_prefix_block_tables
+        k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        v_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        prefix_k_pages = torch.index_select(k_buffer, 0, prefix_block_tables)
+        prefix_rope_pages = torch.index_select(v_buffer, 0, prefix_block_tables)
+        prefix_latent_k = pack_paged_prefix_cache(
+            prefix_k_pages, prefix_lens, self.page_size
+        )
+        prefix_k_rope_compact = pack_paged_prefix_cache(
+            prefix_rope_pages, prefix_lens, self.page_size
+        )
+        if prefix_latent_k.shape[0] != sum(prefix_lens):
+            raise ValueError("MLA CP ring packed prefix length is inconsistent")
+
+        projected_kv = layer.kv_b_proj(prefix_latent_k.squeeze(1))[0].view(
+            -1,
+            layer.tp_k_head_num,
+            layer.v_head_dim * 2,
+        )
+        prefix_k_nope, prefix_value = projected_kv.split(
+            [layer.v_head_dim, layer.v_head_dim], dim=-1
+        )
+        prefix_k_rope = prefix_k_rope_compact.expand(
+            -1, layer.tp_k_head_num, -1
+        )
+        return prefix_lens, prefix_k_nope, prefix_k_rope, prefix_value
+
     def _run_mla_cp_ring_segment(
         self,
         q_nope: torch.Tensor,
@@ -1276,35 +1398,32 @@ class AscendAttnBackend(AttentionBackend):
         bs = int(cp_meta.bs)
         block_lens_prev = [int(length) for length in cp_meta.actual_seq_q_prev_list]
         block_lens_next = [int(length) for length in cp_meta.actual_seq_q_next_list]
-        if (
-            len(block_lens_prev) != bs
-            or len(block_lens_next) != bs
-            or block_lens_prev != block_lens_next
-        ):
+        if len(block_lens_prev) != bs or len(block_lens_next) != bs:
             raise ValueError(
-                "MLA CP ring requires matching early/late zigzag block lengths "
-                f"for every request, got prev={block_lens_prev}, "
-                f"next={block_lens_next}."
+                "MLA CP ring requires one early/late block length per request, "
+                f"got bs={bs}, prev={block_lens_prev}, next={block_lens_next}."
             )
         split = cp_meta.total_q_prev_tokens
         next_tokens = cp_meta.total_q_next_tokens
         if split != sum(block_lens_prev) or next_tokens != sum(block_lens_next):
             raise ValueError("MLA CP ring token totals do not match CP metadata")
-        # Q and every source KV block have the same per-request lengths. Keep
-        # the [2, batch] form explicit so ATB also handles different lengths
-        # across requests in one batch.
-        ring_seq_lens = torch.tensor(
-            [block_lens_prev, block_lens_prev], dtype=torch.int32
+        source_layouts = _get_mla_cp_ring_source_layouts(
+            forward_batch, cp_size, cp_rank
         )
+        max_rank_tokens = int(cp_meta.max_rank_len[0])
+        if any(layout.token_count > max_rank_tokens for layout in source_layouts):
+            raise ValueError("MLA CP ring source payload exceeds max_rank_len")
 
         if not self._mla_cp_ring_logged:
             logger.info(
                 "MLA prefill CP ring active: cp_size=%d, batch_size=%d, "
-                "max_block_len=%d, "
-                "cache_backend=ring-direct",
+                "max_block_len=%d, max_rank_tokens=%d, "
+                "cache_backend=ring-direct, uneven_blocks=true, "
+                "prefix_cache=operator-guarded",
                 cp_size,
                 bs,
-                max(block_lens_prev),
+                max(cp_meta.split_list),
+                max_rank_tokens,
             )
             self._mla_cp_ring_logged = True
 
@@ -1331,16 +1450,31 @@ class AscendAttnBackend(AttentionBackend):
                 f"K heads={latent_head_num}, K-RoPE heads={rope_head_num}."
             )
         local_token_count = split + next_tokens
-        if local_latent_k.shape[0] != local_token_count:
+        if (
+            local_latent_k.shape[0] != local_token_count
+            or local_token_count != source_layouts[cp_rank].token_count
+        ):
             raise ValueError(
-                "MLA CP ring local KV length must equal two zigzag blocks, got "
-                f"KV={local_latent_k.shape[0]}, expected={local_token_count}."
+                "MLA CP ring local KV length does not match zigzag metadata: "
+                f"KV={local_latent_k.shape[0]}, Q={local_token_count}, "
+                f"layout={source_layouts[cp_rank].token_count}."
             )
         latent_feature_size = latent_head_num * self.kv_lora_rank
 
-        packed_kv = torch.cat(
+        local_packed_kv = torch.cat(
             [local_latent_k.flatten(1), local_k_rope.flatten(1)], dim=-1
         ).contiguous()
+        if local_token_count > max_rank_tokens:
+            raise ValueError(
+                f"MLA CP ring local payload {local_token_count} exceeds "
+                f"max_rank_len {max_rank_tokens}."
+            )
+        packed_kv = F.pad(
+            local_packed_kv,
+            (0, 0, 0, max_rank_tokens - local_token_count),
+            mode="constant",
+            value=0,
+        )
 
         q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
         q_nope, q_rope = q.split(
@@ -1367,6 +1501,12 @@ class AscendAttnBackend(AttentionBackend):
         cache_locs_by_rank = _get_mla_cp_ring_cache_locs(
             forward_batch, layer, cp_size
         )
+        (
+            prefix_lens,
+            prefix_k_nope,
+            prefix_k_rope,
+            prefix_value,
+        ) = self._load_mla_cp_ring_prefix_kv(layer, forward_batch)
         output_prev = lse_prev = None
         output_next = lse_next = None
 
@@ -1380,17 +1520,19 @@ class AscendAttnBackend(AttentionBackend):
                 )
 
             source_rank = (cp_rank - ring_step) % cp_size
+            source_layout = source_layouts[source_rank]
             (
                 early_to_prev,
                 early_to_next,
                 late_to_next,
             ) = get_zigzag_mla_cp_ring_visibility(cp_rank, source_rank)
-            source_latent_k = packed_kv[:, :latent_feature_size].reshape(
+            source_packed_kv = packed_kv[: source_layout.token_count]
+            source_latent_k = source_packed_kv[:, :latent_feature_size].reshape(
                 -1, latent_head_num, self.kv_lora_rank
             )
-            source_k_rope_compact = packed_kv[:, latent_feature_size:].reshape(
-                -1, rope_head_num, self.qk_rope_head_dim
-            )
+            source_k_rope_compact = source_packed_kv[
+                :, latent_feature_size:
+            ].reshape(-1, rope_head_num, self.qk_rope_head_dim)
             if ring_step == 0:
                 source_k_nope = local_k_nope
                 source_k_rope = local_expanded_k_rope
@@ -1408,12 +1550,13 @@ class AscendAttnBackend(AttentionBackend):
                     -1, layer.tp_k_head_num, -1
                 )
 
-            source_early_k = source_k_nope[:split].contiguous()
-            source_early_rope = source_k_rope[:split].contiguous()
-            source_early_v = source_value[:split].contiguous()
-            source_late_k = source_k_nope[split:].contiguous()
-            source_late_rope = source_k_rope[split:].contiguous()
-            source_late_v = source_value[split:].contiguous()
+            source_early_tokens = source_layout.early_token_count
+            source_early_k = source_k_nope[:source_early_tokens].contiguous()
+            source_early_rope = source_k_rope[:source_early_tokens].contiguous()
+            source_early_v = source_value[:source_early_tokens].contiguous()
+            source_late_k = source_k_nope[source_early_tokens:].contiguous()
+            source_late_rope = source_k_rope[source_early_tokens:].contiguous()
+            source_late_v = source_value[source_early_tokens:].contiguous()
 
             # Local early Q block r sees early source blocks 0..r. Its own
             # block is causal; strictly earlier blocks need no mask.
@@ -1424,7 +1567,7 @@ class AscendAttnBackend(AttentionBackend):
                     source_early_k,
                     source_early_rope,
                     source_early_v,
-                    ring_seq_lens,
+                    source_layout.early_to_prev_seq_lens,
                     layer,
                     causal=source_rank == cp_rank,
                     previous_output=output_prev,
@@ -1439,7 +1582,7 @@ class AscendAttnBackend(AttentionBackend):
                     source_early_k,
                     source_early_rope,
                     source_early_v,
-                    ring_seq_lens,
+                    source_layout.early_to_next_seq_lens,
                     layer,
                     causal=False,
                     previous_output=output_next,
@@ -1455,7 +1598,7 @@ class AscendAttnBackend(AttentionBackend):
                     source_late_k,
                     source_late_rope,
                     source_late_v,
-                    ring_seq_lens,
+                    source_layout.late_to_next_seq_lens,
                     layer,
                     causal=source_rank == cp_rank,
                     previous_output=output_next,
@@ -1480,6 +1623,43 @@ class AscendAttnBackend(AttentionBackend):
                 packed_kv = self._finish_mla_cp_ring_kv_exchange(
                     recv_kv, exchange_requests
                 )
+
+        if prefix_k_nope is not None:
+            # Prefix KV precedes both local zigzag blocks and is therefore an
+            # unmasked segment. Merge it after the ring so requests with an
+            # empty prefix already have initialized output/LSE buffers. The
+            # ring guard guarantees each non-empty prefix is at least as long
+            # as its Q block, as required by npu_ring_mla.
+            prefix_prev_seq_lens = torch.tensor(
+                [block_lens_prev, prefix_lens], dtype=torch.int32
+            )
+            prefix_next_seq_lens = torch.tensor(
+                [block_lens_next, prefix_lens], dtype=torch.int32
+            )
+            output_prev, lse_prev = self._run_mla_cp_ring_segment(
+                q_nope_prev,
+                q_rope_prev,
+                prefix_k_nope,
+                prefix_k_rope,
+                prefix_value,
+                prefix_prev_seq_lens,
+                layer,
+                causal=False,
+                previous_output=output_prev,
+                previous_lse=lse_prev,
+            )
+            output_next, lse_next = self._run_mla_cp_ring_segment(
+                q_nope_next,
+                q_rope_next,
+                prefix_k_nope,
+                prefix_k_rope,
+                prefix_value,
+                prefix_next_seq_lens,
+                layer,
+                causal=False,
+                previous_output=output_next,
+                previous_lse=lse_next,
+            )
 
         assert output_prev is not None and output_next is not None
         del forward_batch.mla_cp_local_k

@@ -26,8 +26,10 @@ from sglang.srt.layers.cp.utils import (
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
 from sglang.srt.layers.utils.cp_utils import (
     get_npu_mla_cp_ring_fallback_reason,
+    get_zigzag_cp_rank_block_lengths,
     get_zigzag_cp_rank_chunk_indices,
     get_zigzag_mla_cp_ring_visibility,
+    pack_paged_prefix_cache,
     use_npu_mla_cp_ring,
 )
 from sglang.srt.models.deepseek_common.attention_backend_handler import (
@@ -147,6 +149,18 @@ class TestCPStrategyUnit(CustomTestCase):
             attn_cp_metadata=metadata,
             extend_prefix_lens_cpu=[0],
         )
+
+        def update_payload_metadata():
+            rank_tokens = []
+            for rank in range(4):
+                early_lens, late_lens = get_zigzag_cp_rank_block_lengths(
+                    metadata.split_list, metadata.bs, 4, rank
+                )
+                rank_tokens.append(sum(early_lens) + sum(late_lens))
+            metadata.per_rank_actual_token = rank_tokens
+            metadata.max_rank_len = [max(rank_tokens)] * 4
+
+        update_payload_metadata()
         with patch(
             "sglang.srt.layers.utils.cp_utils.get_global_server_args",
             return_value=SimpleNamespace(mla_cp_backend="ring"),
@@ -158,27 +172,40 @@ class TestCPStrategyUnit(CustomTestCase):
             self.assertTrue(use_npu_mla_cp_ring(forward_batch))
 
             metadata.bs = 2
-            metadata.split_list = [64] * 8 + [32] * 8
+            metadata.split_list = [65] + [64] * 7 + [33] + [32] * 7
             forward_batch.extend_prefix_lens_cpu = [0, 0]
+            update_payload_metadata()
             self.assertIsNone(get_npu_mla_cp_ring_fallback_reason(forward_batch))
             self.assertTrue(use_npu_mla_cp_ring(forward_batch))
 
-            metadata.split_list[-1] = 31
-            self.assertEqual(
-                get_npu_mla_cp_ring_fallback_reason(forward_batch),
-                "each request's zigzag blocks must have equal non-zero lengths",
-            )
-            metadata.split_list = [64] * 8 + [32] * 8
+            forward_batch.extend_prefix_lens_cpu = [0, 65]
+            self.assertIsNone(get_npu_mla_cp_ring_fallback_reason(forward_batch))
+
             forward_batch.extend_prefix_lens_cpu = [0, 1]
             self.assertEqual(
                 get_npu_mla_cp_ring_fallback_reason(forward_batch),
-                "prefix cache is not supported",
+                "non-zero prefix length must be at least the largest zigzag "
+                "block for npu_ring_mla",
+            )
+
+            metadata.split_list[-1] = 0
+            self.assertEqual(
+                get_npu_mla_cp_ring_fallback_reason(forward_batch),
+                "each request's zigzag blocks must have non-zero lengths",
             )
             forward_batch.extend_prefix_lens_cpu = [0, 0]
             metadata.split_list = [513] * 8 + [32] * 8
             self.assertIn(
                 "512-token",
                 get_npu_mla_cp_ring_fallback_reason(forward_batch),
+            )
+
+            metadata.split_list = [65] + [64] * 7 + [33] + [32] * 7
+            update_payload_metadata()
+            metadata.max_rank_len = [1] * 4
+            self.assertEqual(
+                get_npu_mla_cp_ring_fallback_reason(forward_batch),
+                "context-parallel ring payload metadata is invalid",
             )
 
     def test_mla_cp_ring_maps_rank_shards_to_natural_cache_locations(self):
@@ -209,6 +236,51 @@ class TestCPStrategyUnit(CustomTestCase):
 
         with self.assertRaisesRegex(ValueError, "Invalid zigzag CP topology"):
             get_zigzag_cp_rank_chunk_indices(bs=2, cp_size=4, cp_rank=4)
+
+    def test_mla_cp_ring_derives_uneven_source_block_lengths(self):
+        split_list = list(range(1, 17))
+        self.assertEqual(
+            get_zigzag_cp_rank_block_lengths(split_list, 2, 4, 0),
+            ([1, 9], [8, 16]),
+        )
+        self.assertEqual(
+            get_zigzag_cp_rank_block_lengths(split_list, 2, 4, 3),
+            ([4, 12], [5, 13]),
+        )
+
+        for total_tokens in range(8, 80):
+            base, remainder = divmod(total_tokens, 8)
+            blocks = [
+                base + (1 if block_id < remainder else 0)
+                for block_id in range(8)
+            ]
+            for cp_rank in range(4):
+                local_early, local_late = get_zigzag_cp_rank_block_lengths(
+                    blocks, 1, 4, cp_rank
+                )
+                for source_rank in range(4):
+                    source_early, source_late = (
+                        get_zigzag_cp_rank_block_lengths(
+                            blocks, 1, 4, source_rank
+                        )
+                    )
+                    early_to_prev, _, late_to_next = (
+                        get_zigzag_mla_cp_ring_visibility(cp_rank, source_rank)
+                    )
+                    if early_to_prev:
+                        self.assertGreaterEqual(source_early[0], local_early[0])
+                    self.assertGreaterEqual(source_early[0], local_late[0])
+                    if late_to_next:
+                        self.assertGreaterEqual(source_late[0], local_late[0])
+
+    def test_mla_cp_ring_packs_prefix_pages_per_request(self):
+        selected_pages = torch.arange(12).view(3, 4, 1)
+        packed_prefix = pack_paged_prefix_cache(
+            selected_pages, prefix_lens=[3, 5], page_size=4
+        )
+        torch.testing.assert_close(
+            packed_prefix.flatten(), torch.tensor([0, 1, 2, 4, 5, 6, 7, 8])
+        )
 
     def test_mla_cp_ring_zigzag_visibility_is_causal(self):
         cp_size = 4

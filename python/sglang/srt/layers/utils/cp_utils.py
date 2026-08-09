@@ -105,11 +105,11 @@ def mla_use_prefill_cp(forward_batch, mla_enable_prefill_cp=None):
 def get_npu_mla_cp_ring_fallback_reason(forward_batch, attention=None):
     """Return why the experimental Ascend MLA CP ring path cannot run.
 
-    The ring path accepts no-prefix batches whose individual requests split
-    into equally sized zigzag blocks no longer than the 512-token ATB causal
-    mask. Unsupported batches keep using the established absorbed-MLA
-    all-gather path, so selecting ``--mla-cp-backend ring`` is safe for mixed
-    workloads.
+    The ring path accepts uneven zigzag blocks and radix prefixes that satisfy
+    the ATB ``kvSeqLen >= qSeqLen`` rule. Every block must also be non-empty
+    and no longer than the 512-token causal mask. Unsupported batches keep
+    using the established absorbed-MLA all-gather path, so selecting
+    ``--mla-cp-backend ring`` is safe for mixed workloads.
     """
     server_args = get_global_server_args()
     if getattr(server_args, "mla_cp_backend", "allgather") != "ring":
@@ -129,10 +129,13 @@ def get_npu_mla_cp_ring_fallback_reason(forward_batch, attention=None):
     if bs is None or int(bs) <= 0:
         return "batch size must be positive"
     bs = int(bs)
-
     prefix_lens = getattr(forward_batch, "extend_prefix_lens_cpu", None)
-    if prefix_lens is not None and any(int(length) != 0 for length in prefix_lens):
-        return "prefix cache is not supported"
+    if (
+        prefix_lens is None
+        or len(prefix_lens) != bs
+        or any(int(length) < 0 for length in prefix_lens)
+    ):
+        return "prefix-cache metadata is invalid"
 
     cp_size = get_parallel().attn_cp_size
     split_list = getattr(metadata, "split_list", None)
@@ -142,13 +145,31 @@ def get_npu_mla_cp_ring_fallback_reason(forward_batch, attention=None):
     for request_id in range(bs):
         begin = request_id * blocks_per_request
         request_blocks = split_list[begin : begin + blocks_per_request]
-        if min(request_blocks) <= 0 or len(set(request_blocks)) != 1:
-            return "each request's zigzag blocks must have equal non-zero lengths"
-        if request_blocks[0] > MLA_CP_RING_MAX_CAUSAL_BLOCK_SIZE:
+        if min(request_blocks) <= 0:
+            return "each request's zigzag blocks must have non-zero lengths"
+        if max(request_blocks) > MLA_CP_RING_MAX_CAUSAL_BLOCK_SIZE:
             return (
                 "zigzag block length exceeds the 512-token npu_ring_mla "
                 "causal mask"
             )
+        prefix_len = int(prefix_lens[request_id])
+        if prefix_len != 0 and prefix_len < max(request_blocks):
+            return (
+                "non-zero prefix length must be at least the largest zigzag "
+                "block for npu_ring_mla"
+            )
+
+    per_rank_tokens = getattr(metadata, "per_rank_actual_token", None)
+    max_rank_len = getattr(metadata, "max_rank_len", None)
+    if (
+        per_rank_tokens is None
+        or len(per_rank_tokens) != cp_size
+        or max_rank_len is None
+        or len(max_rank_len) != cp_size
+        or len(set(max_rank_len)) != 1
+        or max_rank_len[0] < max(per_rank_tokens)
+    ):
+        return "context-parallel ring payload metadata is invalid"
     return None
 
 
@@ -181,6 +202,48 @@ def get_zigzag_cp_rank_chunk_indices(bs: int, cp_size: int, cp_rank: int):
     return list(range(cp_rank, bs * segments, segments)) + list(
         range(segments - cp_rank - 1, bs * segments, segments)
     )
+
+
+def get_zigzag_cp_rank_block_lengths(
+    split_list, bs: int, cp_size: int, cp_rank: int
+):
+    """Return per-request ``(early, late)`` block lengths for a CP rank."""
+    segments = 2 * cp_size
+    if len(split_list) != bs * segments:
+        raise ValueError(
+            "Zigzag split metadata does not match batch/CP topology: "
+            f"splits={len(split_list)}, expected={bs * segments}."
+        )
+    chunk_indices = get_zigzag_cp_rank_chunk_indices(bs, cp_size, cp_rank)
+    return (
+        [int(split_list[index]) for index in chunk_indices[:bs]],
+        [int(split_list[index]) for index in chunk_indices[bs:]],
+    )
+
+
+def pack_paged_prefix_cache(paged_cache, prefix_lens, page_size: int):
+    """Remove per-request tail padding from selected prefix-cache pages."""
+    if page_size <= 0:
+        raise ValueError(f"page_size must be positive, got {page_size}")
+    page_offset = 0
+    packed_requests = []
+    for prefix_len in prefix_lens:
+        prefix_len = int(prefix_len)
+        if prefix_len < 0:
+            raise ValueError(f"prefix length must be non-negative, got {prefix_len}")
+        page_count = (prefix_len + page_size - 1) // page_size
+        request_pages = paged_cache[page_offset : page_offset + page_count]
+        page_offset += page_count
+        if prefix_len > 0:
+            packed_requests.append(request_pages.flatten(0, 1)[:prefix_len])
+    if page_offset != paged_cache.shape[0]:
+        raise ValueError(
+            "Selected prefix pages do not match prefix lengths: "
+            f"pages={paged_cache.shape[0]}, consumed={page_offset}."
+        )
+    if not packed_requests:
+        return paged_cache.flatten(0, 1)[:0]
+    return torch.cat(packed_requests, dim=0)
 
 
 def can_cp_split(seq_len: int, cp_size: int, forward_batch):
