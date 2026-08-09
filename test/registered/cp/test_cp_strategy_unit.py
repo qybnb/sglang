@@ -27,6 +27,7 @@ from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
 from sglang.srt.layers.utils.cp_utils import (
     get_npu_mla_cp_ring_fallback_reason,
     get_zigzag_mla_cp_ring_visibility,
+    rerange_cp_kv_cache_from_rank_shards,
     use_npu_mla_cp_ring,
 )
 from sglang.srt.models.deepseek_common.attention_backend_handler import (
@@ -178,6 +179,59 @@ class TestCPStrategyUnit(CustomTestCase):
             self.assertIn(
                 "512-token",
                 get_npu_mla_cp_ring_fallback_reason(forward_batch),
+            )
+
+    def test_mla_cp_ring_reuses_rank_shards_for_full_cache(self):
+        cp_size = 4
+        bs = 2
+        blocks_per_request = 2 * cp_size
+        split_list = [2] * blocks_per_request + [1] * blocks_per_request
+        full_kv = torch.arange(sum(split_list)).unsqueeze(1)
+        natural_chunks = torch.split(full_kv, split_list, dim=0)
+
+        rank_shards = []
+        reverse_split_len = []
+        for rank in range(cp_size):
+            shard_indices = [
+                rank,
+                blocks_per_request + rank,
+                blocks_per_request - 1 - rank,
+                2 * blocks_per_request - 1 - rank,
+            ]
+            rank_shards.append(
+                torch.cat([natural_chunks[index] for index in shard_indices], dim=0)
+            )
+            reverse_split_len.extend(
+                [natural_chunks[index].shape[0] for index in shard_indices]
+            )
+
+        cp_reverse_index = []
+        for batch_id in range(bs):
+            cp_reverse_index.extend(
+                list(range(batch_id, blocks_per_request * bs, 2 * bs))
+                + list(
+                    range(
+                        (blocks_per_request - 1) * bs + batch_id,
+                        0,
+                        -2 * bs,
+                    )
+                )
+            )
+        metadata = SimpleNamespace(
+            per_rank_actual_token=[shard.shape[0] for shard in rank_shards],
+            reverse_split_len=reverse_split_len,
+            cp_reverse_index=cp_reverse_index,
+        )
+        forward_batch = SimpleNamespace(attn_cp_metadata=metadata)
+
+        restored = rerange_cp_kv_cache_from_rank_shards(
+            rank_shards, forward_batch
+        )
+        torch.testing.assert_close(restored, full_kv)
+
+        with self.assertRaisesRegex(ValueError, "shard 0"):
+            rerange_cp_kv_cache_from_rank_shards(
+                [rank_shards[0][:-1], *rank_shards[1:]], forward_batch
             )
 
     def test_mla_cp_ring_zigzag_visibility_is_causal(self):

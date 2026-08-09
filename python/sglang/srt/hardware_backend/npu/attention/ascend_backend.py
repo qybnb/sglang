@@ -29,6 +29,7 @@ from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_kv_cache,
     get_zigzag_mla_cp_ring_visibility,
+    rerange_cp_kv_cache_from_rank_shards,
 )
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -283,6 +284,37 @@ def _cp_allgather_and_save_kv_npu(
     token_to_kv_pool.set_kv_buffer(
         layer,
         KVWriteLoc(cache_loc, swa_loc),
+        key_cache_full,
+        value_cache_full,
+    )
+
+
+def _save_rotated_cp_kv_npu(
+    forward_batch, layer, rank_shards, local_k, local_v, token_to_kv_pool
+):
+    """Save full KV from compact shards already collected by a CP ring."""
+    cache_loc = (
+        forward_batch.out_cache_loc
+        if not layer.is_cross_attention
+        else forward_batch.encoder_out_cache_loc
+    )
+    k_tail = local_k.shape[1:]
+    v_tail = local_v.shape[1:]
+    k_feature_size = local_k.flatten(1).shape[-1]
+    v_feature_size = local_v.flatten(1).shape[-1]
+
+    kv_full = rerange_cp_kv_cache_from_rank_shards(rank_shards, forward_batch)
+    if kv_full.shape[-1] != k_feature_size + v_feature_size:
+        raise ValueError(
+            "Rotated CP KV feature size does not match local KV: "
+            f"packed={kv_full.shape[-1]}, "
+            f"expected={k_feature_size + v_feature_size}."
+        )
+    key_cache_full = kv_full[..., :k_feature_size].reshape(-1, *k_tail)
+    value_cache_full = kv_full[..., k_feature_size:].reshape(-1, *v_tail)
+    token_to_kv_pool.set_kv_buffer(
+        layer,
+        KVWriteLoc(cache_loc, None),
         key_cache_full,
         value_cache_full,
     )
@@ -1228,9 +1260,11 @@ class AscendAttnBackend(AttentionBackend):
     ) -> torch.Tensor:
         """Run experimental zigzag MLA attention by rotating latent KV.
 
-        This is compute-only sharding for now. Once all ring rounds finish, the
-        compact latent KV is still all-gathered into the paged cache so the
-        existing CP-rank-0 PD sender can transfer a complete cache to decode.
+        Each rank retains the compact shards it already receives during the
+        attention ring. Once all rounds finish, those shards are reordered and
+        written to the paged cache without a second CP all-gather. Every rank
+        still gets a complete cache for radix-prefix correctness, while the
+        existing CP-rank-0 PD sender remains unchanged.
         """
         cp_meta = forward_batch.attn_cp_metadata
         cp_group = get_attention_cp_group()
@@ -1264,7 +1298,7 @@ class AscendAttnBackend(AttentionBackend):
             logger.info(
                 "MLA prefill CP ring active: cp_size=%d, batch_size=%d, "
                 "max_block_len=%d, "
-                "cache_backend=allgather",
+                "cache_backend=ring-reuse",
                 cp_size,
                 bs,
                 max(block_lens_prev),
@@ -1329,6 +1363,7 @@ class AscendAttnBackend(AttentionBackend):
         )
         output_prev = lse_prev = None
         output_next = lse_next = None
+        packed_kv_by_rank = [None] * cp_size
 
         for ring_step in range(cp_size):
             recv_kv = exchange_requests = None
@@ -1340,6 +1375,10 @@ class AscendAttnBackend(AttentionBackend):
                 )
 
             source_rank = (cp_rank - ring_step) % cp_size
+            # Every received buffer has a distinct allocation and remains
+            # valid after the next rotation, so retaining references collects
+            # the full cache without copying or another collective.
+            packed_kv_by_rank[source_rank] = packed_kv
             (
                 early_to_prev,
                 early_to_next,
@@ -1429,14 +1468,17 @@ class AscendAttnBackend(AttentionBackend):
 
         assert output_prev is not None and output_next is not None
 
-        # Phase 1 keeps cache ownership unchanged: every CP rank receives the
-        # full latent cache, and the existing PD sender can remain CP rank 0.
-        _cp_allgather_and_save_kv_npu(
+        if any(shard is None for shard in packed_kv_by_rank):
+            raise RuntimeError("MLA CP ring did not collect every rank's KV shard")
+        complete_rank_shards = [
+            shard for shard in packed_kv_by_rank if shard is not None
+        ]
+        _save_rotated_cp_kv_npu(
             forward_batch,
             layer,
+            complete_rank_shards,
             local_latent_k,
             local_k_rope,
-            cp_size,
             self.token_to_kv_pool,
         )
         del forward_batch.mla_cp_local_k
