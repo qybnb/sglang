@@ -166,6 +166,23 @@ def get_zigzag_mla_cp_ring_visibility(cp_rank: int, source_rank: int):
     return source_rank <= cp_rank, True, source_rank >= cp_rank
 
 
+def get_zigzag_cp_rank_chunk_indices(bs: int, cp_size: int, cp_rank: int):
+    """Return natural-layout chunk indices owned by one zigzag CP rank.
+
+    The returned order is ``[all request early blocks, all request late
+    blocks]``, matching the rank-local tensor layout used by CP-v2.
+    """
+    if bs <= 0 or cp_size <= 0 or not 0 <= cp_rank < cp_size:
+        raise ValueError(
+            f"Invalid zigzag CP topology: bs={bs}, cp_size={cp_size}, "
+            f"cp_rank={cp_rank}."
+        )
+    segments = 2 * cp_size
+    return list(range(cp_rank, bs * segments, segments)) + list(
+        range(segments - cp_rank - 1, bs * segments, segments)
+    )
+
+
 def can_cp_split(seq_len: int, cp_size: int, forward_batch):
     # Base conditions: CP must be enabled, size > 1, and this must be a
     # CP-extend (prefill) step. The seq_len // (cp_size * 2) check ensures
@@ -479,54 +496,6 @@ def cp_all_gather_rerange_kv_cache(input_tensor, cp_size, forward_batch, stream)
     )
     # No need to reshape - output_tensor already has the correct shape [seq_len, ...]
     return output_tensor
-
-
-def rerange_cp_kv_cache_from_rank_shards(rank_shards, forward_batch):
-    """Restore natural token order from already-collected CP rank shards.
-
-    ``rank_shards`` must be ordered by CP rank. This is the communication-free
-    half of :func:`cp_all_gather_rerange_kv_cache`, used when a ring algorithm
-    has already rotated every shard through the current rank.
-    """
-    metadata = forward_batch.attn_cp_metadata
-    rank_token_counts = metadata.per_rank_actual_token
-    if not rank_shards:
-        raise ValueError("CP KV rank shards must not be empty")
-    if len(rank_shards) != len(rank_token_counts):
-        raise ValueError(
-            "CP KV shard count does not match metadata: "
-            f"shards={len(rank_shards)}, ranks={len(rank_token_counts)}."
-        )
-
-    reverse_split_len = metadata.reverse_split_len
-    if len(reverse_split_len) % len(rank_shards) != 0:
-        raise ValueError("CP KV reverse split metadata is not rank-aligned")
-    pieces_per_rank = len(reverse_split_len) // len(rank_shards)
-
-    rank_ordered_pieces = []
-    for rank, (shard, expected_tokens) in enumerate(
-        zip(rank_shards, rank_token_counts)
-    ):
-        if shard.shape[0] != expected_tokens:
-            raise ValueError(
-                f"CP KV shard {rank} has {shard.shape[0]} tokens, "
-                f"expected {expected_tokens}."
-            )
-        begin = rank * pieces_per_rank
-        rank_ordered_pieces.extend(
-            torch.split(
-                shard,
-                reverse_split_len[begin : begin + pieces_per_rank],
-                dim=0,
-            )
-        )
-
-    if len(rank_ordered_pieces) != len(metadata.cp_reverse_index):
-        raise ValueError("CP KV reverse index does not match split metadata")
-    return torch.cat(
-        [rank_ordered_pieces[index] for index in metadata.cp_reverse_index],
-        dim=0,
-    )
 
 
 def cp_allgather_and_save_kv_cache(forward_batch, layer, k, v, cp_size, swa_loc=None):

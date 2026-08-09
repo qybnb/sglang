@@ -26,8 +26,8 @@ from sglang.srt.layers.cp.utils import (
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
 from sglang.srt.layers.utils.cp_utils import (
     get_npu_mla_cp_ring_fallback_reason,
+    get_zigzag_cp_rank_chunk_indices,
     get_zigzag_mla_cp_ring_visibility,
-    rerange_cp_kv_cache_from_rank_shards,
     use_npu_mla_cp_ring,
 )
 from sglang.srt.models.deepseek_common.attention_backend_handler import (
@@ -181,58 +181,34 @@ class TestCPStrategyUnit(CustomTestCase):
                 get_npu_mla_cp_ring_fallback_reason(forward_batch),
             )
 
-    def test_mla_cp_ring_reuses_rank_shards_for_full_cache(self):
+    def test_mla_cp_ring_maps_rank_shards_to_natural_cache_locations(self):
         cp_size = 4
-        bs = 2
         blocks_per_request = 2 * cp_size
         split_list = [2] * blocks_per_request + [1] * blocks_per_request
         full_kv = torch.arange(sum(split_list)).unsqueeze(1)
         natural_chunks = torch.split(full_kv, split_list, dim=0)
+        restored_cache = torch.full_like(full_kv, -1)
 
-        rank_shards = []
-        reverse_split_len = []
         for rank in range(cp_size):
-            shard_indices = [
-                rank,
-                blocks_per_request + rank,
-                blocks_per_request - 1 - rank,
-                2 * blocks_per_request - 1 - rank,
-            ]
-            rank_shards.append(
-                torch.cat([natural_chunks[index] for index in shard_indices], dim=0)
+            shard_indices = get_zigzag_cp_rank_chunk_indices(
+                bs=2, cp_size=cp_size, cp_rank=rank
             )
-            reverse_split_len.extend(
-                [natural_chunks[index].shape[0] for index in shard_indices]
+            shard = torch.cat(
+                [natural_chunks[index] for index in shard_indices], dim=0
             )
+            shard_cache_locs = torch.cat(
+                [natural_chunks[index].flatten() for index in shard_indices], dim=0
+            )
+            restored_cache[shard_cache_locs] = shard
 
-        cp_reverse_index = []
-        for batch_id in range(bs):
-            cp_reverse_index.extend(
-                list(range(batch_id, blocks_per_request * bs, 2 * bs))
-                + list(
-                    range(
-                        (blocks_per_request - 1) * bs + batch_id,
-                        0,
-                        -2 * bs,
-                    )
-                )
-            )
-        metadata = SimpleNamespace(
-            per_rank_actual_token=[shard.shape[0] for shard in rank_shards],
-            reverse_split_len=reverse_split_len,
-            cp_reverse_index=cp_reverse_index,
+        self.assertEqual(
+            get_zigzag_cp_rank_chunk_indices(bs=2, cp_size=4, cp_rank=0),
+            [0, 8, 7, 15],
         )
-        forward_batch = SimpleNamespace(attn_cp_metadata=metadata)
+        torch.testing.assert_close(restored_cache, full_kv)
 
-        restored = rerange_cp_kv_cache_from_rank_shards(
-            rank_shards, forward_batch
-        )
-        torch.testing.assert_close(restored, full_kv)
-
-        with self.assertRaisesRegex(ValueError, "shard 0"):
-            rerange_cp_kv_cache_from_rank_shards(
-                [rank_shards[0][:-1], *rank_shards[1:]], forward_batch
-            )
+        with self.assertRaisesRegex(ValueError, "Invalid zigzag CP topology"):
+            get_zigzag_cp_rank_chunk_indices(bs=2, cp_size=4, cp_rank=4)
 
     def test_mla_cp_ring_zigzag_visibility_is_causal(self):
         cp_size = 4

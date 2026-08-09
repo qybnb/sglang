@@ -28,8 +28,8 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_kv_cache,
+    get_zigzag_cp_rank_chunk_indices,
     get_zigzag_mla_cp_ring_visibility,
-    rerange_cp_kv_cache_from_rank_shards,
 )
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -289,35 +289,38 @@ def _cp_allgather_and_save_kv_npu(
     )
 
 
-def _save_rotated_cp_kv_npu(
-    forward_batch, layer, rank_shards, local_k, local_v, token_to_kv_pool
-):
-    """Save full KV from compact shards already collected by a CP ring."""
+def _get_mla_cp_ring_cache_locs(forward_batch, layer, cp_size):
+    """Build natural paged-cache locations for every zigzag CP shard."""
+    cached_locs = getattr(forward_batch, "mla_cp_ring_cache_locs", None)
+    if cached_locs is not None:
+        return cached_locs
+
     cache_loc = (
         forward_batch.out_cache_loc
         if not layer.is_cross_attention
         else forward_batch.encoder_out_cache_loc
     )
-    k_tail = local_k.shape[1:]
-    v_tail = local_v.shape[1:]
-    k_feature_size = local_k.flatten(1).shape[-1]
-    v_feature_size = local_v.flatten(1).shape[-1]
-
-    kv_full = rerange_cp_kv_cache_from_rank_shards(rank_shards, forward_batch)
-    if kv_full.shape[-1] != k_feature_size + v_feature_size:
+    metadata = forward_batch.attn_cp_metadata
+    if cache_loc.shape[0] != sum(metadata.split_list):
         raise ValueError(
-            "Rotated CP KV feature size does not match local KV: "
-            f"packed={kv_full.shape[-1]}, "
-            f"expected={k_feature_size + v_feature_size}."
+            "MLA CP ring cache locations do not match zigzag metadata: "
+            f"locations={cache_loc.shape[0]}, splits={sum(metadata.split_list)}."
         )
-    key_cache_full = kv_full[..., :k_feature_size].reshape(-1, *k_tail)
-    value_cache_full = kv_full[..., k_feature_size:].reshape(-1, *v_tail)
-    token_to_kv_pool.set_kv_buffer(
-        layer,
-        KVWriteLoc(cache_loc, None),
-        key_cache_full,
-        value_cache_full,
+    natural_chunks = torch.split(cache_loc, metadata.split_list, dim=0)
+    cached_locs = tuple(
+        torch.cat(
+            [
+                natural_chunks[index]
+                for index in get_zigzag_cp_rank_chunk_indices(
+                    int(metadata.bs), cp_size, cp_rank
+                )
+            ],
+            dim=0,
+        )
+        for cp_rank in range(cp_size)
     )
+    forward_batch.mla_cp_ring_cache_locs = cached_locs
+    return cached_locs
 
 
 class AscendAttnBackend(AttentionBackend):
@@ -1260,11 +1263,11 @@ class AscendAttnBackend(AttentionBackend):
     ) -> torch.Tensor:
         """Run experimental zigzag MLA attention by rotating latent KV.
 
-        Each rank retains the compact shards it already receives during the
-        attention ring. Once all rounds finish, those shards are reordered and
-        written to the paged cache without a second CP all-gather. Every rank
-        still gets a complete cache for radix-prefix correctness, while the
-        existing CP-rank-0 PD sender remains unchanged.
+        Each compact shard received during the attention ring is scattered
+        directly to its natural paged-cache locations. No second CP all-gather
+        or full-sequence staging tensor is needed. Every rank still gets a
+        complete cache for radix-prefix correctness, while the existing
+        CP-rank-0 PD sender remains unchanged.
         """
         cp_meta = forward_batch.attn_cp_metadata
         cp_group = get_attention_cp_group()
@@ -1298,7 +1301,7 @@ class AscendAttnBackend(AttentionBackend):
             logger.info(
                 "MLA prefill CP ring active: cp_size=%d, batch_size=%d, "
                 "max_block_len=%d, "
-                "cache_backend=ring-reuse",
+                "cache_backend=ring-direct",
                 cp_size,
                 bs,
                 max(block_lens_prev),
@@ -1361,9 +1364,11 @@ class AscendAttnBackend(AttentionBackend):
         local_k_nope, local_expanded_k_rope = k.split(
             [layer.v_head_dim, self.qk_rope_head_dim], dim=-1
         )
+        cache_locs_by_rank = _get_mla_cp_ring_cache_locs(
+            forward_batch, layer, cp_size
+        )
         output_prev = lse_prev = None
         output_next = lse_next = None
-        packed_kv_by_rank = [None] * cp_size
 
         for ring_step in range(cp_size):
             recv_kv = exchange_requests = None
@@ -1375,26 +1380,22 @@ class AscendAttnBackend(AttentionBackend):
                 )
 
             source_rank = (cp_rank - ring_step) % cp_size
-            # Every received buffer has a distinct allocation and remains
-            # valid after the next rotation, so retaining references collects
-            # the full cache without copying or another collective.
-            packed_kv_by_rank[source_rank] = packed_kv
             (
                 early_to_prev,
                 early_to_next,
                 late_to_next,
             ) = get_zigzag_mla_cp_ring_visibility(cp_rank, source_rank)
+            source_latent_k = packed_kv[:, :latent_feature_size].reshape(
+                -1, latent_head_num, self.kv_lora_rank
+            )
+            source_k_rope_compact = packed_kv[:, latent_feature_size:].reshape(
+                -1, rope_head_num, self.qk_rope_head_dim
+            )
             if ring_step == 0:
                 source_k_nope = local_k_nope
                 source_k_rope = local_expanded_k_rope
                 source_value = v
             else:
-                source_latent_k = packed_kv[:, :latent_feature_size].reshape(
-                    -1, latent_head_num, self.kv_lora_rank
-                )
-                source_k_rope_compact = packed_kv[
-                    :, latent_feature_size:
-                ].reshape(-1, rope_head_num, self.qk_rope_head_dim)
                 projected_kv = layer.kv_b_proj(source_latent_k.squeeze(1))[0].view(
                     -1,
                     layer.tp_k_head_num,
@@ -1461,26 +1462,26 @@ class AscendAttnBackend(AttentionBackend):
                     previous_lse=lse_next,
                 )
 
+            source_cache_locs = cache_locs_by_rank[source_rank]
+            if source_cache_locs.shape[0] != source_latent_k.shape[0]:
+                raise ValueError(
+                    f"MLA CP ring shard {source_rank} cache locations do not "
+                    f"match KV tokens: locations={source_cache_locs.shape[0]}, "
+                    f"KV={source_latent_k.shape[0]}."
+                )
+            self.token_to_kv_pool.set_kv_buffer(
+                layer,
+                KVWriteLoc(source_cache_locs, None),
+                source_latent_k,
+                source_k_rope_compact,
+            )
+
             if exchange_requests is not None:
                 packed_kv = self._finish_mla_cp_ring_kv_exchange(
                     recv_kv, exchange_requests
                 )
 
         assert output_prev is not None and output_next is not None
-
-        if any(shard is None for shard in packed_kv_by_rank):
-            raise RuntimeError("MLA CP ring did not collect every rank's KV shard")
-        complete_rank_shards = [
-            shard for shard in packed_kv_by_rank if shard is not None
-        ]
-        _save_rotated_cp_kv_npu(
-            forward_batch,
-            layer,
-            complete_rank_shards,
-            local_latent_k,
-            local_k_rope,
-            self.token_to_kv_pool,
-        )
         del forward_batch.mla_cp_local_k
         del forward_batch.mla_cp_local_k_rope
 
