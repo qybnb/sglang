@@ -364,11 +364,20 @@ class TestContextParallelServerArgs(CustomTestCase):
 
     def test_canonical_prefill_cp_cli_sets_unified_fields(self):
         args = self.parser.parse_args(
-            ["--model", "dummy", "--enable-prefill-cp", "--cp-strategy", "interleave"]
+            [
+                "--model",
+                "dummy",
+                "--enable-prefill-cp",
+                "--cp-strategy",
+                "interleave",
+                "--mla-cp-backend",
+                "ring",
+            ]
         )
 
         self.assertTrue(args.enable_prefill_cp)
         self.assertEqual(args.cp_strategy, "interleave")
+        self.assertEqual(args.mla_cp_backend, "ring")
 
     def test_canonical_prefill_cp_requires_strategy(self):
         args = self.parser.parse_args(["--model", "dummy", "--enable-prefill-cp"])

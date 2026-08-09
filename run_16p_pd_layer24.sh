@@ -99,6 +99,11 @@ DECODE_MEM_FRACTION_STATIC="${DECODE_MEM_FRACTION_STATIC:-${MEM_FRACTION_STATIC:
 MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-32768}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-16}"
 CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-4096}"
+MLA_CP_BACKEND="${MLA_CP_BACKEND:-allgather}"
+if [[ "${MLA_CP_BACKEND}" != "allgather" && "${MLA_CP_BACKEND}" != "ring" ]]; then
+    echo "MLA_CP_BACKEND must be allgather or ring (got ${MLA_CP_BACKEND})." >&2
+    exit 2
+fi
 PAGE_SIZE="${PAGE_SIZE:-128}"
 LOG_DIR="${LOG_DIR:-${REPO_ROOT}/logs/kimi_k3_layer24_pd}"
 mkdir -p "${LOG_DIR}"
@@ -189,7 +194,7 @@ case "${ROLE}" in
         LOG_FILE="${LOG_DIR}/prefill_$(date '+%Y-%m-%d_%H-%M-%S').log"
         echo "Starting Kimi-K3 ${NUM_HIDDEN_LAYERS}-layer prefill at ${PREFILL_HOST} (bind=${PREFILL_BIND_HOST}) on NPU ${PREFILL_BASE_GPU_ID}-$((PREFILL_BASE_GPU_ID + TP_SIZE - 1))" \
             "(TP=${TP_SIZE}, DP=${PREFILL_DP_SIZE}, CP=${PREFILL_CP_SIZE}, attention-TP=${PREFILL_ATTN_TP_SIZE}," \
-            "HCCL=${HCCL_BUFFSIZE}MB, MF=${ASCEND_MF_TRANSFER_PROTOCOL}," \
+            "MLA-CP=${MLA_CP_BACKEND}, HCCL=${HCCL_BUFFSIZE}MB, MF=${ASCEND_MF_TRANSFER_PROTOCOL}," \
             "DeepEP-round=${DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS}x${DEEPEP_NORMAL_LONG_SEQ_ROUND});" \
             "log=${LOG_FILE}"
         python3 -m sglang.launch_server \
@@ -204,6 +209,7 @@ case "${ROLE}" in
             --attn-cp-size "${PREFILL_CP_SIZE}" \
             --enable-prefill-cp \
             --cp-strategy zigzag \
+            --mla-cp-backend "${MLA_CP_BACKEND}" \
             --chunked-prefill-size "${CHUNKED_PREFILL_SIZE}" \
             --deepep-mode normal \
             --disable-cuda-graph \

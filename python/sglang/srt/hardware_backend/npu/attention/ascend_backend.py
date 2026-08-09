@@ -21,9 +21,15 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.dp_attention import (
+    get_attention_cp_group,
+    get_attention_tp_size,
+)
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
+from sglang.srt.layers.utils.cp_utils import (
+    cp_all_gather_rerange_kv_cache,
+    get_zigzag_mla_cp_ring_visibility,
+)
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -381,6 +387,10 @@ class AscendAttnBackend(AttentionBackend):
             self.dllm_block_size = self.dllm_config.block_size
 
         self.attn_cp_size = model_runner.attn_cp_size
+        self.mla_cp_backend = getattr(
+            model_runner.server_args, "mla_cp_backend", "allgather"
+        )
+        self._mla_cp_ring_logged = False
 
     def _is_swa_layer(self, layer: RadixAttention) -> bool:
         return (
@@ -1123,6 +1133,269 @@ class AscendAttnBackend(AttentionBackend):
             -1, layer.tp_q_head_num * self.kv_lora_rank
         )
 
+    def _exchange_mla_cp_ring_kv(self, packed_kv: torch.Tensor) -> torch.Tensor:
+        """Rotate one compact latent-KV shard to the next CP rank."""
+        cp_group = get_attention_cp_group()
+        cp_rank = cp_group.rank_in_group
+        next_global_rank = cp_group.ranks[(cp_rank + 1) % cp_group.world_size]
+        prev_global_rank = cp_group.ranks[(cp_rank - 1) % cp_group.world_size]
+        recv_kv = torch.empty_like(packed_kv)
+        ops = [
+            torch.distributed.P2POp(
+                torch.distributed.irecv,
+                recv_kv,
+                prev_global_rank,
+                cp_group.device_group,
+            ),
+            torch.distributed.P2POp(
+                torch.distributed.isend,
+                packed_kv,
+                next_global_rank,
+                cp_group.device_group,
+            ),
+        ]
+        for request in torch.distributed.batch_isend_irecv(ops):
+            request.wait()
+        return recv_kv
+
+    def _run_mla_cp_ring_segment(
+        self,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_rope: torch.Tensor,
+        value: torch.Tensor,
+        layer: RadixAttention,
+        causal: bool,
+        previous_output: Optional[torch.Tensor],
+        previous_lse: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute and online-merge one visible Q/KV block pair."""
+        q_len = q_nope.shape[0]
+        kv_len = k_nope.shape[0]
+        seq_lens = torch.tensor([[q_len], [kv_len]], dtype=torch.int32)
+        output = q_nope.new_zeros(q_nope.shape)
+        softmax_lse = torch.zeros(
+            layer.tp_q_head_num,
+            q_len,
+            dtype=torch.float32,
+            device=q_nope.device,
+        )
+        first_block = previous_output is None
+        torch_npu.atb.npu_ring_mla(
+            q_nope=q_nope,
+            q_rope=q_rope,
+            k_nope=k_nope,
+            k_rope=k_rope,
+            value=value,
+            mask=self.ringmla_mask,
+            seqlen=seq_lens,
+            head_num=layer.tp_q_head_num,
+            kv_head_num=layer.tp_k_head_num,
+            pre_out=previous_output,
+            prev_lse=previous_lse,
+            qk_scale=layer.scaling,
+            kernel_type="kernel_type_high_precision",
+            mask_type="mask_type_triu" if causal else "no_mask",
+            calc_type=(
+                "calc_type_first_ring" if first_block else "calc_type_default"
+            ),
+            output=output,
+            softmax_lse=softmax_lse,
+        )
+        return output, softmax_lse
+
+    def do_cp_mla_attn_ring(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """Run experimental zigzag MLA attention by rotating latent KV.
+
+        This is compute-only sharding for now. Once all ring rounds finish, the
+        compact latent KV is still all-gathered into the paged cache so the
+        existing CP-rank-0 PD sender can transfer a complete cache to decode.
+        """
+        cp_meta = forward_batch.attn_cp_metadata
+        cp_group = get_attention_cp_group()
+        cp_rank = cp_group.rank_in_group
+        cp_size = cp_group.world_size
+        block_len = cp_meta.split_list[0]
+        split = cp_meta.total_q_prev_tokens
+
+        if not self._mla_cp_ring_logged:
+            logger.info(
+                "MLA prefill CP ring active: cp_size=%d, block_len=%d, "
+                "cache_backend=allgather",
+                cp_size,
+                block_len,
+            )
+            self._mla_cp_ring_logged = True
+
+        if (
+            layer.v_head_dim != 128
+            or self.qk_rope_head_dim != 64
+            or layer.qk_head_dim != 192
+        ):
+            raise ValueError(
+                "npu_ring_mla requires q_nope/k_nope/value dim 128 and RoPE "
+                f"dim 64, got qk={layer.qk_head_dim}, v={layer.v_head_dim}, "
+                f"rope={self.qk_rope_head_dim}."
+            )
+        if layer.kv_b_proj is None:
+            raise ValueError("MLA CP ring requires kv_b_proj to expand latent KV")
+
+        local_latent_k = forward_batch.mla_cp_local_k
+        local_k_rope = forward_batch.mla_cp_local_k_rope
+        latent_head_num = local_latent_k.shape[1]
+        rope_head_num = local_k_rope.shape[1]
+        if latent_head_num != 1 or rope_head_num != 1:
+            raise ValueError(
+                "MLA CP ring expects one latent KV head, got "
+                f"K heads={latent_head_num}, K-RoPE heads={rope_head_num}."
+            )
+        if local_latent_k.shape[0] != 2 * block_len:
+            raise ValueError(
+                "MLA CP ring local KV length must equal two zigzag blocks, got "
+                f"KV={local_latent_k.shape[0]}, block={block_len}."
+            )
+        latent_feature_size = latent_head_num * self.kv_lora_rank
+
+        packed_kv = torch.cat(
+            [local_latent_k.flatten(1), local_k_rope.flatten(1)], dim=-1
+        ).contiguous()
+
+        q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        q_nope, q_rope = q.split(
+            [layer.v_head_dim, self.qk_rope_head_dim], dim=-1
+        )
+        q_nope_prev, q_nope_next = (
+            q_nope[:split].contiguous(),
+            q_nope[split:].contiguous(),
+        )
+        q_rope_prev, q_rope_next = (
+            q_rope[:split].contiguous(),
+            q_rope[split:].contiguous(),
+        )
+        if q_nope_prev.shape[0] != block_len or q_nope_next.shape[0] != block_len:
+            raise ValueError(
+                "MLA CP ring local Q halves must match the zigzag block length, "
+                f"got prev={q_nope_prev.shape[0]}, next={q_nope_next.shape[0]}, "
+                f"block={block_len}."
+            )
+
+        local_k_nope, local_expanded_k_rope = k.split(
+            [layer.v_head_dim, self.qk_rope_head_dim], dim=-1
+        )
+        output_prev = lse_prev = None
+        output_next = lse_next = None
+
+        for ring_step in range(cp_size):
+            source_rank = (cp_rank - ring_step) % cp_size
+            (
+                early_to_prev,
+                early_to_next,
+                late_to_next,
+            ) = get_zigzag_mla_cp_ring_visibility(cp_rank, source_rank)
+            if ring_step == 0:
+                source_k_nope = local_k_nope
+                source_k_rope = local_expanded_k_rope
+                source_value = v
+            else:
+                source_latent_k = packed_kv[:, :latent_feature_size].reshape(
+                    -1, latent_head_num, self.kv_lora_rank
+                )
+                source_k_rope_compact = packed_kv[
+                    :, latent_feature_size:
+                ].reshape(-1, rope_head_num, self.qk_rope_head_dim)
+                projected_kv = layer.kv_b_proj(source_latent_k.squeeze(1))[0].view(
+                    -1,
+                    layer.tp_k_head_num,
+                    layer.v_head_dim * 2,
+                )
+                source_k_nope, source_value = projected_kv.split(
+                    [layer.v_head_dim, layer.v_head_dim], dim=-1
+                )
+                source_k_rope = source_k_rope_compact.expand(
+                    -1, layer.tp_k_head_num, -1
+                )
+
+            source_early_k = source_k_nope[:block_len].contiguous()
+            source_early_rope = source_k_rope[:block_len].contiguous()
+            source_early_v = source_value[:block_len].contiguous()
+            source_late_k = source_k_nope[block_len:].contiguous()
+            source_late_rope = source_k_rope[block_len:].contiguous()
+            source_late_v = source_value[block_len:].contiguous()
+
+            # Local early Q block r sees early source blocks 0..r. Its own
+            # block is causal; strictly earlier blocks need no mask.
+            if early_to_prev:
+                output_prev, lse_prev = self._run_mla_cp_ring_segment(
+                    q_nope_prev,
+                    q_rope_prev,
+                    source_early_k,
+                    source_early_rope,
+                    source_early_v,
+                    layer,
+                    causal=source_rank == cp_rank,
+                    previous_output=output_prev,
+                    previous_lse=lse_prev,
+                )
+
+            # Every early block precedes local late Q block (2*CP-1-r).
+            if early_to_next:
+                output_next, lse_next = self._run_mla_cp_ring_segment(
+                    q_nope_next,
+                    q_rope_next,
+                    source_early_k,
+                    source_early_rope,
+                    source_early_v,
+                    layer,
+                    causal=False,
+                    previous_output=output_next,
+                    previous_lse=lse_next,
+                )
+
+            # A source late block (2*CP-1-s) is visible iff s >= r. Only the
+            # current rank's late block needs its intra-block causal mask.
+            if late_to_next:
+                output_next, lse_next = self._run_mla_cp_ring_segment(
+                    q_nope_next,
+                    q_rope_next,
+                    source_late_k,
+                    source_late_rope,
+                    source_late_v,
+                    layer,
+                    causal=source_rank == cp_rank,
+                    previous_output=output_next,
+                    previous_lse=lse_next,
+                )
+
+            if ring_step + 1 < cp_size:
+                packed_kv = self._exchange_mla_cp_ring_kv(packed_kv)
+
+        assert output_prev is not None and output_next is not None
+
+        # Phase 1 keeps cache ownership unchanged: every CP rank receives the
+        # full latent cache, and the existing PD sender can remain CP rank 0.
+        _cp_allgather_and_save_kv_npu(
+            forward_batch,
+            layer,
+            local_latent_k,
+            local_k_rope,
+            cp_size,
+            self.token_to_kv_pool,
+        )
+        del forward_batch.mla_cp_local_k
+        del forward_batch.mla_cp_local_k_rope
+
+        return torch.cat((output_prev, output_next), dim=0).view(
+            -1, layer.tp_q_head_num * layer.v_head_dim
+        )
+
     def forward_sparse(
         self,
         q: torch.Tensor,
@@ -1685,6 +1958,13 @@ class AscendAttnBackend(AttentionBackend):
                         -1, layer.tp_q_head_num * layer.v_head_dim
                     )
         elif is_cp_mode:
+            if (
+                self.mla_cp_backend == "ring"
+                and not save_kv_cache
+                and hasattr(forward_batch, "mla_cp_local_k")
+                and hasattr(forward_batch, "mla_cp_local_k_rope")
+            ):
+                return self.do_cp_mla_attn_ring(q, k, v, layer, forward_batch)
             # MLA projections provide rank-local Q and a full-sequence latent KV
             # after rebuild_cp_kv_cache. Persist that full KV on every CP rank,
             # then evaluate only this rank's zigzag Q blocks against the paged

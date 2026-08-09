@@ -19,6 +19,8 @@ from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 
+MLA_CP_RING_MAX_CAUSAL_BLOCK_SIZE = 512
+
 
 @dataclass
 class ContextParallelMetadata:
@@ -98,6 +100,63 @@ def mla_use_prefill_cp(forward_batch, mla_enable_prefill_cp=None):
         and mla_enable_prefill_cp
         and forward_batch.forward_mode.is_context_parallel_extend()
     )
+
+
+def get_npu_mla_cp_ring_fallback_reason(forward_batch, attention=None):
+    """Return why the experimental Ascend MLA CP ring path cannot run.
+
+    The first implementation deliberately targets the shape for which the ATB
+    ``npu_ring_mla`` contract is unambiguous: one request, no prefix cache, and
+    equally sized zigzag blocks no longer than its 512-token causal mask.
+    Unsupported batches keep using the established absorbed-MLA all-gather
+    path, so selecting ``--mla-cp-backend ring`` is safe for mixed workloads.
+    """
+    server_args = get_global_server_args()
+    if getattr(server_args, "mla_cp_backend", "allgather") != "ring":
+        return "ring backend is disabled"
+
+    if attention is not None and (
+        getattr(attention, "qk_nope_head_dim", None) != 128
+        or getattr(attention, "qk_rope_head_dim", None) != 64
+        or getattr(attention, "v_head_dim", None) != 128
+    ):
+        return "npu_ring_mla requires 128-dim NoPE/value and 64-dim RoPE"
+
+    metadata = getattr(forward_batch, "attn_cp_metadata", None)
+    if metadata is None:
+        return "context-parallel metadata is missing"
+    if getattr(metadata, "bs", None) != 1:
+        return "only batch size 1 is supported"
+
+    prefix_lens = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+    if prefix_lens is not None and any(int(length) != 0 for length in prefix_lens):
+        return "prefix cache is not supported"
+
+    cp_size = get_parallel().attn_cp_size
+    split_list = getattr(metadata, "split_list", None)
+    if split_list is None or len(split_list) != 2 * cp_size:
+        return "only the zigzag CP layout is supported"
+    if not split_list or min(split_list) <= 0 or len(set(split_list)) != 1:
+        return "zigzag blocks must have equal non-zero lengths"
+    if split_list[0] > MLA_CP_RING_MAX_CAUSAL_BLOCK_SIZE:
+        return (
+            "zigzag block length exceeds the 512-token npu_ring_mla causal mask"
+        )
+    return None
+
+
+def use_npu_mla_cp_ring(forward_batch, attention=None) -> bool:
+    return get_npu_mla_cp_ring_fallback_reason(forward_batch, attention) is None
+
+
+def get_zigzag_mla_cp_ring_visibility(cp_rank: int, source_rank: int):
+    """Return visibility of a source rank's early/late KV zigzag blocks.
+
+    The tuple is ``(early_to_local_early, early_to_local_late,
+    late_to_local_late)``. Equality denotes the two causal diagonal blocks;
+    the caller applies a triangular mask only in that case.
+    """
+    return source_rank <= cp_rank, True, source_rank >= cp_rank
 
 
 def can_cp_split(seq_len: int, cp_size: int, forward_batch):

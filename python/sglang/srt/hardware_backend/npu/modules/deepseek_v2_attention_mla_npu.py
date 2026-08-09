@@ -16,7 +16,10 @@ from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
 )
 from sglang.srt.layers.communicator import ScatterMode, get_attn_tp_context
-from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
+from sglang.srt.layers.utils.cp_utils import (
+    mla_use_prefill_cp,
+    use_npu_mla_cp_ring,
+)
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 
 if TYPE_CHECKING:
@@ -114,10 +117,21 @@ def forward_mha_prepare_npu(
         k_pe = latent_cache[:, :, m.kv_lora_rank :]
         if m.rotary_emb is not None:
             q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
-        # this is for model kimi-vl-a3B-instruct
-        get_token_to_kv_pool().set_kv_buffer(
-            m, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
-        )
+        # The CP ring backend gathers this local latent KV after attention and
+        # then writes the full cache required by the current PD sender. Avoid a
+        # redundant rank-local write on the non-fused RoPE path.
+        if not use_npu_mla_cp_ring(forward_batch):
+            # this is for model kimi-vl-a3B-instruct
+            get_token_to_kv_pool().set_kv_buffer(
+                m, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
+            )
+
+    if use_npu_mla_cp_ring(forward_batch):
+        # RadixAttention's MHA signature only carries expanded K/V. Preserve
+        # compact rank-local latent KV on the per-forward object so the Ascend
+        # backend can rotate it and materialize the full PD cache afterwards.
+        forward_batch.mla_cp_local_k = kv_a.unsqueeze(1).contiguous()
+        forward_batch.mla_cp_local_k_rope = k_pe.contiguous()
 
     q[..., m.qk_nope_head_dim :] = q_pe
 

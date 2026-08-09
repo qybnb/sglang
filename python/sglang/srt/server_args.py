@@ -946,6 +946,18 @@ class ServerArgs:
             choices=("zigzag", "interleave"),
         ),
     ] = None
+    mla_cp_backend: A[
+        str,
+        Arg(
+            help=(
+                "MLA attention implementation used during prefill context "
+                "parallelism. 'allgather' materializes full latent KV on every "
+                "CP rank. 'ring' enables the experimental Ascend zigzag ring "
+                "compute path and falls back to allgather for unsupported batches."
+            ),
+            choices=("allgather", "ring"),
+        ),
+    ] = "allgather"
     enable_dsa_prefill_context_parallel: A[bool, Arg(no_cli=True)] = False
     dsa_prefill_cp_mode: A[str, Arg(no_cli=True)] = "round-robin-split"
     enable_prefill_context_parallel: A[bool, Arg(no_cli=True)] = False

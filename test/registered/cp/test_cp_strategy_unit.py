@@ -24,6 +24,11 @@ from sglang.srt.layers.cp.utils import (
     is_cp_v2_active,
 )
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
+from sglang.srt.layers.utils.cp_utils import (
+    get_npu_mla_cp_ring_fallback_reason,
+    get_zigzag_mla_cp_ring_visibility,
+    use_npu_mla_cp_ring,
+)
 from sglang.srt.models.deepseek_common.attention_backend_handler import (
     handle_attention_ascend,
 )
@@ -96,11 +101,100 @@ class TestCPStrategyUnit(CustomTestCase):
             "sglang.srt.models.deepseek_common.attention_backend_handler."
             "mla_use_prefill_cp",
             return_value=True,
-        ) as use_prefill_cp:
+        ) as use_prefill_cp, patch(
+            "sglang.srt.models.deepseek_common.attention_backend_handler."
+            "use_npu_mla_cp_ring",
+            return_value=False,
+        ) as use_ring:
             method = handle_attention_ascend(attn, forward_batch)
 
         self.assertEqual(method, AttnForwardMethod.MLA_NPU)
         use_prefill_cp.assert_called_once_with(forward_batch, True)
+        use_ring.assert_called_once_with(forward_batch, attn)
+
+    def test_ascend_prefill_cp_ring_dispatches_to_mha(self):
+        forward_mode = SimpleNamespace(
+            is_extend=lambda: True,
+            is_target_verify=lambda: False,
+            is_draft_extend_v2=lambda: False,
+        )
+        forward_batch = SimpleNamespace(forward_mode=forward_mode)
+        attn = SimpleNamespace(
+            use_dsa=False,
+            mla_enable_prefill_cp=True,
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=64,
+            v_head_dim=128,
+        )
+
+        with patch(
+            "sglang.srt.models.deepseek_common.attention_backend_handler."
+            "mla_use_prefill_cp",
+            return_value=True,
+        ), patch(
+            "sglang.srt.models.deepseek_common.attention_backend_handler."
+            "use_npu_mla_cp_ring",
+            return_value=True,
+        ):
+            method = handle_attention_ascend(attn, forward_batch)
+
+        self.assertEqual(method, AttnForwardMethod.MHA_NPU)
+
+    def test_mla_cp_ring_batch_guard(self):
+        metadata = SimpleNamespace(bs=1, split_list=[64] * 8)
+        forward_batch = SimpleNamespace(
+            attn_cp_metadata=metadata,
+            extend_prefix_lens_cpu=[0],
+        )
+        with patch(
+            "sglang.srt.layers.utils.cp_utils.get_global_server_args",
+            return_value=SimpleNamespace(mla_cp_backend="ring"),
+        ), patch(
+            "sglang.srt.layers.utils.cp_utils.get_parallel",
+            return_value=SimpleNamespace(attn_cp_size=4),
+        ):
+            self.assertIsNone(get_npu_mla_cp_ring_fallback_reason(forward_batch))
+            self.assertTrue(use_npu_mla_cp_ring(forward_batch))
+
+            metadata.bs = 2
+            self.assertEqual(
+                get_npu_mla_cp_ring_fallback_reason(forward_batch),
+                "only batch size 1 is supported",
+            )
+            metadata.bs = 1
+            forward_batch.extend_prefix_lens_cpu = [1]
+            self.assertEqual(
+                get_npu_mla_cp_ring_fallback_reason(forward_batch),
+                "prefix cache is not supported",
+            )
+            forward_batch.extend_prefix_lens_cpu = [0]
+            metadata.split_list = [513] * 8
+            self.assertIn(
+                "512-token",
+                get_npu_mla_cp_ring_fallback_reason(forward_batch),
+            )
+
+    def test_mla_cp_ring_zigzag_visibility_is_causal(self):
+        cp_size = 4
+        for cp_rank in range(cp_size):
+            prev_visible_blocks = []
+            next_visible_blocks = []
+            for source_rank in range(cp_size):
+                early_to_prev, early_to_next, late_to_next = (
+                    get_zigzag_mla_cp_ring_visibility(cp_rank, source_rank)
+                )
+                if early_to_prev:
+                    prev_visible_blocks.append(source_rank)
+                if early_to_next:
+                    next_visible_blocks.append(source_rank)
+                if late_to_next:
+                    next_visible_blocks.append(2 * cp_size - 1 - source_rank)
+
+            self.assertEqual(prev_visible_blocks, list(range(cp_rank + 1)))
+            self.assertEqual(
+                sorted(next_visible_blocks),
+                list(range(2 * cp_size - cp_rank)),
+            )
 
     def test_strategy_kind_maps_cli_values(self):
         self.assertEqual(ContextParallelStrategyKind.NONE.value, 0)

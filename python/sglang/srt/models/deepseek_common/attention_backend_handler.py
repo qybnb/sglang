@@ -1,5 +1,8 @@
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
-from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
+from sglang.srt.layers.utils.cp_utils import (
+    mla_use_prefill_cp,
+    use_npu_mla_cp_ring,
+)
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
@@ -51,6 +54,11 @@ def handle_attention_ascend(attn, forward_batch):
         if hasattr(attn, "use_dsa") and attn.use_dsa:
             return AttnForwardMethod.DSA_NPU
         elif mla_use_prefill_cp(forward_batch, attn.mla_enable_prefill_cp):
+            if use_npu_mla_cp_ring(forward_batch, attn):
+                # npu_ring_mla consumes expanded 128-dim K/V, so use the MHA
+                # preparation path while rotating compact latent KV between
+                # CP ranks inside the Ascend backend.
+                return AttnForwardMethod.MHA_NPU
             # Ascend normally expands latent KV into MHA K/V for prefill. CP
             # instead needs the absorbed MLA path so forward_mla_prepare_npu
             # can all-gather latent K and K-RoPE before entering the backend.
