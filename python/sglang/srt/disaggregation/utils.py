@@ -632,9 +632,24 @@ def filter_kv_indices_for_cp_rank(
 
 def is_mla_backend(target_kv_pool) -> bool:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-    from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+    from sglang.srt.mem_cache.memory_pool import (
+        HybridLinearKVPool,
+        MLATokenToKVPool,
+    )
 
-    return isinstance(target_kv_pool, (MLATokenToKVPool, DeepSeekV4TokenToKVPool))
+    if isinstance(target_kv_pool, (MLATokenToKVPool, DeepSeekV4TokenToKVPool)):
+        return True
+
+    # Hybrid KDA/MLA models expose the full-attention cache through the outer
+    # HybridLinearKVPool.  Treating that wrapper as MHA makes heterogeneous-TP
+    # PD transfer split the compressed latent KV by query head.  MLA has one
+    # shared latent KV head, so the full latent K and K-RoPE buffers must use
+    # the flat MLA transfer path instead.
+    return (
+        isinstance(target_kv_pool, HybridLinearKVPool)
+        and bool(target_kv_pool.use_mla)
+        and isinstance(target_kv_pool.full_kv_pool, MLATokenToKVPool)
+    )
 
 
 def append_state_component(
@@ -735,6 +750,26 @@ def setup_state_kv_args(
             append_state_component(
                 kv_args, StateType.MAMBA, data_ptrs, data_lens, item_lens, dim
             )
+            full_kv_pool = token_to_kv_pool.full_kv_pool
+            if isinstance(full_kv_pool, NPUMLATokenToKVPool):
+                if full_kv_pool.layer_num <= 0:
+                    raise ValueError(
+                        "NPU MLA KV pool must contain at least one full-attention "
+                        "layer for PD transfer."
+                    )
+                if len(kv_args.kv_data_ptrs) % full_kv_pool.layer_num != 0:
+                    raise ValueError(
+                        "NPU MLA KV buffer count must be divisible by its layer "
+                        f"count, got buffers={len(kv_args.kv_data_ptrs)}, "
+                        f"layers={full_kv_pool.layer_num}."
+                    )
+                # NPU MLA stores latent K and K-RoPE in separate, unequal-width
+                # buffer groups.  Preserve that grouping for PP-aware flat MLA
+                # transfer instead of applying the MHA head-slice layout.
+                kv_args.kv_buf_groups = (
+                    len(kv_args.kv_data_ptrs) // full_kv_pool.layer_num
+                )
+                kv_args.total_kv_layers = total_kv_layers
         elif isinstance(token_to_kv_pool, (DSATokenToKVPool, NPUMLATokenToKVPool)):
             if draft_token_to_kv_pool is not None and isinstance(
                 draft_token_to_kv_pool, DSATokenToKVPool
