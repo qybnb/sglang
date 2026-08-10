@@ -9,11 +9,22 @@
 #   MODEL_PATH=/path/to/full/Kimi-K3 ./run_16p_pd_layer24.sh decode
 #   ./run_16p_pd_layer24.sh router
 #
+# A/B validation:
+#   ENABLE_PCP=0 RUN_TAG=A_pcp_off ... ./run_16p_pd_layer24.sh prefill
+#   ENABLE_PCP=1 RUN_TAG=C_pcp_optimized \
+#     KDA_CP_BACKEND=fla MLA_CP_BACKEND=ring ... \
+#     ./run_16p_pd_layer24.sh prefill
+#
 set -euo pipefail
 
 ROLE="${1:-}"
 if [[ "${ROLE}" != "prefill" && "${ROLE}" != "decode" && "${ROLE}" != "router" ]]; then
     echo "Usage: MODEL_PATH=/path/to/model $0 {prefill|decode} | $0 router" >&2
+    exit 2
+fi
+CONFIG_ONLY="${CONFIG_ONLY:-0}"
+if [[ "${CONFIG_ONLY}" != "0" && "${CONFIG_ONLY}" != "1" ]]; then
+    echo "CONFIG_ONLY must be 0 or 1 (got ${CONFIG_ONLY})." >&2
     exit 2
 fi
 
@@ -33,7 +44,7 @@ PREFILL_BASE_GPU_ID="${PREFILL_BASE_GPU_ID:-0}"
 DECODE_BASE_GPU_ID="${DECODE_BASE_GPU_ID:-0}"
 
 MODEL_PATH="${MODEL_PATH:-}"
-if [[ "${ROLE}" != "router" ]]; then
+if [[ "${ROLE}" != "router" && "${CONFIG_ONLY}" != "1" ]]; then
     if [[ -z "${MODEL_PATH}" ]]; then
         echo "MODEL_PATH is required." >&2
         exit 2
@@ -57,6 +68,11 @@ ROUTER_PORT="${ROUTER_PORT:-6688}"
 BOOTSTRAP_PORT="${BOOTSTRAP_PORT:-8998}"
 MF_STORE_PORT="${MF_STORE_PORT:-24669}"
 TP_SIZE="${TP_SIZE:-8}"
+ENABLE_PCP="${ENABLE_PCP:-1}"
+if [[ "${ENABLE_PCP}" != "0" && "${ENABLE_PCP}" != "1" ]]; then
+    echo "ENABLE_PCP must be 0 or 1 (got ${ENABLE_PCP})." >&2
+    exit 2
+fi
 # Prefill CP consumes ranks from the attention-parallel dimension. TP8/DP2/CP4
 # would collapse attention TP to 1 and replicate the full attention weights on
 # every rank, which does not fit K3-24L on a 64 GiB NPU. Keep two-way attention
@@ -76,16 +92,23 @@ for role_dp_name in PREFILL_DP_SIZE DECODE_DP_SIZE; do
         exit 2
     fi
 done
-PREFILL_CP_SIZE="${PREFILL_CP_SIZE:-4}"
 PREFILL_ATTN_PARALLEL_SIZE=$((TP_SIZE / PREFILL_DP_SIZE))
-if [[ ! "${PREFILL_CP_SIZE}" =~ ^[2-9][0-9]*$ ]] \
-    || (( PREFILL_ATTN_PARALLEL_SIZE % PREFILL_CP_SIZE != 0 )); then
-    echo "PREFILL_CP_SIZE must be greater than 1 and divide TP_SIZE / PREFILL_DP_SIZE" \
-        "(got CP=${PREFILL_CP_SIZE}, TP=${TP_SIZE}, Prefill-DP=${PREFILL_DP_SIZE})." >&2
-    exit 2
+if [[ "${ENABLE_PCP}" == "1" ]]; then
+    PREFILL_CP_SIZE="${PREFILL_CP_SIZE:-4}"
+    if [[ ! "${PREFILL_CP_SIZE}" =~ ^[2-9][0-9]*$ ]] \
+        || (( PREFILL_ATTN_PARALLEL_SIZE % PREFILL_CP_SIZE != 0 )); then
+        echo "With ENABLE_PCP=1, PREFILL_CP_SIZE must be greater than 1 and divide" \
+            "TP_SIZE / PREFILL_DP_SIZE (got CP=${PREFILL_CP_SIZE}," \
+            "TP=${TP_SIZE}, Prefill-DP=${PREFILL_DP_SIZE})." >&2
+        exit 2
+    fi
+else
+    # Keep the same total Prefill world size for a fair A/B comparison.  CP1
+    # means all attention-parallel ranks are ordinary attention-TP ranks.
+    PREFILL_CP_SIZE=1
 fi
 PREFILL_ATTN_TP_SIZE=$((PREFILL_ATTN_PARALLEL_SIZE / PREFILL_CP_SIZE))
-if (( PREFILL_ATTN_TP_SIZE < 2 )); then
+if [[ "${ENABLE_PCP}" == "1" ]] && (( PREFILL_ATTN_TP_SIZE < 2 )); then
     echo "Prefill attention TP must be at least 2 for K3-24L on 64 GiB NPU; " \
         "TP${TP_SIZE}/DP${PREFILL_DP_SIZE}/CP${PREFILL_CP_SIZE} would replicate full KDA attention weights." >&2
     exit 2
@@ -109,26 +132,35 @@ if [[ "${KDA_CP_BACKEND}" != "a2a" && "${KDA_CP_BACKEND}" != "fla" ]]; then
     exit 2
 fi
 PAGE_SIZE="${PAGE_SIZE:-128}"
+RUN_TAG="${RUN_TAG:-pcp${ENABLE_PCP}_cp${PREFILL_CP_SIZE}_${KDA_CP_BACKEND}_${MLA_CP_BACKEND}}"
+if [[ ! "${RUN_TAG}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+    echo "RUN_TAG may contain only letters, digits, dot, underscore, and dash." >&2
+    exit 2
+fi
 LOG_DIR="${LOG_DIR:-${REPO_ROOT}/logs/kimi_k3_layer24_pd}"
-mkdir -p "${LOG_DIR}"
 if [[ "${ROLE}" != "router" ]]; then
     # Direct JSONL diagnostics bypass Python/stdout logging and use one file
     # per scheduler process.  Keep each launch separate for easy collection.
-    export SGLANG_ASCEND_KV_DIAG_DIR="${SGLANG_ASCEND_KV_DIAG_DIR:-${LOG_DIR}/${ROLE}_kv_diag_$(date '+%Y-%m-%d_%H-%M-%S')}"
-    mkdir -p "${SGLANG_ASCEND_KV_DIAG_DIR}"
+    export SGLANG_ASCEND_KV_DIAG_DIR="${SGLANG_ASCEND_KV_DIAG_DIR:-${LOG_DIR}/${RUN_TAG}_${ROLE}_kv_diag_$(date '+%Y-%m-%d_%H-%M-%S')}"
 fi
 
-if [[ -f /usr/local/Ascend/ascend-toolkit/set_env.sh ]]; then
-    set +u
-    # shellcheck disable=SC1091
-    source /usr/local/Ascend/ascend-toolkit/set_env.sh
-    set -u
-fi
-if [[ -f /usr/local/Ascend/nnal/atb/set_env.sh ]]; then
-    set +u
-    # shellcheck disable=SC1091
-    source /usr/local/Ascend/nnal/atb/set_env.sh
-    set -u
+if [[ "${CONFIG_ONLY}" != "1" ]]; then
+    mkdir -p "${LOG_DIR}"
+    if [[ "${ROLE}" != "router" ]]; then
+        mkdir -p "${SGLANG_ASCEND_KV_DIAG_DIR}"
+    fi
+    if [[ -f /usr/local/Ascend/ascend-toolkit/set_env.sh ]]; then
+        set +u
+        # shellcheck disable=SC1091
+        source /usr/local/Ascend/ascend-toolkit/set_env.sh
+        set -u
+    fi
+    if [[ -f /usr/local/Ascend/nnal/atb/set_env.sh ]]; then
+        set +u
+        # shellcheck disable=SC1091
+        source /usr/local/Ascend/nnal/atb/set_env.sh
+        set -u
+    fi
 fi
 
 export SGLANG_SET_CPU_AFFINITY="${SGLANG_SET_CPU_AFFINITY:-1}"
@@ -172,10 +204,25 @@ elif [[ "${ROLE}" == "decode" && -n "${DECODE_LOCAL_IP}" ]]; then
 else
     unset SGLANG_HOST_IP
 fi
-# K3 uses the model-boundary CP-v2 path: shard embeddings before the text
-# backbone and gather hidden states before logits.  The legacy MLA CP path
-# assumes attention-TP=1 and cannot represent the CP4 x attention-TP2 layout.
-export SGLANG_ENABLE_CP_V2="${SGLANG_ENABLE_CP_V2:-1}"
+# K3 PCP uses the model-boundary CP-v2 path: shard embeddings before the text
+# backbone and gather hidden states before logits. Explicitly disable it in the
+# CP1 baseline so the A/B run cannot accidentally enter a CP implementation.
+if [[ "${ENABLE_PCP}" == "1" && "${ROLE}" == "prefill" ]]; then
+    export SGLANG_ENABLE_CP_V2="${SGLANG_ENABLE_CP_V2:-1}"
+else
+    export SGLANG_ENABLE_CP_V2=0
+fi
+
+PREFILL_CP_ARGS=()
+if [[ "${ENABLE_PCP}" == "1" ]]; then
+    PREFILL_CP_ARGS=(
+        --attn-cp-size "${PREFILL_CP_SIZE}"
+        --enable-prefill-cp
+        --cp-strategy zigzag
+        --mla-cp-backend "${MLA_CP_BACKEND}"
+        --kda-cp-backend "${KDA_CP_BACKEND}"
+    )
+fi
 
 COMMON_ARGS=(
     --model-loader-extra-config '{"enable_multithread_load": true}'
@@ -201,12 +248,15 @@ COMMON_ARGS=(
 
 case "${ROLE}" in
     prefill)
-        LOG_FILE="${LOG_DIR}/prefill_$(date '+%Y-%m-%d_%H-%M-%S').log"
+        LOG_FILE="${LOG_DIR}/${RUN_TAG}_prefill_$(date '+%Y-%m-%d_%H-%M-%S').log"
         echo "Starting Kimi-K3 ${NUM_HIDDEN_LAYERS}-layer prefill at ${PREFILL_HOST} (bind=${PREFILL_BIND_HOST}) on NPU ${PREFILL_BASE_GPU_ID}-$((PREFILL_BASE_GPU_ID + TP_SIZE - 1))" \
-            "(TP=${TP_SIZE}, DP=${PREFILL_DP_SIZE}, CP=${PREFILL_CP_SIZE}, attention-TP=${PREFILL_ATTN_TP_SIZE}," \
+            "(RUN_TAG=${RUN_TAG}, PCP=${ENABLE_PCP}, TP=${TP_SIZE}, DP=${PREFILL_DP_SIZE}, CP=${PREFILL_CP_SIZE}, attention-TP=${PREFILL_ATTN_TP_SIZE}," \
             "MLA-CP=${MLA_CP_BACKEND}, KDA-CP=${KDA_CP_BACKEND}, HCCL=${HCCL_BUFFSIZE}MB, MF=${ASCEND_MF_TRANSFER_PROTOCOL}," \
             "DeepEP-round=${DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS}x${DEEPEP_NORMAL_LONG_SEQ_ROUND});" \
             "log=${LOG_FILE}; kv_diag=${SGLANG_ASCEND_KV_DIAG_DIR}"
+        if [[ "${CONFIG_ONLY}" == "1" ]]; then
+            exit 0
+        fi
         python3 -m sglang.launch_server \
             "${COMMON_ARGS[@]}" \
             --host "${PREFILL_BIND_HOST}" \
@@ -216,21 +266,20 @@ case "${ROLE}" in
             --disaggregation-mode prefill \
             --disaggregation-transfer-backend ascend \
             --disaggregation-bootstrap-port "${BOOTSTRAP_PORT}" \
-            --attn-cp-size "${PREFILL_CP_SIZE}" \
-            --enable-prefill-cp \
-            --cp-strategy zigzag \
-            --mla-cp-backend "${MLA_CP_BACKEND}" \
-            --kda-cp-backend "${KDA_CP_BACKEND}" \
+            "${PREFILL_CP_ARGS[@]}" \
             --chunked-prefill-size "${CHUNKED_PREFILL_SIZE}" \
             --deepep-mode normal \
             --disable-cuda-graph \
             --port "${PREFILL_PORT}" 2>&1 | tee "${LOG_FILE}"
         ;;
     decode)
-        LOG_FILE="${LOG_DIR}/decode_$(date '+%Y-%m-%d_%H-%M-%S').log"
+        LOG_FILE="${LOG_DIR}/${RUN_TAG}_decode_$(date '+%Y-%m-%d_%H-%M-%S').log"
         echo "Starting Kimi-K3 ${NUM_HIDDEN_LAYERS}-layer decode at ${DECODE_HOST} (bind=${DECODE_BIND_HOST}) on NPU ${DECODE_BASE_GPU_ID}-$((DECODE_BASE_GPU_ID + TP_SIZE - 1))" \
-            "(TP=${TP_SIZE}, DP=${DECODE_DP_SIZE}, CP=1, attention-TP=$((TP_SIZE / DECODE_DP_SIZE))," \
+            "(RUN_TAG=${RUN_TAG}, PCP=0, TP=${TP_SIZE}, DP=${DECODE_DP_SIZE}, CP=1, attention-TP=$((TP_SIZE / DECODE_DP_SIZE))," \
             "MF=${ASCEND_MF_TRANSFER_PROTOCOL}); log=${LOG_FILE}; kv_diag=${SGLANG_ASCEND_KV_DIAG_DIR}"
+        if [[ "${CONFIG_ONLY}" == "1" ]]; then
+            exit 0
+        fi
         python3 -m sglang.launch_server \
             "${COMMON_ARGS[@]}" \
             --host "${DECODE_BIND_HOST}" \
@@ -246,7 +295,10 @@ case "${ROLE}" in
             --port "${DECODE_PORT}" 2>&1 | tee "${LOG_FILE}"
         ;;
     router)
-        echo "Starting PD router at ${ROUTER_HOST}:${ROUTER_PORT}; prefill=${PREFILL_HOST}:${PREFILL_PORT}, decode=${DECODE_HOST}:${DECODE_PORT}"
+        echo "Starting PD router for RUN_TAG=${RUN_TAG} at ${ROUTER_HOST}:${ROUTER_PORT}; prefill=${PREFILL_HOST}:${PREFILL_PORT}, decode=${DECODE_HOST}:${DECODE_PORT}"
+        if [[ "${CONFIG_ONLY}" == "1" ]]; then
+            exit 0
+        fi
         python3 -m sglang_router.launch_router \
             --pd-disaggregation \
             --policy cache_aware \
