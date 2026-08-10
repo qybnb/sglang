@@ -181,6 +181,9 @@ class KVArgsRegisterInfo:
 class MooncakeKVManager(CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
 
+    def record_transfer_diagnostic(self, event: str, **fields) -> None:
+        """Backend hook for request-level transfer diagnostics."""
+
     def should_blacklist_session_on_transfer_failure(self) -> bool:
         """Whether one transfer error proves that the remote session is dead."""
         return True
@@ -1340,6 +1343,39 @@ class MooncakeKVManager(CommonKVManager):
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
+                        self.record_transfer_diagnostic(
+                            "chunk_dispatch_start",
+                            room=str(kv_chunk.room),
+                            remote_session_id=req.mooncake_session_id,
+                            endpoint=req.endpoint,
+                            dst_port=int(req.dst_port),
+                            chunk_id=getattr(kv_chunk, "chunk_id", None),
+                            is_last_chunk=bool(kv_chunk.is_last_chunk),
+                            index_slice_start=kv_chunk.index_slice.start,
+                            index_slice_stop=kv_chunk.index_slice.stop,
+                            prefill_page_count=len(kv_chunk.prefill_kv_indices),
+                            decode_page_count=len(chunked_dst_kv_indice),
+                            prefill_first_page=(
+                                int(kv_chunk.prefill_kv_indices[0])
+                                if len(kv_chunk.prefill_kv_indices)
+                                else None
+                            ),
+                            prefill_last_page=(
+                                int(kv_chunk.prefill_kv_indices[-1])
+                                if len(kv_chunk.prefill_kv_indices)
+                                else None
+                            ),
+                            decode_first_page=(
+                                int(chunked_dst_kv_indice[0])
+                                if len(chunked_dst_kv_indice)
+                                else None
+                            ),
+                            decode_last_page=(
+                                int(chunked_dst_kv_indice[-1])
+                                if len(chunked_dst_kv_indice)
+                                else None
+                            ),
+                        )
                         if len(kv_chunk.prefill_kv_indices) == 0:
                             ret = 0
                         elif self.is_mla_backend or (
@@ -1383,6 +1419,15 @@ class MooncakeKVManager(CommonKVManager):
                                 target_rank_registration_info.dst_kv_item_len,
                                 executor,
                             )
+                        self.record_transfer_diagnostic(
+                            "chunk_dispatch_result",
+                            room=str(kv_chunk.room),
+                            remote_session_id=req.mooncake_session_id,
+                            chunk_id=getattr(kv_chunk, "chunk_id", None),
+                            is_last_chunk=bool(kv_chunk.is_last_chunk),
+                            ret=int(ret),
+                            elapsed_ms=(time.perf_counter() - start_ts) * 1000,
+                        )
                         if ret != 0:
                             with self.session_lock:
                                 self.session_failures[req.mooncake_session_id] += 1

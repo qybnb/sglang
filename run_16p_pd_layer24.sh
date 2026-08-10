@@ -111,6 +111,12 @@ fi
 PAGE_SIZE="${PAGE_SIZE:-128}"
 LOG_DIR="${LOG_DIR:-${REPO_ROOT}/logs/kimi_k3_layer24_pd}"
 mkdir -p "${LOG_DIR}"
+if [[ "${ROLE}" != "router" ]]; then
+    # Direct JSONL diagnostics bypass Python/stdout logging and use one file
+    # per scheduler process.  Keep each launch separate for easy collection.
+    export SGLANG_ASCEND_KV_DIAG_DIR="${SGLANG_ASCEND_KV_DIAG_DIR:-${LOG_DIR}/${ROLE}_kv_diag_$(date '+%Y-%m-%d_%H-%M-%S')}"
+    mkdir -p "${SGLANG_ASCEND_KV_DIAG_DIR}"
+fi
 
 if [[ -f /usr/local/Ascend/ascend-toolkit/set_env.sh ]]; then
     set +u
@@ -200,7 +206,7 @@ case "${ROLE}" in
             "(TP=${TP_SIZE}, DP=${PREFILL_DP_SIZE}, CP=${PREFILL_CP_SIZE}, attention-TP=${PREFILL_ATTN_TP_SIZE}," \
             "MLA-CP=${MLA_CP_BACKEND}, KDA-CP=${KDA_CP_BACKEND}, HCCL=${HCCL_BUFFSIZE}MB, MF=${ASCEND_MF_TRANSFER_PROTOCOL}," \
             "DeepEP-round=${DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS}x${DEEPEP_NORMAL_LONG_SEQ_ROUND});" \
-            "log=${LOG_FILE}"
+            "log=${LOG_FILE}; kv_diag=${SGLANG_ASCEND_KV_DIAG_DIR}"
         python3 -m sglang.launch_server \
             "${COMMON_ARGS[@]}" \
             --host "${PREFILL_BIND_HOST}" \
@@ -224,7 +230,7 @@ case "${ROLE}" in
         LOG_FILE="${LOG_DIR}/decode_$(date '+%Y-%m-%d_%H-%M-%S').log"
         echo "Starting Kimi-K3 ${NUM_HIDDEN_LAYERS}-layer decode at ${DECODE_HOST} (bind=${DECODE_BIND_HOST}) on NPU ${DECODE_BASE_GPU_ID}-$((DECODE_BASE_GPU_ID + TP_SIZE - 1))" \
             "(TP=${TP_SIZE}, DP=${DECODE_DP_SIZE}, CP=1, attention-TP=$((TP_SIZE / DECODE_DP_SIZE))," \
-            "MF=${ASCEND_MF_TRANSFER_PROTOCOL}); log=${LOG_FILE}"
+            "MF=${ASCEND_MF_TRANSFER_PROTOCOL}); log=${LOG_FILE}; kv_diag=${SGLANG_ASCEND_KV_DIAG_DIR}"
         python3 -m sglang.launch_server \
             "${COMMON_ARGS[@]}" \
             --host "${DECODE_BIND_HOST}" \

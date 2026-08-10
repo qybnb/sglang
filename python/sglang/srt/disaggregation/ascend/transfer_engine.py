@@ -4,6 +4,7 @@ from typing import List
 
 import torch
 
+from sglang.srt.disaggregation.ascend.diagnostics import write_ascend_kv_diag
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     MooncakeTransferEngine,
@@ -51,6 +52,14 @@ class AscendTransferEngine(MooncakeTransferEngine):
         self.session_id = NetworkAddress(
             self.hostname, self.engine.get_rpc_port()
         ).to_host_port_str()
+        write_ascend_kv_diag(
+            "engine_created",
+            role=self.role,
+            hostname=self.hostname,
+            npu_id=self.npu_id,
+            session_id=self.session_id,
+            store_url=self.store_url,
+        )
         self.initialize()
 
     def initialize(self) -> None:
@@ -74,8 +83,35 @@ class AscendTransferEngine(MooncakeTransferEngine):
                 output_tensor_list, tmp_tensor, group=get_world_group().device_group
             )
         """Initialize the ascend transfer instance."""
-        ret_value = self.engine.initialize(
-            self.store_url, self.session_id, self.role, self.npu_id, trans_op_type
+        protocol_name = transfer_protocol or "sdma"
+        write_ascend_kv_diag(
+            "engine_initialize_start",
+            role=self.role,
+            npu_id=self.npu_id,
+            session_id=self.session_id,
+            store_url=self.store_url,
+            protocol=protocol_name,
+        )
+        try:
+            ret_value = self.engine.initialize(
+                self.store_url, self.session_id, self.role, self.npu_id, trans_op_type
+            )
+        except Exception as exc:
+            write_ascend_kv_diag(
+                "engine_initialize_exception",
+                role=self.role,
+                npu_id=self.npu_id,
+                session_id=self.session_id,
+                exception=repr(exc),
+            )
+            raise
+        write_ascend_kv_diag(
+            "engine_initialize_result",
+            role=self.role,
+            npu_id=self.npu_id,
+            session_id=self.session_id,
+            protocol=protocol_name,
+            ret=int(ret_value),
         )
         if ret_value != 0:
             raise RuntimeError(
@@ -86,13 +122,43 @@ class AscendTransferEngine(MooncakeTransferEngine):
             )
 
     def batch_register(self, ptrs: List[int], lengths: List[int]):
+        registration = [
+            {"buffer": index, "ptr": int(ptr), "capacity": int(length)}
+            for index, (ptr, length) in enumerate(zip(ptrs, lengths))
+        ]
+        write_ascend_kv_diag(
+            "batch_register_start",
+            role=self.role,
+            npu_id=self.npu_id,
+            session_id=self.session_id,
+            buffers=registration,
+            ptr_count=len(ptrs),
+            length_count=len(lengths),
+            total_bytes=sum(lengths),
+        )
         try:
             ret_value = self.engine.batch_register_memory(ptrs, lengths)
         except Exception as exc:
+            write_ascend_kv_diag(
+                "batch_register_exception",
+                role=self.role,
+                npu_id=self.npu_id,
+                session_id=self.session_id,
+                buffers=registration,
+                exception=repr(exc),
+            )
             raise RuntimeError(
                 "Ascend memory registration raised an exception: "
                 f"buffers={len(ptrs)}, total_bytes={sum(lengths)}"
             ) from exc
+        write_ascend_kv_diag(
+            "batch_register_result",
+            role=self.role,
+            npu_id=self.npu_id,
+            session_id=self.session_id,
+            buffers=registration,
+            ret=int(ret_value),
+        )
         if ret_value != 0:
             raise RuntimeError(
                 "Ascend memory registration failed: "
