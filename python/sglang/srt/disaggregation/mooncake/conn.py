@@ -123,35 +123,67 @@ class KVArgsRegisterInfo:
     # for mamba state different tp slice transfer
     dst_state_item_lens: List[List[int]]
     dst_state_dim_per_tensor: List[List[int]]
-    # Note: always put the staging field at the final (since the staging field is optional and contains multiple inputs)
+    # Per-buffer metadata was added after the fixed staging wire fields so that
+    # a new prefill can still parse registrations from an older decode.
+    dst_kv_data_lens: list[int] = dataclasses.field(default_factory=list)
+    dst_kv_item_lens: list[int] = dataclasses.field(default_factory=list)
     staging: Optional[StagingRegisterInfo] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
+        dst_kv_ptrs = list(struct.unpack(f"{len(msg[4])//8}Q", msg[4]))
+        dst_kv_item_len = int(msg[9].decode("ascii"))
+        dst_kv_data_lens = (
+            list(struct.unpack(f"{len(msg[14])//8}Q", msg[14]))
+            if len(msg) > 14 and msg[14] != b""
+            else []
+        )
+        dst_kv_item_lens = (
+            list(struct.unpack(f"{len(msg[15])//8}Q", msg[15]))
+            if len(msg) > 15 and msg[15] != b""
+            else [dst_kv_item_len] * len(dst_kv_ptrs)
+        )
+        if dst_kv_data_lens and len(dst_kv_data_lens) != len(dst_kv_ptrs):
+            raise ValueError(
+                "dst_kv_data_lens length mismatch: "
+                f"got {len(dst_kv_data_lens)}, expected {len(dst_kv_ptrs)}"
+            )
+        if len(dst_kv_item_lens) != len(dst_kv_ptrs):
+            raise ValueError(
+                "dst_kv_item_lens length mismatch: "
+                f"got {len(dst_kv_item_lens)}, expected {len(dst_kv_ptrs)}"
+            )
         return cls(
             room=str(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
             dst_port=int(msg[2].decode("ascii")),
             mooncake_session_id=msg[3].decode("ascii"),
-            dst_kv_ptrs=list(struct.unpack(f"{len(msg[4])//8}Q", msg[4])),
+            dst_kv_ptrs=dst_kv_ptrs,
             dst_aux_ptrs=list(struct.unpack(f"{len(msg[5])//8}Q", msg[5])),
             dst_state_data_ptrs=unpack_int_lists(msg[6], "Q"),
             dst_tp_rank=int(msg[7].decode("ascii")),
             dst_attn_tp_size=int(msg[8].decode("ascii")),
-            dst_kv_item_len=int(msg[9].decode("ascii")),
+            dst_kv_item_len=dst_kv_item_len,
             dst_state_item_lens=(
                 unpack_int_lists(msg[10], "I") if len(msg) > 10 else []
             ),
             dst_state_dim_per_tensor=(
                 unpack_int_lists(msg[11], "I") if len(msg) > 11 else []
             ),
-            # Note: always put the staging field at the final
+            dst_kv_data_lens=dst_kv_data_lens,
+            dst_kv_item_lens=dst_kv_item_lens,
+            # Staging occupies fixed wire fields 12 and 13. New extension
+            # fields must be appended after those fields.
             staging=StagingRegisterInfo.from_zmq_fields(msg, 12),
         )
 
 
 class MooncakeKVManager(CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
+
+    def should_blacklist_session_on_transfer_failure(self) -> bool:
+        """Whether one transfer error proves that the remote session is dead."""
+        return True
 
     def __init__(
         self,
@@ -1354,11 +1386,25 @@ class MooncakeKVManager(CommonKVManager):
                         if ret != 0:
                             with self.session_lock:
                                 self.session_failures[req.mooncake_session_id] += 1
-                                # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
-                                if self.session_failures[req.mooncake_session_id] >= 1:
+                                # Most Mooncake transports use a transfer error as
+                                # a liveness signal. Backends whose error code also
+                                # covers address/registration failures can opt out.
+                                if (
+                                    self.session_failures[req.mooncake_session_id]
+                                    >= 1
+                                    and self.should_blacklist_session_on_transfer_failure()
+                                ):
                                     self.failed_sessions.add(req.mooncake_session_id)
                                     logger.error(
                                         f"Session {req.mooncake_session_id} failed."
+                                    )
+                                else:
+                                    logger.error(
+                                        "KV transfer failed for session %s; the "
+                                        "backend does not treat this error as proof "
+                                        "that the remote session is dead, so later "
+                                        "requests may retry it.",
+                                        req.mooncake_session_id,
                                     )
                             self.record_failure(
                                 kv_chunk.room,
@@ -1839,6 +1885,14 @@ class MooncakeKVReceiver(CommonKVReceiver):
             packed_state_dim_per_tensor = pack_int_lists(
                 getattr(self.kv_mgr.kv_args, "state_dim_per_tensor", []) or [], "I"
             )
+            packed_kv_data_lens = b"".join(
+                struct.pack("Q", data_len)
+                for data_len in self.kv_mgr.kv_args.kv_data_lens
+            )
+            packed_kv_item_lens = b"".join(
+                struct.pack("Q", item_len)
+                for item_len in self.kv_mgr.kv_args.kv_item_lens
+            )
             # Note(shangming): No need to add pp rank here since decode pp size should be equal to prefill pp size or 1
             tp_rank = self.kv_mgr.kv_args.engine_rank
             kv_item_len = self.kv_mgr.kv_args.kv_item_lens[0]
@@ -1874,6 +1928,8 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         packed_state_dim_per_tensor,
                         packed_staging_base_ptr,
                         staging_total_size_str,
+                        packed_kv_data_lens,
+                        packed_kv_item_lens,
                     ]
                 )
 
