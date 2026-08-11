@@ -128,6 +128,47 @@ Prefill 节点: world=8, DP1
 Decode 节点: world=8, DP2, CP1 / attention-TP4
 ```
 
+仓库已经提供三份 12 层固定配置脚本。模型默认路径为
+`/home/weights/Kimi-K3-int4`，IP 默认沿用 `80.5.17.37/38`；只有实际环境不同
+时才需要通过 `MODEL_PATH`、`PREFILL_HOST` 和 `DECODE_HOST` 覆盖。
+
+| 配置 | 直接执行的脚本 |
+|---|---|
+| A：PCP off | `run_16p_pd_layer12_pcp_off.sh` |
+| B：A2A/allgather | `run_16p_pd_layer12_pcp_a2a.sh` |
+| C：FLA/ring | `run_16p_pd_layer12_pcp_fla_ring.sh` |
+
+例如测试 C 配置，在 Prefill 节点执行：
+
+```bash
+./run_16p_pd_layer12_pcp_fla_ring.sh prefill
+```
+
+在 Decode 节点执行：
+
+```bash
+./run_16p_pd_layer12_pcp_fla_ring.sh decode
+```
+
+在 Router 所在节点执行：
+
+```bash
+./run_16p_pd_layer12_pcp_fla_ring.sh router
+```
+
+切换配置时，三处使用同一份 A、B 或 C 脚本，并完整重启 Prefill、Decode 和
+Router。三份脚本固定相同的 TP/DP、层数、page size、cache 上限和 chunk size，
+避免终端遗留的环境变量污染 A/B/C 对比。正式启动前也可以执行：
+
+```bash
+CONFIG_ONLY=1 ./run_16p_pd_layer12_pcp_off.sh prefill
+CONFIG_ONLY=1 ./run_16p_pd_layer12_pcp_a2a.sh prefill
+CONFIG_ONLY=1 ./run_16p_pd_layer12_pcp_fla_ring.sh prefill
+```
+
+以下环境变量方式保留用于修改机器地址、显存配置或其他实验参数；常规双机
+12 层 A/B/C 验证直接使用上面的固定脚本即可。
+
 两台机器都设置：
 
 ```bash
