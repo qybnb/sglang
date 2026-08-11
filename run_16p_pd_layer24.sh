@@ -114,9 +114,14 @@ if [[ "${ENABLE_PCP}" == "1" ]] && (( PREFILL_ATTN_TP_SIZE < 2 )); then
     exit 2
 fi
 # Prefill CP increases resident attention weights and owns three HCCL
-# communicators. They are pre-warmed before cache profiling, so 93% is needed
-# for weights plus the MLA/KDA pools while still leaving 7% runtime slack.
-PREFILL_MEM_FRACTION_STATIC="${PREFILL_MEM_FRACTION_STATIC:-${MEM_FRACTION_STATIC:-0.93}}"
+# communicators.  Keep its 93% cache profile isolated from the CP-off baseline,
+# which uses the pre-PCP 84% default.
+if [[ "${ENABLE_PCP}" == "1" ]]; then
+    PREFILL_MEM_FRACTION_STATIC_DEFAULT=0.93
+else
+    PREFILL_MEM_FRACTION_STATIC_DEFAULT=0.84
+fi
+PREFILL_MEM_FRACTION_STATIC="${PREFILL_MEM_FRACTION_STATIC:-${MEM_FRACTION_STATIC:-${PREFILL_MEM_FRACTION_STATIC_DEFAULT}}}"
 DECODE_MEM_FRACTION_STATIC="${DECODE_MEM_FRACTION_STATIC:-${MEM_FRACTION_STATIC:-0.84}}"
 MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-32768}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-16}"
@@ -171,20 +176,42 @@ export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-lo}"
 export STREAMS_PER_DEVICE="${STREAMS_PER_DEVICE:-32}"
 export DEEP_NORMAL_MODE_USE_INT8_QUANT="${DEEP_NORMAL_MODE_USE_INT8_QUANT:-1}"
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK="${SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK:-64}"
-# Prefill CP4 x attention-TP2 leaves at most CHUNKED_PREFILL_SIZE / 8 routed
-# tokens on each rank.  Stream DeepEP normal dispatch/combine in 512-token
-# rounds so its HCCL workspace does not compete with the KDA/MLA cache pool.
-# Decode keeps the previously validated low-latency buffer size.
-if [[ "${ROLE}" == "prefill" ]]; then
+# PCP shards each Prefill chunk across CP and attention TP before routed MoE.
+# DeepEP's per-round capacity is per rank, so derive the number of rounds from
+# the local token count instead of the scheduler's global chunk size.  CP-off
+# deliberately keeps the pre-PCP DeepEP/HCCL defaults and full-token TP flow.
+if [[ "${ROLE}" == "prefill" && "${ENABLE_PCP}" == "1" ]]; then
+    if (( CHUNKED_PREFILL_SIZE <= 0 )); then
+        echo "PCP Prefill requires a positive CHUNKED_PREFILL_SIZE" \
+            "(got ${CHUNKED_PREFILL_SIZE})." >&2
+        exit 2
+    fi
+    PREFILL_LOCAL_MAX_TOKENS="$(( \
+        (CHUNKED_PREFILL_SIZE + PREFILL_ATTN_PARALLEL_SIZE - 1) \
+        / PREFILL_ATTN_PARALLEL_SIZE \
+    ))"
     DEEPEP_PREFILL_TOKENS_PER_ROUND="${DEEPEP_PREFILL_TOKENS_PER_ROUND:-512}"
+    if [[ ! "${DEEPEP_PREFILL_TOKENS_PER_ROUND}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "DEEPEP_PREFILL_TOKENS_PER_ROUND must be a positive integer" \
+            "(got ${DEEPEP_PREFILL_TOKENS_PER_ROUND})." >&2
+        exit 2
+    fi
     DEEPEP_PREFILL_ROUNDS="$(( \
-        (CHUNKED_PREFILL_SIZE + DEEPEP_PREFILL_TOKENS_PER_ROUND - 1) \
+        (PREFILL_LOCAL_MAX_TOKENS + DEEPEP_PREFILL_TOKENS_PER_ROUND - 1) \
         / DEEPEP_PREFILL_TOKENS_PER_ROUND \
     ))"
     export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS="${DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS:-${DEEPEP_PREFILL_TOKENS_PER_ROUND}}"
     export DEEPEP_NORMAL_LONG_SEQ_ROUND="${DEEPEP_NORMAL_LONG_SEQ_ROUND:-${DEEPEP_PREFILL_ROUNDS}}"
     export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ="${DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ:-1}"
     export HCCL_BUFFSIZE="${PREFILL_HCCL_BUFFSIZE:-${HCCL_BUFFSIZE:-400}}"
+    PREFILL_TOKEN_LAYOUT="pcp_scattered"
+elif [[ "${ROLE}" == "prefill" ]]; then
+    PREFILL_LOCAL_MAX_TOKENS="${CHUNKED_PREFILL_SIZE}"
+    export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS="${DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS:-8192}"
+    export DEEPEP_NORMAL_LONG_SEQ_ROUND="${DEEPEP_NORMAL_LONG_SEQ_ROUND:-1}"
+    export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ="${DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ:-0}"
+    export HCCL_BUFFSIZE="${PREFILL_HCCL_BUFFSIZE:-${HCCL_BUFFSIZE:-1200}}"
+    PREFILL_TOKEN_LAYOUT="legacy_tp_full"
 else
     export HCCL_BUFFSIZE="${DECODE_HCCL_BUFFSIZE:-${HCCL_BUFFSIZE:-1200}}"
 fi
@@ -216,6 +243,9 @@ fi
 PREFILL_CP_ARGS=()
 if [[ "${ENABLE_PCP}" == "1" ]]; then
     PREFILL_CP_ARGS=(
+        --enable-dp-attention
+        --enable-dp-lm-head
+        --dp-size "${PREFILL_DP_SIZE}"
         --attn-cp-size "${PREFILL_CP_SIZE}"
         --enable-prefill-cp
         --cp-strategy zigzag
@@ -235,8 +265,6 @@ COMMON_ARGS=(
     --quantization modelslim
     --dtype bfloat16
     --tp-size "${TP_SIZE}"
-    --enable-dp-attention
-    --enable-dp-lm-head
     --page-size "${PAGE_SIZE}"
     --max-total-tokens "${MAX_TOTAL_TOKENS}"
     --max-running-requests "${MAX_RUNNING_REQUESTS}"
@@ -251,7 +279,9 @@ case "${ROLE}" in
         LOG_FILE="${LOG_DIR}/${RUN_TAG}_prefill_$(date '+%Y-%m-%d_%H-%M-%S').log"
         echo "Starting Kimi-K3 ${NUM_HIDDEN_LAYERS}-layer prefill at ${PREFILL_HOST} (bind=${PREFILL_BIND_HOST}) on NPU ${PREFILL_BASE_GPU_ID}-$((PREFILL_BASE_GPU_ID + TP_SIZE - 1))" \
             "(RUN_TAG=${RUN_TAG}, PCP=${ENABLE_PCP}, TP=${TP_SIZE}, DP=${PREFILL_DP_SIZE}, CP=${PREFILL_CP_SIZE}, attention-TP=${PREFILL_ATTN_TP_SIZE}," \
-            "MLA-CP=${MLA_CP_BACKEND}, KDA-CP=${KDA_CP_BACKEND}, HCCL=${HCCL_BUFFSIZE}MB, MF=${ASCEND_MF_TRANSFER_PROTOCOL}," \
+            "MLA-CP=${MLA_CP_BACKEND}, KDA-CP=${KDA_CP_BACKEND}, mem-fraction=${PREFILL_MEM_FRACTION_STATIC}," \
+            "HCCL=${HCCL_BUFFSIZE}MB, MF=${ASCEND_MF_TRANSFER_PROTOCOL}," \
+            "token-layout=${PREFILL_TOKEN_LAYOUT}, local-max-token=${PREFILL_LOCAL_MAX_TOKENS}," \
             "DeepEP-round=${DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS}x${DEEPEP_NORMAL_LONG_SEQ_ROUND});" \
             "log=${LOG_FILE}; kv_diag=${SGLANG_ASCEND_KV_DIAG_DIR}"
         if [[ "${CONFIG_ONLY}" == "1" ]]; then
@@ -261,7 +291,6 @@ case "${ROLE}" in
             "${COMMON_ARGS[@]}" \
             --host "${PREFILL_BIND_HOST}" \
             --base-gpu-id "${PREFILL_BASE_GPU_ID}" \
-            --dp-size "${PREFILL_DP_SIZE}" \
             --mem-fraction-static "${PREFILL_MEM_FRACTION_STATIC}" \
             --disaggregation-mode prefill \
             --disaggregation-transfer-backend ascend \
@@ -284,6 +313,8 @@ case "${ROLE}" in
             "${COMMON_ARGS[@]}" \
             --host "${DECODE_BIND_HOST}" \
             --base-gpu-id "${DECODE_BASE_GPU_ID}" \
+            --enable-dp-attention \
+            --enable-dp-lm-head \
             --dp-size "${DECODE_DP_SIZE}" \
             --mem-fraction-static "${DECODE_MEM_FRACTION_STATIC}" \
             --disaggregation-mode decode \
