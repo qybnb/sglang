@@ -182,9 +182,10 @@ export STREAMS_PER_DEVICE="${STREAMS_PER_DEVICE:-32}"
 export DEEP_NORMAL_MODE_USE_INT8_QUANT="${DEEP_NORMAL_MODE_USE_INT8_QUANT:-1}"
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK="${SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK:-64}"
 # Prefill always keeps DP-attention token scatter for DeepEP, matching the last
-# validated pre-PCP Kimi configuration.  PCP additionally shards each chunk
-# across CP.  The Ascend CamMoeDispatchNormal tiler receives both the rank-local
-# tensor and the EP group's globalBs; round * perRoundTokens must cover globalBs.
+# validated pre-PCP Kimi configuration. PCP changes the attention partitioning,
+# but both PCP-on and PCP-off present the same maximum token count per physical
+# rank at the MoE boundary. Keep the pre-PCP DeepEP capacity defaults instead of
+# enabling the long-sequence round mode from the attention chunk size.
 if [[ "${ROLE}" == "prefill" ]]; then
     if (( CHUNKED_PREFILL_SIZE <= 0 )); then
         echo "Prefill requires a positive CHUNKED_PREFILL_SIZE" \
@@ -197,26 +198,11 @@ if [[ "${ROLE}" == "prefill" ]]; then
     PREFILL_LOCAL_MAX_TOKENS="$(( \
         (CHUNKED_PREFILL_SIZE + TP_SIZE - 1) / TP_SIZE \
     ))"
-    DEEPEP_PREFILL_TOKENS_PER_ROUND="${DEEPEP_PREFILL_TOKENS_PER_ROUND:-512}"
-    if [[ ! "${DEEPEP_PREFILL_TOKENS_PER_ROUND}" =~ ^[1-9][0-9]*$ ]]; then
-        echo "DEEPEP_PREFILL_TOKENS_PER_ROUND must be a positive integer" \
-            "(got ${DEEPEP_PREFILL_TOKENS_PER_ROUND})." >&2
-        exit 2
-    fi
-    DEEPEP_PREFILL_ROUNDS="$(( \
-        (CHUNKED_PREFILL_SIZE + DEEPEP_PREFILL_TOKENS_PER_ROUND - 1) \
-        / DEEPEP_PREFILL_TOKENS_PER_ROUND \
-    ))"
-    # Set the operator-facing variables from one internally consistent pair;
-    # stale generic DeepEP variables must not override the computed local size.
-    export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS="${DEEPEP_PREFILL_TOKENS_PER_ROUND}"
-    export DEEPEP_NORMAL_LONG_SEQ_ROUND="${DEEPEP_PREFILL_ROUNDS}"
-    export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
+    export HCCL_BUFFSIZE="${PREFILL_HCCL_BUFFSIZE:-${HCCL_BUFFSIZE:-1200}}"
+    DEEPEP_ROUND_SUMMARY="${DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS:-default}x${DEEPEP_NORMAL_LONG_SEQ_ROUND:-default}"
     if [[ "${ENABLE_PCP}" == "1" ]]; then
-        export HCCL_BUFFSIZE="${PREFILL_HCCL_BUFFSIZE:-${HCCL_BUFFSIZE:-400}}"
         PREFILL_TOKEN_LAYOUT="pcp_scattered"
     else
-        export HCCL_BUFFSIZE="${PREFILL_HCCL_BUFFSIZE:-${HCCL_BUFFSIZE:-1200}}"
         PREFILL_TOKEN_LAYOUT="dp_attn_scattered"
     fi
 else
@@ -291,7 +277,8 @@ case "${ROLE}" in
             "MLA-CP=${MLA_CP_BACKEND}, KDA-CP=${KDA_CP_BACKEND}, mem-fraction=${PREFILL_MEM_FRACTION_STATIC}," \
             "HCCL=${HCCL_BUFFSIZE}MB, MF=${ASCEND_MF_TRANSFER_PROTOCOL}," \
             "token-layout=${PREFILL_TOKEN_LAYOUT}, local-max-token=${PREFILL_LOCAL_MAX_TOKENS}," \
-            "DeepEP-round=${DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS}x${DEEPEP_NORMAL_LONG_SEQ_ROUND});" \
+            "DeepEP-max-dispatch=${SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK}," \
+            "DeepEP-round=${DEEPEP_ROUND_SUMMARY});" \
             "log=${LOG_FILE}; kv_diag=${SGLANG_ASCEND_KV_DIAG_DIR}"
         if [[ "${CONFIG_ONLY}" == "1" ]]; then
             exit 0
