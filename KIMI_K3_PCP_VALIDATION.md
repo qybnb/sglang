@@ -139,9 +139,10 @@ Decode 节点: world=8, DP2, CP1 / attention-TP4
 | C：FLA/ring | `run_16p_pd_layer12_pcp_fla_ring.sh` |
 
 A 的 Prefill 不传 `--enable-dp-attention`、`--enable-dp-lm-head` 和任何 CP
-参数，保持适配前的 TP-full token layout；DeepEP 使用 `8192 x 1`，Prefill
-HCCL buffer 使用 1200 MB。B/C 的 Prefill 才启用 PCP 所需的 scattered token
-layout。DeepEP 轮数按每个 rank 的本地 token 数计算；当前配置下
+参数，并在所有 Kimi layer 边界保持 TP-full token layout；DeepEP 使用
+`8192 x 1`，Prefill HCCL buffer 使用 1200 MB。B/C 的 Prefill 才启用 PCP
+所需的 scattered token layout。DeepEP 轮数按每个 rank 的本地 token 数计算；
+当前配置下
 `4096 / (CP4 * attention-TP2) = 512`，所以使用 `512 x 1` 和 400 MB HCCL
 buffer。Decode 在三组配置中都保持 DP2/CP1，不随 Prefill 的 PCP 开关变化。
 

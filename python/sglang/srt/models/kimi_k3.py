@@ -404,7 +404,17 @@ class KimiMoE(nn.Module):
     def _forward_shared_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Run the TP-sharded shared MLP while keeping MoE tokens scattered."""
         if not _use_kimi_attn_tp_token_scatter():
-            return self.shared_experts(hidden_states)
+            shared_output = self.shared_experts(hidden_states)
+            # With DeepEP the routed experts return a complete result to every
+            # source rank, but the shared expert remains attention-TP sharded.
+            # The scattered path sums those shards with reduce-scatter below;
+            # the TP-full PCP-off path needs the corresponding all-reduce.
+            if (
+                get_parallel().attn_tp_size > 1
+                and not get_moe_a2a_backend().is_none()
+            ):
+                shared_output = tensor_model_parallel_all_reduce(shared_output)
+            return shared_output
 
         gathered_hidden_states = get_local_dp_buffer(get_attention_tp_group())
         attn_tp_all_gather_into_tensor(gathered_hidden_states, hidden_states)
@@ -946,6 +956,18 @@ class KimiDecoderLayer(nn.Module):
             self.layer_scatter_modes.middle_residual_mode = ScatterMode.SCATTERED
             if layer_idx != config.num_hidden_layers - 1:
                 self.layer_scatter_modes.layer_output_mode = ScatterMode.SCATTERED
+        else:
+            # LayerScatterModes normally infers SCATTERED MoE boundaries from
+            # the DeepEP backend.  Kimi's PCP-off path deliberately keeps
+            # complete tokens on every attention-TP rank, so carrying that
+            # inferred mode into the next layer would all-gather a TP-full
+            # tensor and violate output.numel() == world_size * input.numel().
+            self.layer_scatter_modes.layer_input_mode = ScatterMode.TP_ATTN_FULL
+            self.layer_scatter_modes.mlp_mode = ScatterMode.TP_ATTN_FULL
+            self.layer_scatter_modes.middle_residual_mode = (
+                ScatterMode.TP_ATTN_FULL
+            )
+            self.layer_scatter_modes.layer_output_mode = ScatterMode.TP_ATTN_FULL
 
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
