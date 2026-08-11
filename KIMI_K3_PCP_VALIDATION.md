@@ -121,9 +121,9 @@ export MAX_RUNNING_REQUESTS=2
 双机测试使用现有默认规模：
 
 ```text
-Prefill 节点: world=8, DP1
-  PCP off: CP1 / attention-TP8
-  PCP on : CP4 / attention-TP2
+Prefill 节点: world=8
+  PCP off: DP2 / CP1 / attention-TP4
+  PCP on : DP1 / CP4 / attention-TP2
 
 Decode 节点: world=8, DP2, CP1 / attention-TP4
 ```
@@ -138,13 +138,18 @@ Decode 节点: world=8, DP2, CP1 / attention-TP4
 | B：A2A/allgather | `run_16p_pd_layer12_pcp_a2a.sh` |
 | C：FLA/ring | `run_16p_pd_layer12_pcp_fla_ring.sh` |
 
-A 的 Prefill 不传 `--enable-dp-attention`、`--enable-dp-lm-head` 和任何 CP
-参数，并在所有 Kimi layer 边界保持 TP-full token layout；DeepEP 使用
-`8192 x 1`，Prefill HCCL buffer 使用 1200 MB。B/C 的 Prefill 才启用 PCP
-所需的 scattered token layout。DeepEP 轮数按每个 rank 的本地 token 数计算；
-当前配置下
-`4096 / (CP4 * attention-TP2) = 512`，所以使用 `512 x 1` 和 400 MB HCCL
-buffer。Decode 在三组配置中都保持 DP2/CP1，不随 Prefill 的 PCP 开关变化。
+A 的 Prefill 不传任何 CP 参数，但保留适配前已经使用的 DP-attention token
+scatter，以满足 DeepEP 的逐 rank token 布局；Prefill HCCL buffer 使用
+1200 MB。B/C 在相同 token scatter 基础上增加 PCP，并使用 400 MB HCCL
+buffer。DeepEP 轮数按每个 rank 的本地 token 数计算：A 为
+`(4096 / DP2) / attention-TP4 = 512`，B/C 为
+`4096 / (CP4 * attention-TP2) = 512`，所以三者都是 `512 x 1`。Decode
+在三组配置中都保持 DP2/CP1，不随 Prefill 的 PCP 开关变化。
+
+因此 A 是“适配前可用方案”和 PCP 的部署效果对照，不是只改变 CP 一个变量的
+微基准。`DP1/CP1/attention-TP8` 会被 SGLang 自动关闭 DP-attention，使每个
+rank 向 DeepEP 发送完整 chunk；当前 Ascend `CamMoeDispatchNormal` 无法稳定
+支持该组合，所以不作为功能、精度或性能基线。
 
 例如测试 C 配置，在 Prefill 节点执行：
 
@@ -165,8 +170,9 @@ buffer。Decode 在三组配置中都保持 DP2/CP1，不随 Prefill 的 PCP 开
 ```
 
 切换配置时，三处使用同一份 A、B 或 C 脚本，并完整重启 Prefill、Decode 和
-Router。三份脚本固定相同的 TP/DP、层数、page size、cache 上限和 chunk size，
-避免终端遗留的环境变量污染 A/B/C 对比。正式启动前也可以执行：
+Router。A 使用适配前已验证的 Prefill DP2，B/C 使用 PCP 所需的 Prefill DP1；
+三份脚本的总 TP、层数、page size、cache 上限和 chunk size保持一致。正式启动前
+也可以执行：
 
 ```bash
 CONFIG_ONLY=1 ./run_16p_pd_layer12_pcp_off.sh prefill
@@ -184,7 +190,6 @@ export MODEL_PATH=/path/to/Kimi-K3
 export PREFILL_HOST=<Prefill节点IP>
 export DECODE_HOST=<Decode节点IP>
 export TP_SIZE=8
-export PREFILL_DP_SIZE=1
 export DECODE_DP_SIZE=2
 export NUM_HIDDEN_LAYERS=12
 export MAX_TOTAL_TOKENS=16384
@@ -211,6 +216,7 @@ A 配置使用：
 
 ```bash
 export ENABLE_PCP=0
+export PREFILL_DP_SIZE=2
 export RUN_TAG=A_pcp_off
 ```
 
@@ -218,6 +224,7 @@ B/C 配置增加：
 
 ```bash
 export ENABLE_PCP=1
+export PREFILL_DP_SIZE=1
 export PREFILL_CP_SIZE=4
 ```
 

@@ -76,8 +76,13 @@ fi
 # Prefill CP consumes ranks from the attention-parallel dimension. TP8/DP2/CP4
 # would collapse attention TP to 1 and replicate the full attention weights on
 # every rank, which does not fit K3-24L on a 64 GiB NPU. Keep two-way attention
-# TP on prefill while preserving DP2 on decode.
-PREFILL_DP_SIZE="${PREFILL_DP_SIZE:-1}"
+# TP on PCP prefill while preserving the validated DP2 CP-off baseline.
+if [[ "${ENABLE_PCP}" == "1" ]]; then
+    PREFILL_DP_SIZE_DEFAULT=1
+else
+    PREFILL_DP_SIZE_DEFAULT="${DP_SIZE:-2}"
+fi
+PREFILL_DP_SIZE="${PREFILL_DP_SIZE:-${PREFILL_DP_SIZE_DEFAULT}}"
 DECODE_DP_SIZE="${DECODE_DP_SIZE:-${DP_SIZE:-2}}"
 NUM_HIDDEN_LAYERS="${NUM_HIDDEN_LAYERS:-24}"
 if [[ ! "${NUM_HIDDEN_LAYERS}" =~ ^[1-9][0-9]*$ ]]; then
@@ -176,19 +181,21 @@ export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-lo}"
 export STREAMS_PER_DEVICE="${STREAMS_PER_DEVICE:-32}"
 export DEEP_NORMAL_MODE_USE_INT8_QUANT="${DEEP_NORMAL_MODE_USE_INT8_QUANT:-1}"
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK="${SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK:-64}"
-# PCP shards each Prefill chunk across CP and attention TP before routed MoE.
-# DeepEP's per-round capacity is per rank, so derive the number of rounds from
-# the local token count instead of the scheduler's global chunk size.  CP-off
-# deliberately keeps the pre-PCP DeepEP/HCCL defaults and full-token TP flow.
-if [[ "${ROLE}" == "prefill" && "${ENABLE_PCP}" == "1" ]]; then
+# Prefill always keeps DP-attention token scatter for DeepEP, matching the last
+# validated pre-PCP Kimi configuration.  PCP additionally shards each chunk
+# across CP.  DeepEP's capacity is per rank, so derive its rounds from the
+# resulting local token count rather than the scheduler's global chunk size.
+if [[ "${ROLE}" == "prefill" ]]; then
     if (( CHUNKED_PREFILL_SIZE <= 0 )); then
-        echo "PCP Prefill requires a positive CHUNKED_PREFILL_SIZE" \
+        echo "Prefill requires a positive CHUNKED_PREFILL_SIZE" \
             "(got ${CHUNKED_PREFILL_SIZE})." >&2
         exit 2
     fi
+    # DP-attention first divides the configured chunk across DP replicas and
+    # attention TP then scatters each replica's tokens.  PCP DP1 similarly
+    # divides over CP x attention-TP.  Both result in chunk / TP local tokens.
     PREFILL_LOCAL_MAX_TOKENS="$(( \
-        (CHUNKED_PREFILL_SIZE + PREFILL_ATTN_PARALLEL_SIZE - 1) \
-        / PREFILL_ATTN_PARALLEL_SIZE \
+        (CHUNKED_PREFILL_SIZE + TP_SIZE - 1) / TP_SIZE \
     ))"
     DEEPEP_PREFILL_TOKENS_PER_ROUND="${DEEPEP_PREFILL_TOKENS_PER_ROUND:-512}"
     if [[ ! "${DEEPEP_PREFILL_TOKENS_PER_ROUND}" =~ ^[1-9][0-9]*$ ]]; then
@@ -200,18 +207,18 @@ if [[ "${ROLE}" == "prefill" && "${ENABLE_PCP}" == "1" ]]; then
         (PREFILL_LOCAL_MAX_TOKENS + DEEPEP_PREFILL_TOKENS_PER_ROUND - 1) \
         / DEEPEP_PREFILL_TOKENS_PER_ROUND \
     ))"
-    export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS="${DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS:-${DEEPEP_PREFILL_TOKENS_PER_ROUND}}"
-    export DEEPEP_NORMAL_LONG_SEQ_ROUND="${DEEPEP_NORMAL_LONG_SEQ_ROUND:-${DEEPEP_PREFILL_ROUNDS}}"
-    export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ="${DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ:-1}"
-    export HCCL_BUFFSIZE="${PREFILL_HCCL_BUFFSIZE:-${HCCL_BUFFSIZE:-400}}"
-    PREFILL_TOKEN_LAYOUT="pcp_scattered"
-elif [[ "${ROLE}" == "prefill" ]]; then
-    PREFILL_LOCAL_MAX_TOKENS="${CHUNKED_PREFILL_SIZE}"
-    export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS="${DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS:-8192}"
-    export DEEPEP_NORMAL_LONG_SEQ_ROUND="${DEEPEP_NORMAL_LONG_SEQ_ROUND:-1}"
-    export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ="${DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ:-0}"
-    export HCCL_BUFFSIZE="${PREFILL_HCCL_BUFFSIZE:-${HCCL_BUFFSIZE:-1200}}"
-    PREFILL_TOKEN_LAYOUT="legacy_tp_full"
+    # Set the operator-facing variables from one internally consistent pair;
+    # stale generic DeepEP variables must not override the computed local size.
+    export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS="${DEEPEP_PREFILL_TOKENS_PER_ROUND}"
+    export DEEPEP_NORMAL_LONG_SEQ_ROUND="${DEEPEP_PREFILL_ROUNDS}"
+    export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
+    if [[ "${ENABLE_PCP}" == "1" ]]; then
+        export HCCL_BUFFSIZE="${PREFILL_HCCL_BUFFSIZE:-${HCCL_BUFFSIZE:-400}}"
+        PREFILL_TOKEN_LAYOUT="pcp_scattered"
+    else
+        export HCCL_BUFFSIZE="${PREFILL_HCCL_BUFFSIZE:-${HCCL_BUFFSIZE:-1200}}"
+        PREFILL_TOKEN_LAYOUT="dp_attn_scattered"
+    fi
 else
     export HCCL_BUFFSIZE="${DECODE_HCCL_BUFFSIZE:-${HCCL_BUFFSIZE:-1200}}"
 fi
@@ -240,12 +247,14 @@ else
     export SGLANG_ENABLE_CP_V2=0
 fi
 
+PREFILL_DP_ARGS=(
+    --enable-dp-attention
+    --enable-dp-lm-head
+    --dp-size "${PREFILL_DP_SIZE}"
+)
 PREFILL_CP_ARGS=()
 if [[ "${ENABLE_PCP}" == "1" ]]; then
     PREFILL_CP_ARGS=(
-        --enable-dp-attention
-        --enable-dp-lm-head
-        --dp-size "${PREFILL_DP_SIZE}"
         --attn-cp-size "${PREFILL_CP_SIZE}"
         --enable-prefill-cp
         --cp-strategy zigzag
@@ -295,6 +304,7 @@ case "${ROLE}" in
             --disaggregation-mode prefill \
             --disaggregation-transfer-backend ascend \
             --disaggregation-bootstrap-port "${BOOTSTRAP_PORT}" \
+            "${PREFILL_DP_ARGS[@]}" \
             "${PREFILL_CP_ARGS[@]}" \
             --chunked-prefill-size "${CHUNKED_PREFILL_SIZE}" \
             --deepep-mode normal \

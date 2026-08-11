@@ -11,7 +11,7 @@ export LOG_DIR="${LOG_DIR:-${SCRIPT_DIR}/logs/kimi_k3_layer12_pd}"
 
 export NUM_HIDDEN_LAYERS=12
 export TP_SIZE=8
-export PREFILL_DP_SIZE=1
+export PREFILL_DP_SIZE=2
 export DECODE_DP_SIZE=2
 export PREFILL_CP_SIZE=1
 export ENABLE_PCP=0
