@@ -183,8 +183,8 @@ export DEEP_NORMAL_MODE_USE_INT8_QUANT="${DEEP_NORMAL_MODE_USE_INT8_QUANT:-1}"
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK="${SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK:-64}"
 # Prefill always keeps DP-attention token scatter for DeepEP, matching the last
 # validated pre-PCP Kimi configuration.  PCP additionally shards each chunk
-# across CP.  DeepEP's capacity is per rank, so derive its rounds from the
-# resulting local token count rather than the scheduler's global chunk size.
+# across CP.  The Ascend CamMoeDispatchNormal tiler receives both the rank-local
+# tensor and the EP group's globalBs; round * perRoundTokens must cover globalBs.
 if [[ "${ROLE}" == "prefill" ]]; then
     if (( CHUNKED_PREFILL_SIZE <= 0 )); then
         echo "Prefill requires a positive CHUNKED_PREFILL_SIZE" \
@@ -204,7 +204,7 @@ if [[ "${ROLE}" == "prefill" ]]; then
         exit 2
     fi
     DEEPEP_PREFILL_ROUNDS="$(( \
-        (PREFILL_LOCAL_MAX_TOKENS + DEEPEP_PREFILL_TOKENS_PER_ROUND - 1) \
+        (CHUNKED_PREFILL_SIZE + DEEPEP_PREFILL_TOKENS_PER_ROUND - 1) \
         / DEEPEP_PREFILL_TOKENS_PER_ROUND \
     ))"
     # Set the operator-facing variables from one internally consistent pair;

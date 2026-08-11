@@ -141,9 +141,11 @@ Decode 节点: world=8, DP2, CP1 / attention-TP4
 A 的 Prefill 不传任何 CP 参数，但保留适配前已经使用的 DP-attention token
 scatter，以满足 DeepEP 的逐 rank token 布局；Prefill HCCL buffer 使用
 1200 MB。B/C 在相同 token scatter 基础上增加 PCP，并使用 400 MB HCCL
-buffer。DeepEP 轮数按每个 rank 的本地 token 数计算：A 为
+buffer。每个 rank 的 DeepEP 本地 token 上限均为 512：A 为
 `(4096 / DP2) / attention-TP4 = 512`，B/C 为
-`4096 / (CP4 * attention-TP2) = 512`，所以三者都是 `512 x 1`。Decode
+`4096 / (CP4 * attention-TP2) = 512`。Ascend DeepEP tiler 还要求
+`round x perRoundTokens` 覆盖 EP 组的全局 4096 token，所以三者使用
+`512 x 8`。Decode
 在三组配置中都保持 DP2/CP1，不随 Prefill 的 PCP 开关变化。
 
 因此 A 是“适配前可用方案”和 PCP 的部署效果对照，不是只改变 CP 一个变量的
