@@ -22,10 +22,60 @@ PERF_WARMUP_REQUESTS="${PERF_WARMUP_REQUESTS:-4}"
 usage() {
   echo "Usage:"
   echo "  MODEL_PATH=/path/to/Kimi-K3 $0 collect A1|A2|B|C"
+  echo "  MODEL_PATH=/path/to/Kimi-K3 $0 collect-accuracy A1|A2|B|C"
   echo "  $0 compare"
+  echo "  $0 compare-accuracy"
   echo
   echo "A1/A2 are two independently restarted PCP-off runs."
   echo "B is PCP+A2A/allgather; C is PCP+FLA/ring."
+}
+
+collect_accuracy_only() {
+  local label="$1"
+  local tag
+  tag=$(label_tag "${label}") || {
+    echo "Unknown label: ${label}; expected A1, A2, B, or C" >&2
+    return 2
+  }
+  : "${MODEL_PATH:?Set MODEL_PATH to the local Kimi-K3 checkpoint directory}"
+
+  local smoke_file="${RESULT_DIR}/${label}_smoke.json"
+  local accuracy_file="${RESULT_DIR}/${label}_accuracy.json"
+  for artifact in "${smoke_file}" "${accuracy_file}"; do
+    if [[ -e "${artifact}" ]]; then
+      echo "Refusing to overwrite existing artifact: ${artifact}" >&2
+      echo "Use a new RESULT_DIR for another suite run." >&2
+      return 2
+    fi
+  done
+  mkdir -p "${RESULT_DIR}"
+
+  echo "Collecting accuracy-only ${label} (${tag}) from ${BASE_URL}"
+  echo "Commit: $(git -C "${ROOT_DIR}" rev-parse HEAD)"
+  echo "Before continuing, confirm the running service matches label ${label}."
+
+  "${PYTHON_BIN}" "${VALIDATOR}" smoke \
+    --base-url "${BASE_URL}" \
+    --tokenizer "${MODEL_PATH}" \
+    --tag "${tag}" \
+    --input-len 2048 \
+    --output-len 32 \
+    --num-requests 8 \
+    --concurrency 4 \
+    --output "${smoke_file}"
+
+  "${PYTHON_BIN}" "${VALIDATOR}" accuracy \
+    --base-url "${BASE_URL}" \
+    --tokenizer "${MODEL_PATH}" \
+    --tag "${tag}" \
+    --input-lens "${ACCURACY_INPUT_LENS}" \
+    --output-len "${ACCURACY_OUTPUT_LEN}" \
+    --repeats "${ACCURACY_REPEATS}" \
+    --prefill-logprob-tokens "${PREFILL_LOGPROB_TOKENS}" \
+    --top-logprobs 5 \
+    --output "${accuracy_file}"
+
+  echo "Accuracy collection complete: ${RESULT_DIR}/${label}_{smoke,accuracy}.json"
 }
 
 label_tag() {
@@ -180,6 +230,38 @@ compare_all() {
   fi
 }
 
+compare_accuracy_all() {
+  local required
+  for required in A1 A2 B C; do
+    if [[ ! -f "${RESULT_DIR}/${required}_accuracy.json" ]]; then
+      echo "Missing ${RESULT_DIR}/${required}_accuracy.json" >&2
+      return 2
+    fi
+  done
+  mkdir -p "${RESULT_DIR}/comparisons"
+  COMPARE_FAILURES=0
+
+  echo "=== Accuracy: within-service stability of identical prompts ==="
+  check_accuracy_stability A1
+  check_accuracy_stability A2
+  check_accuracy_stability B
+  check_accuracy_stability C
+
+  echo "=== Accuracy: A1 vs A2 is the PCP-off natural-variation gate ==="
+  compare_one_accuracy A1 A2
+  compare_one_accuracy A1 B
+  compare_one_accuracy A2 B
+  compare_one_accuracy A1 C
+  compare_one_accuracy A2 C
+  compare_one_accuracy B C
+
+  echo "Accuracy comparison artifacts: ${RESULT_DIR}/comparisons"
+  if [[ "${COMPARE_FAILURES}" -ne 0 ]]; then
+    echo "At least one strict accuracy comparison failed; retain all artifacts for analysis." >&2
+    return 1
+  fi
+}
+
 if [[ $# -lt 1 ]]; then
   usage
   exit 2
@@ -193,12 +275,26 @@ case "$1" in
     fi
     collect "$2"
     ;;
+  collect-accuracy)
+    if [[ $# -ne 2 ]]; then
+      usage
+      exit 2
+    fi
+    collect_accuracy_only "$2"
+    ;;
   compare)
     if [[ $# -ne 1 ]]; then
       usage
       exit 2
     fi
     compare_all
+    ;;
+  compare-accuracy)
+    if [[ $# -ne 1 ]]; then
+      usage
+      exit 2
+    fi
+    compare_accuracy_all
     ;;
   *)
     usage
