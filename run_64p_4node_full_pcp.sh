@@ -13,7 +13,7 @@
 #   ./run_64p_4node_full_pcp.sh fla
 #
 # Common overrides:
-#   MODEL_PATH=/home/weights/Kimi-K3-W4A8
+#   MODEL_PATH=/home/weights/Kimi-K3-w4a8-int-moe
 #   NODE_IPS=192.168.25.209,192.168.25.212,192.168.25.216,192.168.25.217
 #   NET_IFACE=enp196s0f0
 #   NODE_RANK=0  # optional; otherwise inferred from NODE_IPS and hostname -I
@@ -39,7 +39,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 export PYTHONPATH="${REPO_ROOT}/python:${PYTHONPATH:-}"
 
-MODEL_PATH="${MODEL_PATH:-/home/weights/Kimi-K3-W4A8}"
+MODEL_PATH="${MODEL_PATH:-/home/weights/Kimi-K3-w4a8-int-moe}"
 if [[ "${CONFIG_ONLY}" != "1" && ! -f "${MODEL_PATH}/config.json" ]]; then
     echo "Invalid MODEL_PATH; config.json not found: ${MODEL_PATH}" >&2
     exit 2

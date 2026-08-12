@@ -74,7 +74,7 @@ SERVER_PORT="${SERVER_PORT:-30000}"
 NPUS_PER_NODE="${NPUS_PER_NODE:-16}"
 TP_SIZE="${TP_SIZE:-$((NNODES * NPUS_PER_NODE))}"
 CP_SIZE="${CP_SIZE:-4}"
-MODEL_PATH="${MODEL_PATH:-/home/weights/Kimi-K3-W4A8}"
+MODEL_PATH="${MODEL_PATH:-/home/weights/Kimi-K3-w4a8-int-moe}"
 
 for value_name in NPUS_PER_NODE TP_SIZE CP_SIZE; do
     value="${!value_name}"

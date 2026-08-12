@@ -28,7 +28,7 @@ esac
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REMOTE_REPO_ROOT="${REMOTE_REPO_ROOT:-${REPO_ROOT}}"
-MODEL_PATH="${MODEL_PATH:-/home/weights/Kimi-K3-W4A8}"
+MODEL_PATH="${MODEL_PATH:-/home/weights/Kimi-K3-w4a8-int-moe}"
 NODE_IPS="${NODE_IPS:-192.168.25.209,192.168.25.212,192.168.25.216,192.168.25.217}"
 IFS=',' read -r -a NODE_IP_ARRAY <<< "${NODE_IPS}"
 if (( ${#NODE_IP_ARRAY[@]} != 4 )); then

@@ -11,7 +11,7 @@ launcher detects the local IP and assigns node ranks in this order:
 | worker | `192.168.25.216` | 2 |
 | worker | `192.168.25.217` | 3 |
 
-The default model path is `/home/weights/Kimi-K3-W4A8`.  Override it on every
+The default model path is `/home/weights/Kimi-K3-w4a8-int-moe`. Override it on every
 node with `MODEL_PATH=/another/path` when necessary.  If the real subnet is
 not `192.168.25.*`, set the same comma-separated `CLUSTER_NODES` value on all
 nodes.
@@ -29,7 +29,7 @@ After `http://192.168.25.209:30000/health` is ready, run on node 209:
 
 ```bash
 cd /home/q00886407/sgl/sglang-kimiK3
-export MODEL_PATH=/home/weights/Kimi-K3-W4A8
+export MODEL_PATH=/home/weights/Kimi-K3-w4a8-int-moe
 export BASE_URL=http://192.168.25.209:30000
 export RESULT_DIR=$PWD/logs/kimi_k3_4node_full_accuracy
 ./scripts/run_kimi_k3_pcp_validation_suite.sh collect-accuracy A1

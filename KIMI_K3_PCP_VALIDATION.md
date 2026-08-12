@@ -38,7 +38,7 @@ context split。首轮验证关闭 DSpark、radix cache 和 CUDA graph，以隔�
 
 ```bash
 cd /home/q00886407/sgl/sglang-kimiK3
-export MODEL_PATH=/home/weights/Kimi-K3-W4A8
+export MODEL_PATH=/home/weights/Kimi-K3-w4a8-int-moe
 export NODE_IPS=192.168.25.209,192.168.25.212,192.168.25.216,192.168.25.217
 export NET_IFACE=enp196s0f0
 ```
@@ -77,7 +77,7 @@ export RESULT_DIR=$PWD/logs/kimi_k3_4node_full_v2
 
 ```bash
 cd /home/q00886407/sgl/sglang-kimiK3
-export MODEL_PATH=/home/weights/Kimi-K3-W4A8
+export MODEL_PATH=/home/weights/Kimi-K3-w4a8-int-moe
 export NET_IFACE=enp196s0f0
 
 # B：A2A/all-gather。服务运行在宿主机时：
@@ -106,7 +106,7 @@ CONTAINER_NAME=qwen0727 ./run_64p_4node_full_pcp_cluster.sh start a2a
 
 ```bash
 cd /home/q00886407/sgl/sglang-kimiK3
-export MODEL_PATH=/home/weights/Kimi-K3-W4A8
+export MODEL_PATH=/home/weights/Kimi-K3-w4a8-int-moe
 ```
 
 按下面顺序分别重启服务并采集。A1 和 A2 都使用 PCP-off，但中间必须完整重启
