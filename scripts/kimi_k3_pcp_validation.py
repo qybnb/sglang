@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_RESULTS_DIR = REPO_ROOT / "logs" / "kimi_k3_pcp_validation"
 
@@ -352,9 +352,12 @@ def command_accuracy(args: argparse.Namespace) -> int:
     url = args.base_url.rstrip("/") + "/generate"
     cases = []
     case_id = 0
-    for input_len in args.input_lens:
+    for prompt_id, input_len in enumerate(args.input_lens):
+        # All repeats for one input length must use the same prompt. Otherwise
+        # repeat-to-repeat differences mix model noise with prompt differences
+        # and cannot establish a PCP-off numerical stability baseline.
+        input_ids = _make_input_ids(tokenizer, input_len, prompt_id)
         for repeat in range(args.repeats):
-            input_ids = _make_input_ids(tokenizer, input_len, case_id)
             payload = _generate_payload(
                 input_ids,
                 args.output_len,
@@ -413,6 +416,7 @@ def command_accuracy(args: argparse.Namespace) -> int:
         "tokenizer": args.tokenizer,
         "input_lens": args.input_lens,
         "output_len": args.output_len,
+        "repeats": args.repeats,
         "prefill_logprob_tokens": args.prefill_logprob_tokens,
         "top_logprobs": args.top_logprobs,
         "cases": cases,
@@ -458,6 +462,80 @@ def _case_key(case: dict[str, Any]) -> tuple[int, int]:
     return int(case["target_input_len"]), int(case["repeat"])
 
 
+def _compare_accuracy_pair(
+    left: dict[str, Any] | None,
+    right: dict[str, Any] | None,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    errors = []
+    if left is None or right is None:
+        errors.append("case_missing")
+    elif not left.get("success") or not right.get("success"):
+        errors.append("request_failed")
+    elif left.get("prompt_hash") != right.get("prompt_hash"):
+        errors.append("prompt_mismatch")
+
+    input_diffs: list[float] = []
+    output_diffs: list[float] = []
+    output_match = 0.0
+    common_prefix = 0
+    first_token_same = False
+    left_output_ids: list[int | None] = []
+    right_output_ids: list[int | None] = []
+    if not errors:
+        left_result = left["result"]
+        right_result = right["result"]
+        left_input = left_result.get("input_token_logprobs", [])
+        right_input = right_result.get("input_token_logprobs", [])
+        left_output = left_result.get("output_token_logprobs", [])
+        right_output = right_result.get("output_token_logprobs", [])
+        input_diffs = _matching_logprob_diffs(left_input, right_input)
+        output_diffs = _matching_logprob_diffs(left_output, right_output)
+        left_output_ids = _token_ids(left_output)
+        right_output_ids = _token_ids(right_output)
+        denominator = max(len(left_output_ids), len(right_output_ids), 1)
+        output_match = sum(
+            left_id == right_id
+            for left_id, right_id in zip(left_output_ids, right_output_ids)
+        ) / denominator
+        common_prefix = _common_prefix_len(left_output_ids, right_output_ids)
+        first_token_same = bool(
+            left_output_ids
+            and right_output_ids
+            and left_output_ids[0] == right_output_ids[0]
+        )
+        if not input_diffs:
+            errors.append("missing_prefill_logprobs")
+        elif max(input_diffs) > args.max_prefill_logprob_diff:
+            errors.append("prefill_logprob_diff")
+        if not first_token_same:
+            errors.append("first_token_mismatch")
+        if output_match < args.min_output_token_match:
+            errors.append("output_token_match")
+        if output_diffs and max(output_diffs) > args.max_output_logprob_diff:
+            errors.append("output_logprob_diff")
+
+    return {
+        "pass": not errors,
+        "errors": errors,
+        "first_token_same": first_token_same,
+        "output_token_match": output_match,
+        "output_common_prefix": common_prefix,
+        "output_token_count_baseline": len(left_output_ids),
+        "output_token_count_candidate": len(right_output_ids),
+        "prefill_logprob_compared": len(input_diffs),
+        "prefill_logprob_mean_abs_diff": (
+            statistics.mean(input_diffs) if input_diffs else None
+        ),
+        "prefill_logprob_max_abs_diff": max(input_diffs) if input_diffs else None,
+        "output_logprob_compared": len(output_diffs),
+        "output_logprob_mean_abs_diff": (
+            statistics.mean(output_diffs) if output_diffs else None
+        ),
+        "output_logprob_max_abs_diff": max(output_diffs) if output_diffs else None,
+    }
+
+
 def command_compare_accuracy(args: argparse.Namespace) -> int:
     baseline = _load_json(args.baseline)
     candidate = _load_json(args.candidate)
@@ -465,7 +543,7 @@ def command_compare_accuracy(args: argparse.Namespace) -> int:
     candidate_cases = {_case_key(case): case for case in candidate.get("cases", [])}
     keys = sorted(set(baseline_cases) | set(candidate_cases))
     comparisons = []
-    overall_pass = True
+    overall_pass = bool(keys)
 
     print(
         "input repeat first_token token_match common_prefix "
@@ -474,84 +552,24 @@ def command_compare_accuracy(args: argparse.Namespace) -> int:
     for key in keys:
         left = baseline_cases.get(key)
         right = candidate_cases.get(key)
-        errors = []
-        if left is None or right is None:
-            errors.append("case_missing")
-        elif not left.get("success") or not right.get("success"):
-            errors.append("request_failed")
-        elif left.get("prompt_hash") != right.get("prompt_hash"):
-            errors.append("prompt_mismatch")
-
-        input_diffs: list[float] = []
-        output_diffs: list[float] = []
-        output_match = 0.0
-        common_prefix = 0
-        first_token_same = False
-        left_output_ids: list[int | None] = []
-        right_output_ids: list[int | None] = []
-        if not errors:
-            left_result = left["result"]
-            right_result = right["result"]
-            left_input = left_result.get("input_token_logprobs", [])
-            right_input = right_result.get("input_token_logprobs", [])
-            left_output = left_result.get("output_token_logprobs", [])
-            right_output = right_result.get("output_token_logprobs", [])
-            input_diffs = _matching_logprob_diffs(left_input, right_input)
-            output_diffs = _matching_logprob_diffs(left_output, right_output)
-            left_output_ids = _token_ids(left_output)
-            right_output_ids = _token_ids(right_output)
-            denominator = max(len(left_output_ids), len(right_output_ids), 1)
-            output_match = sum(
-                left_id == right_id
-                for left_id, right_id in zip(left_output_ids, right_output_ids)
-            ) / denominator
-            common_prefix = _common_prefix_len(left_output_ids, right_output_ids)
-            first_token_same = bool(
-                left_output_ids
-                and right_output_ids
-                and left_output_ids[0] == right_output_ids[0]
-            )
-            if not input_diffs:
-                errors.append("missing_prefill_logprobs")
-            elif max(input_diffs) > args.max_prefill_logprob_diff:
-                errors.append("prefill_logprob_diff")
-            if not first_token_same:
-                errors.append("first_token_mismatch")
-            if output_match < args.min_output_token_match:
-                errors.append("output_token_match")
-            if output_diffs and max(output_diffs) > args.max_output_logprob_diff:
-                errors.append("output_logprob_diff")
-
-        case_pass = not errors
+        comparison = _compare_accuracy_pair(left, right, args)
+        case_pass = comparison["pass"]
         overall_pass = overall_pass and case_pass
-        comparison = {
-            "target_input_len": key[0],
-            "repeat": key[1],
-            "pass": case_pass,
-            "errors": errors,
-            "first_token_same": first_token_same,
-            "output_token_match": output_match,
-            "output_common_prefix": common_prefix,
-            "output_token_count_baseline": len(left_output_ids),
-            "output_token_count_candidate": len(right_output_ids),
-            "prefill_logprob_compared": len(input_diffs),
-            "prefill_logprob_mean_abs_diff": (
-                statistics.mean(input_diffs) if input_diffs else None
-            ),
-            "prefill_logprob_max_abs_diff": max(input_diffs) if input_diffs else None,
-            "output_logprob_compared": len(output_diffs),
-            "output_logprob_mean_abs_diff": (
-                statistics.mean(output_diffs) if output_diffs else None
-            ),
-            "output_logprob_max_abs_diff": max(output_diffs) if output_diffs else None,
-        }
+        comparison.update(
+            {
+                "target_input_len": key[0],
+                "repeat": key[1],
+            }
+        )
         comparisons.append(comparison)
         print(
-            f"{key[0]:5d} {key[1]:6d} {str(first_token_same):11s} "
-            f"{output_match:11.4f} {common_prefix:13d} "
+            f"{key[0]:5d} {key[1]:6d} "
+            f"{str(comparison['first_token_same']):11s} "
+            f"{comparison['output_token_match']:11.4f} "
+            f"{comparison['output_common_prefix']:13d} "
             f"{comparison['prefill_logprob_max_abs_diff']!s:16s} "
             f"{comparison['output_logprob_max_abs_diff']!s:15s} "
-            f"{'PASS' if case_pass else 'FAIL:' + ','.join(errors)}"
+            f"{'PASS' if case_pass else 'FAIL:' + ','.join(comparison['errors'])}"
         )
 
     summary = {
@@ -573,6 +591,69 @@ def command_compare_accuracy(args: argparse.Namespace) -> int:
         _write_json(args.output, summary)
         print(f"comparison artifact={args.output}")
     print(f"accuracy comparison verdict: {'PASS' if overall_pass else 'FAIL'}")
+    return 0 if overall_pass else 1
+
+
+def command_accuracy_stability(args: argparse.Namespace) -> int:
+    artifact = _load_json(args.artifact)
+    grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for case in artifact.get("cases", []):
+        grouped[int(case["target_input_len"])].append(case)
+
+    comparisons = []
+    overall_pass = bool(grouped)
+    print(
+        "input reference_repeat repeat first_token token_match "
+        "prefill_max_diff verdict"
+    )
+    for input_len, cases in sorted(grouped.items()):
+        cases.sort(key=lambda case: int(case["repeat"]))
+        if len(cases) < args.min_repeats:
+            overall_pass = False
+            print(
+                f"{input_len:5d} INSUFFICIENT_REPEATS "
+                f"got={len(cases)} expected={args.min_repeats}"
+            )
+            continue
+        reference = cases[0]
+        for candidate in cases[1:]:
+            comparison = _compare_accuracy_pair(reference, candidate, args)
+            comparison.update(
+                {
+                    "target_input_len": input_len,
+                    "reference_repeat": int(reference["repeat"]),
+                    "repeat": int(candidate["repeat"]),
+                }
+            )
+            comparisons.append(comparison)
+            overall_pass = overall_pass and comparison["pass"]
+            verdict = (
+                "PASS"
+                if comparison["pass"]
+                else "FAIL:" + ",".join(comparison["errors"])
+            )
+            print(
+                f"{input_len:5d} {int(reference['repeat']):16d} "
+                f"{int(candidate['repeat']):6d} "
+                f"{str(comparison['first_token_same']):11s} "
+                f"{comparison['output_token_match']:11.4f} "
+                f"{comparison['prefill_logprob_max_abs_diff']!s:16s} "
+                f"{verdict}"
+            )
+
+    summary = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "accuracy_stability",
+        "artifact": str(args.artifact),
+        "tag": artifact.get("tag"),
+        "min_repeats": args.min_repeats,
+        "pass": overall_pass,
+        "comparisons": comparisons,
+    }
+    if args.output:
+        _write_json(args.output, summary)
+        print(f"stability artifact={args.output}")
+    print(f"accuracy stability verdict: {'PASS' if overall_pass else 'FAIL'}")
     return 0 if overall_pass else 1
 
 
@@ -610,6 +691,7 @@ def command_perf(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    existing_records = _read_jsonl(output_file) if output_file.exists() else []
     output_file.parent.mkdir(parents=True, exist_ok=True)
     log_file = output_file.with_suffix(output_file.suffix + ".log")
 
@@ -621,60 +703,88 @@ def command_perf(args: argparse.Namespace) -> int:
         else local_python + os.pathsep + env["PYTHONPATH"]
     )
 
-    for input_len in args.input_lens:
-        for output_len in args.output_lens:
-            for concurrency in args.concurrencies:
-                num_prompts = max(args.num_prompts, concurrency * 2)
-                case_tag = (
-                    f"{args.tag}_in{input_len}_out{output_len}_c{concurrency}"
-                )
-                command = [
-                    sys.executable,
-                    "-m",
-                    "sglang.benchmark.serving",
-                    "--backend",
-                    "sglang",
-                    "--base-url",
-                    args.base_url,
-                    "--dataset-name",
-                    "random-ids",
-                    "--model",
-                    args.model,
-                    "--tokenizer",
-                    args.tokenizer,
-                    "--tokenize-prompt",
-                    "--num-prompts",
-                    str(num_prompts),
-                    "--random-input-len",
-                    str(input_len),
-                    "--random-output-len",
-                    str(output_len),
-                    "--random-range-ratio",
-                    "0",
-                    "--request-rate",
-                    "inf",
-                    "--max-concurrency",
-                    str(concurrency),
-                    "--warmup-requests",
-                    str(args.warmup_requests),
-                    "--flush-cache",
-                    "--disable-tqdm",
-                    "--seed",
-                    str(args.seed),
-                    "--tag",
-                    case_tag,
-                    "--output-details",
-                    "--output-file",
-                    str(output_file),
-                ]
-                print(
-                    f"\n=== perf {case_tag}: prompts={num_prompts}, "
-                    f"result={output_file} ==="
-                )
-                ret = _stream_subprocess(command, log_file, env)
-                if ret != 0:
-                    print(f"benchmark case {case_tag} failed with exit code {ret}")
-                    return ret
+    for round_id in range(1, args.rounds + 1):
+        for input_len in args.input_lens:
+            for output_len in args.output_lens:
+                for concurrency in args.concurrencies:
+                    num_prompts = max(args.num_prompts, concurrency * 2)
+                    case_tag = (
+                        f"{args.tag}_in{input_len}_out{output_len}_"
+                        f"c{concurrency}_r{round_id}"
+                    )
+                    command = [
+                        sys.executable,
+                        "-m",
+                        "sglang.benchmark.serving",
+                        "--backend",
+                        "sglang",
+                        "--base-url",
+                        args.base_url,
+                        "--dataset-name",
+                        "random-ids",
+                        "--model",
+                        args.model,
+                        "--tokenizer",
+                        args.tokenizer,
+                        "--tokenize-prompt",
+                        "--num-prompts",
+                        str(num_prompts),
+                        "--random-input-len",
+                        str(input_len),
+                        "--random-output-len",
+                        str(output_len),
+                        # In SGLang's random dataset, 0 means sampling lengths
+                        # from [1, target]. A ratio of 1 is the fixed-length
+                        # setting for both input and output.
+                        "--random-range-ratio",
+                        "1",
+                        "--request-rate",
+                        "inf",
+                        "--max-concurrency",
+                        str(concurrency),
+                        "--warmup-requests",
+                        str(args.warmup_requests),
+                        "--flush-cache",
+                        "--disable-tqdm",
+                        "--seed",
+                        str(args.seed),
+                        "--tag",
+                        case_tag,
+                        "--output-details",
+                        "--output-file",
+                        str(output_file),
+                    ]
+                    print(
+                        f"\n=== perf {case_tag}: prompts={num_prompts}, "
+                        f"result={output_file} ==="
+                    )
+                    ret = _stream_subprocess(command, log_file, env)
+                    if ret != 0:
+                        print(
+                            f"benchmark case {case_tag} failed with exit code {ret}"
+                        )
+                        return ret
+
+    new_records = _read_jsonl(output_file)[len(existing_records) :]
+    expected_records = (
+        args.rounds
+        * len(args.input_lens)
+        * len(args.output_lens)
+        * len(args.concurrencies)
+    )
+    validation_errors = []
+    if len(new_records) != expected_records:
+        validation_errors.append(
+            f"expected {expected_records} result rows, got {len(new_records)}"
+        )
+    for record in new_records:
+        for error in _perf_record_errors(record):
+            validation_errors.append(f"{record.get('tag', '<untagged>')}: {error}")
+    if validation_errors:
+        print("performance artifact validation failed:", file=sys.stderr)
+        for error in validation_errors:
+            print(f"  {error}", file=sys.stderr)
+        return 1
     print(f"performance result={output_file}; console_log={log_file}")
     return 0
 
@@ -694,9 +804,38 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return records
 
 
+def _perf_record_errors(record: dict[str, Any]) -> list[str]:
+    """Validate that one serving result used exact token lengths successfully."""
+    errors = []
+    input_len = int(record.get("random_input_len", 0))
+    output_len = int(record.get("random_output_len", 0))
+    range_ratio = float(record.get("random_range_ratio", -1))
+    input_lens = [int(value) for value in (record.get("input_lens") or [])]
+    output_lens = [int(value) for value in (record.get("output_lens") or [])]
+    request_errors = record.get("errors") or []
+
+    if range_ratio != 1.0:
+        errors.append(f"random_range_ratio={range_ratio}, expected 1.0")
+    if not input_lens or any(value != input_len for value in input_lens):
+        errors.append(
+            f"input_lens are not fixed at {input_len}: {input_lens}"
+        )
+    if not output_lens or any(value != output_len for value in output_lens):
+        errors.append(
+            f"output_lens are not fixed at {output_len}: {output_lens}"
+        )
+    if any(bool(error) for error in request_errors):
+        errors.append("one or more requests failed")
+    if int(record.get("completed", 0)) != len(input_lens):
+        errors.append(
+            f"completed={record.get('completed')} but requests={len(input_lens)}"
+        )
+    return errors
+
+
 def _aggregate_perf(
     records: list[dict[str, Any]],
-) -> dict[tuple[int, int, int], dict[str, float]]:
+) -> dict[tuple[int, int, int], dict[str, Any]]:
     grouped: dict[tuple[int, int, int], list[dict[str, Any]]] = defaultdict(list)
     for record in records:
         key = (
@@ -717,13 +856,20 @@ def _aggregate_perf(
     )
     aggregated = {}
     for key, group in grouped.items():
-        aggregated[key] = {
-            metric: statistics.median(float(record[metric]) for record in group)
-            for metric in metrics
-        }
+        aggregated[key] = {"rounds": len(group)}
+        for metric in metrics:
+            values = [float(record[metric]) for record in group]
+            median = statistics.median(values)
+            aggregated[key][metric] = median
+            aggregated[key][f"{metric}_mad"] = statistics.median(
+                abs(value - median) for value in values
+            )
         aggregated[key]["failed_requests"] = sum(
             sum(bool(error) for error in (record.get("errors") or []))
             for record in group
+        )
+        aggregated[key]["invalid_records"] = sum(
+            bool(_perf_record_errors(record)) for record in group
         )
     return aggregated
 
@@ -740,8 +886,9 @@ def command_compare_perf(args: argparse.Namespace) -> int:
     baseline = _aggregate_perf(_read_jsonl(args.baseline))
     candidate = _aggregate_perf(_read_jsonl(args.candidate))
     keys = sorted(set(baseline) | set(candidate))
-    missing = False
+    missing = not keys
     failed_requests = False
+    invalid_records = False
     comparisons = []
     print(
         "input output conc base_ttft cand_ttft ttft_gain% "
@@ -753,6 +900,20 @@ def command_compare_perf(args: argparse.Namespace) -> int:
         if left is None or right is None:
             missing = True
             print(f"{key[0]:5d} {key[1]:6d} {key[2]:4d} MISSING_CASE")
+            continue
+        if (
+            left["rounds"] < args.min_rounds
+            or right["rounds"] < args.min_rounds
+            or left["invalid_records"]
+            or right["invalid_records"]
+        ):
+            invalid_records = True
+            print(
+                f"{key[0]:5d} {key[1]:6d} {key[2]:4d} INVALID_DATA "
+                f"baseline_rounds={left['rounds']} candidate_rounds={right['rounds']} "
+                f"baseline_invalid={left['invalid_records']} "
+                f"candidate_invalid={right['invalid_records']}"
+            )
             continue
         if left["failed_requests"] or right["failed_requests"]:
             failed_requests = True
@@ -805,12 +966,14 @@ def command_compare_perf(args: argparse.Namespace) -> int:
         "candidate": str(args.candidate),
         "missing_cases": missing,
         "failed_requests": failed_requests,
+        "invalid_records": invalid_records,
+        "min_rounds": args.min_rounds,
         "comparisons": comparisons,
     }
     if args.output:
         _write_json(args.output, summary)
         print(f"performance comparison artifact={args.output}")
-    return 1 if missing or failed_requests else 0
+    return 1 if missing or failed_requests or invalid_records else 0
 
 
 def command_diag(args: argparse.Namespace) -> int:
@@ -969,7 +1132,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--input-lens", type=_csv_positive_ints, default=[2048, 8192]
     )
     accuracy.add_argument("--output-len", type=_positive_int, default=32)
-    accuracy.add_argument("--repeats", type=_positive_int, default=1)
+    accuracy.add_argument(
+        "--repeats",
+        type=_positive_int,
+        default=3,
+        help="repeat each identical prompt to measure within-config numerical drift",
+    )
     accuracy.add_argument("--prefill-logprob-tokens", type=_positive_int, default=64)
     accuracy.add_argument("--top-logprobs", type=_positive_int, default=5)
     accuracy.add_argument("--timeout", type=float, default=1800)
@@ -993,6 +1161,24 @@ def build_parser() -> argparse.ArgumentParser:
     compare_accuracy.add_argument("--output", type=Path)
     compare_accuracy.set_defaults(func=command_compare_accuracy)
 
+    accuracy_stability = subparsers.add_parser(
+        "accuracy-stability",
+        help="compare identical prompts repeated within one accuracy artifact",
+    )
+    accuracy_stability.add_argument("artifact", type=Path)
+    accuracy_stability.add_argument("--min-repeats", type=_positive_int, default=3)
+    accuracy_stability.add_argument(
+        "--max-prefill-logprob-diff", type=_nonnegative_float, default=0.15
+    )
+    accuracy_stability.add_argument(
+        "--max-output-logprob-diff", type=_nonnegative_float, default=0.15
+    )
+    accuracy_stability.add_argument(
+        "--min-output-token-match", type=_ratio, default=0.95
+    )
+    accuracy_stability.add_argument("--output", type=Path)
+    accuracy_stability.set_defaults(func=command_accuracy_stability)
+
     perf = subparsers.add_parser(
         "perf", help="run an exact-token serving benchmark matrix"
     )
@@ -1005,8 +1191,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     perf.add_argument("--output-lens", type=_csv_positive_ints, default=[1, 32])
     perf.add_argument("--concurrencies", type=_csv_positive_ints, default=[1, 4])
-    perf.add_argument("--num-prompts", type=_positive_int, default=8)
-    perf.add_argument("--warmup-requests", type=_positive_int, default=1)
+    perf.add_argument("--num-prompts", type=_positive_int, default=16)
+    perf.add_argument(
+        "--rounds",
+        type=_positive_int,
+        default=3,
+        help="repeat the complete matrix; comparisons use per-case medians",
+    )
+    perf.add_argument("--warmup-requests", type=_positive_int, default=4)
     perf.add_argument("--seed", type=int, default=42)
     perf.add_argument("--output-file", type=Path)
     perf.add_argument("--append", action="store_true")
@@ -1017,6 +1209,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     compare_perf.add_argument("baseline", type=Path)
     compare_perf.add_argument("candidate", type=Path)
+    compare_perf.add_argument("--min-rounds", type=_positive_int, default=3)
     compare_perf.add_argument("--output", type=Path)
     compare_perf.set_defaults(func=command_compare_perf)
 

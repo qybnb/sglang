@@ -8,6 +8,58 @@
 
 裁层模型不能用于 GPQA 等业务精度结论，也不能代替完整 93 层模型的最终性能验收。
 
+## 推荐的一键采集流程
+
+服务仍使用对应的 `run_16p_pd_layer12_pcp_*.sh` 启动。服务启动成功后，在 Router
+所在机器执行统一采集脚本。除 checkpoint 路径外，其余参数都有默认值：
+
+```bash
+cd /home/q00886407/sgl/sglang-kimiK3
+export MODEL_PATH=/home/weights/Kimi-K3-W4A8
+```
+
+按下面顺序分别重启服务并采集。A1 和 A2 都使用 PCP-off，但中间必须完整重启
+Prefill、Decode 和 Router，用于测量相同配置跨进程的自然数值及性能波动：
+
+```bash
+# 第一次启动 PCP-off 服务后
+./scripts/run_kimi_k3_pcp_validation_suite.sh collect A1
+
+# 完整重启 PCP-off 服务后
+./scripts/run_kimi_k3_pcp_validation_suite.sh collect A2
+
+# 重启为 PCP+A2A/allgather 后
+./scripts/run_kimi_k3_pcp_validation_suite.sh collect B
+
+# 重启为 PCP+FLA/ring 后
+./scripts/run_kimi_k3_pcp_validation_suite.sh collect C
+```
+
+四组数据完成后统一比较：
+
+```bash
+./scripts/run_kimi_k3_pcp_validation_suite.sh compare
+```
+
+默认结果目录是 `logs/kimi_k3_pcp_validation_v2`。如果需要重新跑一整套，使用新目录，
+避免覆盖或混合历史结果：
+
+```bash
+export RESULT_DIR=$PWD/logs/kimi_k3_pcp_validation_v2_run2
+```
+
+默认采集规则：
+
+- 精度使用 2048/8192 两个固定 prompt，每个 prompt 重复 3 次；同一输入长度的重复
+  请求使用完全相同的 token IDs。
+- 性能使用 1024/4096/8192 固定输入，1/32 固定输出，并发 1/4；每个场景 16 个
+  请求、4 个预热请求、完整重复 3 轮。
+- 性能结果按三轮中位数比较，并保存 MAD（中位绝对偏差）。任何实际 token 长度
+  不等于目标值、请求失败或轮数不足，比较脚本都会拒绝给出收益结论。
+
+如需修改规模，可以在采集前覆盖 `ACCURACY_INPUT_LENS`、`PERF_INPUT_LENS`、
+`PERF_NUM_PROMPTS`、`PERF_ROUNDS` 等环境变量。
+
 ## 1. 测试配置
 
 使用同一份 checkpoint、相同 `NUM_HIDDEN_LAYERS`、相同 Prefill/Decode
@@ -289,6 +341,7 @@ python3 scripts/kimi_k3_pcp_validation.py accuracy \
   --tag A_pcp_off \
   --input-lens 2048,8192 \
   --output-len 32 \
+  --repeats 3 \
   --prefill-logprob-tokens 64 \
   --top-logprobs 5 \
   --output logs/kimi_k3_pcp_validation/A_accuracy.json
@@ -303,6 +356,7 @@ python3 scripts/kimi_k3_pcp_validation.py accuracy \
   --tag C_pcp_fla_ring \
   --input-lens 2048,8192 \
   --output-len 32 \
+  --repeats 3 \
   --prefill-logprob-tokens 64 \
   --top-logprobs 5 \
   --output logs/kimi_k3_pcp_validation/C_accuracy.json
@@ -324,9 +378,11 @@ python3 scripts/kimi_k3_pcp_validation.py compare-accuracy \
 - Prefill 尾部 token logprob 最大绝对差不超过 0.15
 - 相同输出 token 的 logprob 最大绝对差不超过 0.15
 
-阈值是初始工程门槛，不是最终精度规范。应先记录 A 自身重复运行的自然波动，再决定
-是否收紧。Prefill logprob 的比较比生成文本更重要，因为生成一旦在接近打平的 token
-处发生分叉，后续 token 就不再处于相同自回归输入上。
+阈值是初始工程门槛，不是最终精度规范。必须先采集独立重启的 A1/A2：只有 A1/A2
+自身通过，B/C 与 A 的严格比较才有明确结论；如果 A1/A2 自身失败，本轮精度结论是
+“基线不稳定、无法判断”，不能据此放宽 PCP 阈值。Prefill logprob 的比较比生成文本
+更重要，因为生成一旦在接近打平的 token 处发生分叉，后续 token 就不再处于相同
+自回归输入上。
 
 ## 6. 性能 A/B
 
@@ -344,7 +400,9 @@ python3 scripts/kimi_k3_pcp_validation.py perf \
   --input-lens 1024,4096,8192 \
   --output-lens 1,32 \
   --concurrencies 1,4 \
-  --num-prompts 8 \
+  --num-prompts 16 \
+  --rounds 3 \
+  --warmup-requests 4 \
   --output-file logs/kimi_k3_pcp_validation/A_perf.jsonl
 ```
 
@@ -359,7 +417,9 @@ python3 scripts/kimi_k3_pcp_validation.py perf \
   --input-lens 1024,4096,8192 \
   --output-lens 1,32 \
   --concurrencies 1,4 \
-  --num-prompts 8 \
+  --num-prompts 16 \
+  --rounds 3 \
+  --warmup-requests 4 \
   --output-file logs/kimi_k3_pcp_validation/C_perf.jsonl
 ```
 
@@ -382,7 +442,11 @@ python3 scripts/kimi_k3_pcp_validation.py compare-perf \
 脚本会在 JSONL 中保留逐请求错误；任一对比配置有请求失败时，`compare-perf`
 直接返回失败，不使用残缺请求计算出的吞吐作为收益结论。
 
-建议每个配置完整重复三次，比较中位数。短输入可能因为通信开销而没有收益，PCP
+脚本强制向 SGLang benchmark 传入 `random-range-ratio=1`；这里 `1` 才表示固定长度，
+`0` 表示从 1 到目标长度随机采样。脚本同时保留默认的 `ignore_eos=true`，并在采集
+结束后校验所有实际输入和输出长度。
+
+每个配置默认完整重复三次，比较中位数。短输入可能因为通信开销而没有收益，PCP
 是否有价值主要看 8K、16K、32K 及目标并发下的曲线。裁层结果只能作为趋势，最终
 结论必须在完整 93 层、相同总硬件预算下重跑。
 
