@@ -6,15 +6,14 @@ launcher detects the local IP and assigns node ranks in this order:
 
 | Node | Default IP | Rank |
 | --- | --- | ---: |
-| master/API | `192.168.25.209` | 0 |
-| worker | `192.168.25.212` | 1 |
-| worker | `192.168.25.216` | 2 |
-| worker | `192.168.25.217` | 3 |
+| master/API | `80.5.17.37` | 0 |
+| worker | `80.5.17.38` | 1 |
+| worker | `80.5.17.33` | 2 |
+| worker | `80.5.17.35` | 3 |
 
 The default model path is `/home/weights/Kimi-K3-w4a8-int-moe`. Override it on every
-node with `MODEL_PATH=/another/path` when necessary.  If the real subnet is
-not `192.168.25.*`, set the same comma-separated `CLUSTER_NODES` value on all
-nodes.
+node with `MODEL_PATH=/another/path` when necessary. Set the same
+comma-separated `CLUSTER_NODES` value on all nodes when using another cluster.
 
 ## 1. PCP-off baseline A1
 
@@ -25,12 +24,12 @@ cd /home/q00886407/sgl/sglang-kimiK3
 ./run_4node_full_pcp_off.sh
 ```
 
-After `http://192.168.25.209:30000/health` is ready, run on node 209:
+After `http://80.5.17.37:15000/health` is ready, run on node 80.5.17.37:
 
 ```bash
 cd /home/q00886407/sgl/sglang-kimiK3
 export MODEL_PATH=/home/weights/Kimi-K3-w4a8-int-moe
-export BASE_URL=http://192.168.25.209:30000
+export BASE_URL=http://80.5.17.37:15000
 export RESULT_DIR=$PWD/logs/kimi_k3_4node_full_accuracy
 ./scripts/run_kimi_k3_pcp_validation_suite.sh collect-accuracy A1
 ```
@@ -51,7 +50,7 @@ Stop the A2 service, then run on all four nodes:
 ./run_4node_full_pcp_a2a.sh
 ```
 
-Collect on node 209 after the service is ready:
+Collect on node 80.5.17.37 after the service is ready:
 
 ```bash
 ./scripts/run_kimi_k3_pcp_validation_suite.sh collect-accuracy B
@@ -65,7 +64,7 @@ Stop the B service, then run on all four nodes:
 ./run_4node_full_pcp_fla_ring.sh
 ```
 
-Collect on node 209 after the service is ready:
+Collect on node 80.5.17.37 after the service is ready:
 
 ```bash
 ./scripts/run_kimi_k3_pcp_validation_suite.sh collect-accuracy C
@@ -73,7 +72,7 @@ Collect on node 209 after the service is ready:
 
 ## 4. Compare
 
-On node 209, with the same `RESULT_DIR` exported:
+On node 80.5.17.37, with the same `RESULT_DIR` exported:
 
 ```bash
 ./scripts/run_kimi_k3_pcp_validation_suite.sh compare-accuracy

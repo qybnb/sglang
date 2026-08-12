@@ -22,7 +22,8 @@ Mooncake/SMEM 或 Router。三份入口脚本均不传 `--json-model-override-ar
 | C：FLA/ring | `run_64p_4node_full_pcp_fla_ring.sh` |
 
 默认沿用四机地址
-`192.168.25.209,192.168.25.212,192.168.25.216,192.168.25.217`，拓扑为：
+`80.5.17.37,80.5.17.38,80.5.17.33,80.5.17.35`，依次对应
+rank 0、1、2、3，拓扑为：
 
 ```text
 PCP off: TP64 / DP4 / CP1 / attention-TP16
@@ -39,7 +40,7 @@ context split。首轮验证关闭 DSpark、radix cache 和 CUDA graph，以隔�
 ```bash
 cd /home/q00886407/sgl/sglang-kimiK3
 export MODEL_PATH=/home/weights/Kimi-K3-w4a8-int-moe
-export NODE_IPS=192.168.25.209,192.168.25.212,192.168.25.216,192.168.25.217
+export NODE_IPS=80.5.17.37,80.5.17.38,80.5.17.33,80.5.17.35
 export NET_IFACE=enp196s0f0
 ```
 
@@ -61,7 +62,7 @@ CONFIG_ONLY=1 NODE_RANK=0 ./run_64p_4node_full_pcp_a2a.sh
 rank 0 服务就绪后，在 rank 0 节点采集 B：
 
 ```bash
-export BASE_URL=http://127.0.0.1:30000
+export BASE_URL=http://127.0.0.1:15000
 export RESULT_DIR=$PWD/logs/kimi_k3_4node_full_v2
 ./scripts/run_kimi_k3_pcp_validation_suite.sh collect B
 ```
@@ -71,8 +72,9 @@ export RESULT_DIR=$PWD/logs/kimi_k3_4node_full_v2
 网卡或显存容量不同，通过 `NODE_IPS`、`NET_IFACE`、`MEM_FRACTION_STATIC`、
 `MAX_TOTAL_TOKENS` 覆盖默认值。
 
-如果 209 可以通过免密 SSH 登录另外三台机器，并且四台机器的代码和模型路径一致，
-可以只在 209 使用集群总控脚本。它会在 212/216/217 后台启动 rank 1/2/3，
+如果 80.5.17.37 可以通过免密 SSH 登录另外三台机器，并且四台机器的代码和模型路径一致，
+可以只在 80.5.17.37 使用集群总控脚本。它会在 80.5.17.38、80.5.17.33、
+80.5.17.35 后台启动 rank 1/2/3，
 随后在当前终端以前台方式启动 rank 0：
 
 ```bash
@@ -83,7 +85,7 @@ export NET_IFACE=enp196s0f0
 # B：A2A/all-gather。服务运行在宿主机时：
 ./run_64p_4node_full_pcp_cluster.sh start a2a
 
-# 如果四台机器都在同名 qwen0727 容器中运行服务，则在 209 宿主机执行：
+# 如果四台机器都在同名 qwen0727 容器中运行服务，则在 80.5.17.37 宿主机执行：
 CONTAINER_NAME=qwen0727 ./run_64p_4node_full_pcp_cluster.sh start a2a
 ```
 
@@ -94,7 +96,7 @@ CONTAINER_NAME=qwen0727 ./run_64p_4node_full_pcp_cluster.sh start a2a
 ./run_64p_4node_full_pcp_cluster.sh stop
 ```
 
-总控使用 `BatchMode=yes`，因此不会卡在 SSH 密码输入；需要提前确认 209 到另外
+总控使用 `BatchMode=yes`，因此不会卡在 SSH 密码输入；需要提前确认 80.5.17.37 到另外
 三台机器免密登录。如果设置了 `CONTAINER_NAME`，总控会在每台宿主机执行
 `docker exec`，代码路径、模型路径和日志路径均指容器内部路径。如果远端仓库路径
 不同，设置 `REMOTE_REPO_ROOT`；如果 SSH 用户不是 root，设置 `SSH_USER`。

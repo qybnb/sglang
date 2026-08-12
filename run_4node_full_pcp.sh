@@ -23,9 +23,9 @@ esac
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PYTHONPATH="${REPO_ROOT}/python:${PYTHONPATH:-}"
 
-# The previous four-node deployment used the 192.168.25.* fabric.  Override
-# CLUSTER_NODES if the new hosts really use a different subnet.
-CLUSTER_NODES="${CLUSTER_NODES:-192.168.25.209,192.168.25.212,192.168.25.216,192.168.25.217}"
+# Default rank order for the current four-node deployment. Override
+# CLUSTER_NODES when using another cluster.
+CLUSTER_NODES="${CLUSTER_NODES:-80.5.17.37,80.5.17.38,80.5.17.33,80.5.17.35}"
 IFS=',' read -r -a NODE_IPS <<< "${CLUSTER_NODES}"
 NNODES="${#NODE_IPS[@]}"
 if (( NNODES != 4 )); then
@@ -69,8 +69,8 @@ if (( NODE_RANK < 0 )); then
 fi
 
 MASTER_ADDR="${MASTER_ADDR:-${NODE_IPS[0]}}"
-DIST_INIT_PORT="${DIST_INIT_PORT:-5000}"
-SERVER_PORT="${SERVER_PORT:-30000}"
+DIST_INIT_PORT="${DIST_INIT_PORT:-15100}"
+SERVER_PORT="${SERVER_PORT:-15000}"
 NPUS_PER_NODE="${NPUS_PER_NODE:-16}"
 TP_SIZE="${TP_SIZE:-$((NNODES * NPUS_PER_NODE))}"
 CP_SIZE="${CP_SIZE:-4}"

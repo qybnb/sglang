@@ -14,7 +14,7 @@
 #
 # Common overrides:
 #   MODEL_PATH=/home/weights/Kimi-K3-w4a8-int-moe
-#   NODE_IPS=192.168.25.209,192.168.25.212,192.168.25.216,192.168.25.217
+#   NODE_IPS=80.5.17.37,80.5.17.38,80.5.17.33,80.5.17.35
 #   NET_IFACE=enp196s0f0
 #   NODE_RANK=0  # optional; otherwise inferred from NODE_IPS and hostname -I
 #
@@ -51,9 +51,9 @@ if [[ -f "${MODEL_PATH}/config.json" ]]; then
         "${MODEL_PATH}/config.json")"
 fi
 
-# Defaults match the original four-node unified Kimi-K3 deployment. Override
-# NODE_IPS on all four nodes when using a different cluster.
-NODE_IPS="${NODE_IPS:-192.168.25.209,192.168.25.212,192.168.25.216,192.168.25.217}"
+# Default rank order for the current four-node unified Kimi-K3 deployment.
+# Override NODE_IPS on all four nodes when using a different cluster.
+NODE_IPS="${NODE_IPS:-80.5.17.37,80.5.17.38,80.5.17.33,80.5.17.35}"
 IFS=',' read -r -a NODE_IP_ARRAY <<< "${NODE_IPS}"
 NNODES="${NNODES:-4}"
 if (( ${#NODE_IP_ARRAY[@]} != NNODES )); then
@@ -128,11 +128,11 @@ if (( ENABLE_PCP == 1 && ATTN_TP_SIZE < 2 )); then
     exit 2
 fi
 
-DIST_PORT="${DIST_PORT:-5000}"
+DIST_PORT="${DIST_PORT:-15100}"
 DIST_INIT_ADDR="${DIST_INIT_ADDR:-${NODE_IP_ARRAY[0]}:${DIST_PORT}}"
 NET_IFACE="${NET_IFACE:-enp196s0f0}"
 HOST="${HOST:-0.0.0.0}"
-PORT="${PORT:-30000}"
+PORT="${PORT:-15000}"
 PAGE_SIZE="${PAGE_SIZE:-128}"
 CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-8192}"
 MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-65536}"

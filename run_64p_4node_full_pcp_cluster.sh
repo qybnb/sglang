@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start, stop, or inspect the four-node full-model PCP service from node 209.
+# Start, stop, or inspect the four-node full-model PCP service from node 80.5.17.37.
 set -euo pipefail
 
 ACTION="${1:-}"
@@ -29,7 +29,7 @@ esac
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REMOTE_REPO_ROOT="${REMOTE_REPO_ROOT:-${REPO_ROOT}}"
 MODEL_PATH="${MODEL_PATH:-/home/weights/Kimi-K3-w4a8-int-moe}"
-NODE_IPS="${NODE_IPS:-192.168.25.209,192.168.25.212,192.168.25.216,192.168.25.217}"
+NODE_IPS="${NODE_IPS:-80.5.17.37,80.5.17.38,80.5.17.33,80.5.17.35}"
 IFS=',' read -r -a NODE_IP_ARRAY <<< "${NODE_IPS}"
 if (( ${#NODE_IP_ARRAY[@]} != 4 )); then
     echo "NODE_IPS must contain four comma-separated addresses (got ${NODE_IPS})." >&2
