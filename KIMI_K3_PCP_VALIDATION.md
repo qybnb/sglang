@@ -21,8 +21,8 @@ Mooncake/SMEM 或 Router。三份入口脚本均不传 `--json-model-override-ar
 | B：A2A/all-gather | `run_64p_4node_full_pcp_a2a.sh` |
 | C：FLA/ring | `run_64p_4node_full_pcp_fla_ring.sh` |
 
-默认沿用原四机地址
-`192.168.25.213,192.168.25.214,192.168.25.215,192.168.25.218`，拓扑为：
+默认沿用四机地址
+`192.168.25.209,192.168.25.212,192.168.25.216,192.168.25.217`，拓扑为：
 
 ```text
 PCP off: TP64 / DP4 / CP1 / attention-TP16
@@ -39,7 +39,7 @@ context split。首轮验证关闭 DSpark、radix cache 和 CUDA graph，以隔�
 ```bash
 cd /home/q00886407/sgl/sglang-kimiK3
 export MODEL_PATH=/home/weights/Kimi-K3-W4A8
-export NODE_IPS=192.168.25.213,192.168.25.214,192.168.25.215,192.168.25.218
+export NODE_IPS=192.168.25.209,192.168.25.212,192.168.25.216,192.168.25.217
 export NET_IFACE=enp196s0f0
 ```
 
@@ -70,6 +70,34 @@ export RESULT_DIR=$PWD/logs/kimi_k3_4node_full_v2
 目标脚本重新启动。A1 和 A2 都使用 PCP-off，中间也必须完整重启。若实际节点 IP、
 网卡或显存容量不同，通过 `NODE_IPS`、`NET_IFACE`、`MEM_FRACTION_STATIC`、
 `MAX_TOTAL_TOKENS` 覆盖默认值。
+
+如果 209 可以通过免密 SSH 登录另外三台机器，并且四台机器的代码和模型路径一致，
+可以只在 209 使用集群总控脚本。它会在 212/216/217 后台启动 rank 1/2/3，
+随后在当前终端以前台方式启动 rank 0：
+
+```bash
+cd /home/q00886407/sgl/sglang-kimiK3
+export MODEL_PATH=/home/weights/Kimi-K3-W4A8
+export NET_IFACE=enp196s0f0
+
+# B：A2A/all-gather。服务运行在宿主机时：
+./run_64p_4node_full_pcp_cluster.sh start a2a
+
+# 如果四台机器都在同名 qwen0727 容器中运行服务，则在 209 宿主机执行：
+CONTAINER_NAME=qwen0727 ./run_64p_4node_full_pcp_cluster.sh start a2a
+```
+
+其他配置为 `start off` 和 `start fla`。状态检查和四机停止命令为：
+
+```bash
+./run_64p_4node_full_pcp_cluster.sh status
+./run_64p_4node_full_pcp_cluster.sh stop
+```
+
+总控使用 `BatchMode=yes`，因此不会卡在 SSH 密码输入；需要提前确认 209 到另外
+三台机器免密登录。如果设置了 `CONTAINER_NAME`，总控会在每台宿主机执行
+`docker exec`，代码路径、模型路径和日志路径均指容器内部路径。如果远端仓库路径
+不同，设置 `REMOTE_REPO_ROOT`；如果 SSH 用户不是 root，设置 `SSH_USER`。
 
 ## 推荐的一键采集流程
 

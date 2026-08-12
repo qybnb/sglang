@@ -14,7 +14,7 @@
 #
 # Common overrides:
 #   MODEL_PATH=/home/weights/Kimi-K3-W4A8
-#   NODE_IPS=192.168.25.213,192.168.25.214,192.168.25.215,192.168.25.218
+#   NODE_IPS=192.168.25.209,192.168.25.212,192.168.25.216,192.168.25.217
 #   NET_IFACE=enp196s0f0
 #   NODE_RANK=0  # optional; otherwise inferred from NODE_IPS and hostname -I
 #
@@ -53,7 +53,7 @@ fi
 
 # Defaults match the original four-node unified Kimi-K3 deployment. Override
 # NODE_IPS on all four nodes when using a different cluster.
-NODE_IPS="${NODE_IPS:-192.168.25.213,192.168.25.214,192.168.25.215,192.168.25.218}"
+NODE_IPS="${NODE_IPS:-192.168.25.209,192.168.25.212,192.168.25.216,192.168.25.217}"
 IFS=',' read -r -a NODE_IP_ARRAY <<< "${NODE_IPS}"
 NNODES="${NNODES:-4}"
 if (( ${#NODE_IP_ARRAY[@]} != NNODES )); then
