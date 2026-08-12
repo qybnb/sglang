@@ -56,6 +56,13 @@ class ContextParallelMetadata:
     actual_seq_q_prev_list: List[int] = None
     actual_seq_q_next_list: List[int] = None
 
+    # Unpadded lengths for paged attention backends. The physical lengths
+    # above still describe the fixed-shape CP collective payload.
+    real_kv_len_prev_list: List[int] = None
+    real_kv_len_next_list: List[int] = None
+    real_seq_q_prev_list: List[int] = None
+    real_seq_q_next_list: List[int] = None
+
     # Aggregate sum of extend_seq_lens across the batch.
     total_seq_lens: int = 0
     bs: int = 1
@@ -668,15 +675,21 @@ def prepare_context_parallel_metadata(
     assert extend_seqs_len is not None
     extend_seqs_len = [int(x) for x in extend_seqs_len]
 
+    real_extend_seqs_len = list(extend_seqs_len)
+    bs = len(extend_seqs_len)
+    if seqs_len is not None and len(seqs_len) == bs:
+        prefix_offsets = [
+            max(int(seqs_len[s]) - real_extend_seqs_len[s], 0)
+            for s in range(bs)
+        ]
+    else:
+        prefix_offsets = [0] * bs
+
     # Update the extend_seqs_len to the padded length.
     pad_len = int(kv_len) - sum(extend_seqs_len)
     if pad_len > 0:
         extend_seqs_len[-1] += pad_len
-        if seqs_len is not None and len(seqs_len) == len(extend_seqs_len):
-            seqs_len = list(seqs_len)
-            seqs_len[-1] += pad_len
 
-    bs = len(extend_seqs_len)
     cp_segment_num = cp_size * 2
 
     # Prefix offset (radix cache hit length) per sequence. For non-NSA
@@ -684,15 +697,9 @@ def prepare_context_parallel_metadata(
     # prefix_offsets[s] below, so cache_seqlens correctly covers the cached
     # prefix. NSA leaves bare cumulatives so its indexer can re-add the
     # offset itself.
-    if seqs_len is not None and len(seqs_len) == bs:
-        prefix_offsets = [
-            max(int(seqs_len[s]) - extend_seqs_len[s], 0) for s in range(bs)
-        ]
-    else:
-        prefix_offsets = [0] * bs
-
     # Per-sequence block sizes: first (L % cp_segment_num) blocks get +1.
     per_seq_block_sizes: List[List[int]] = []
+    per_seq_real_block_sizes: List[List[int]] = []
     split_list: List[int] = []
     for s in range(bs):
         L = extend_seqs_len[s]
@@ -701,6 +708,15 @@ def prepare_context_parallel_metadata(
         blk = [base + 1 if i < rem else base for i in range(cp_segment_num)]
         per_seq_block_sizes.append(blk)
         split_list.extend(blk)
+
+        remaining = real_extend_seqs_len[s]
+        real_blk = []
+        for block_size in blk:
+            real_block_size = min(block_size, max(remaining, 0))
+            real_blk.append(real_block_size)
+            remaining -= real_block_size
+        assert remaining == 0
+        per_seq_real_block_sizes.append(real_blk)
 
     # Per-rank aggregate: this rank owns block r and block (2*cp_size-1-r)
     # of every sequence.
@@ -765,20 +781,33 @@ def prepare_context_parallel_metadata(
     kv_len_next_list: List[int] = []
     actual_seq_q_prev_list: List[int] = []
     actual_seq_q_next_list: List[int] = []
+    real_kv_len_prev_list: List[int] = []
+    real_kv_len_next_list: List[int] = []
+    real_seq_q_prev_list: List[int] = []
+    real_seq_q_next_list: List[int] = []
     for s in range(bs):
         blk = per_seq_block_sizes[s]
+        real_blk = per_seq_real_block_sizes[s]
         cum_prev = sum(blk[: cp_rank + 1])
         cum_next = sum(blk[: cp_segment_num - cp_rank])
+        real_cum_prev = sum(real_blk[: cp_rank + 1])
+        real_cum_next = sum(real_blk[: cp_segment_num - cp_rank])
         # NSA indexer re-adds prefix offset itself; leave bare cumulative.
         # For non-NSA (FlashAttention), bake prefix into cache_seqlens.
         if nsa_mode:
             kv_len_prev_list.append(cum_prev)
             kv_len_next_list.append(cum_next)
+            real_kv_len_prev_list.append(real_cum_prev)
+            real_kv_len_next_list.append(real_cum_next)
         else:
             kv_len_prev_list.append(prefix_offsets[s] + cum_prev)
             kv_len_next_list.append(prefix_offsets[s] + cum_next)
+            real_kv_len_prev_list.append(prefix_offsets[s] + real_cum_prev)
+            real_kv_len_next_list.append(prefix_offsets[s] + real_cum_next)
         actual_seq_q_prev_list.append(blk[cp_rank])
         actual_seq_q_next_list.append(blk[cp_segment_num - cp_rank - 1])
+        real_seq_q_prev_list.append(real_blk[cp_rank])
+        real_seq_q_next_list.append(real_blk[cp_segment_num - cp_rank - 1])
 
     # FlashAttention CUDA tensors (device parameterized for unit tests).
     kv_len_prev_tensor = torch.tensor(
@@ -837,6 +866,10 @@ def prepare_context_parallel_metadata(
         kv_len_next_list=kv_len_next_list,
         actual_seq_q_prev_list=actual_seq_q_prev_list,
         actual_seq_q_next_list=actual_seq_q_next_list,
+        real_kv_len_prev_list=real_kv_len_prev_list,
+        real_kv_len_next_list=real_kv_len_next_list,
+        real_seq_q_prev_list=real_seq_q_prev_list,
+        real_seq_q_next_list=real_seq_q_next_list,
         total_seq_lens=total_seq_lens,
         bs=bs,
     )

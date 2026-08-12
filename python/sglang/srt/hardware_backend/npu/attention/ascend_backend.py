@@ -1173,6 +1173,80 @@ class AscendAttnBackend(AttentionBackend):
         else:
             q_rope_prev = q_rope_next = None
 
+        def pack_real_queries(
+            q_half: torch.Tensor,
+            q_rope_half: Optional[torch.Tensor],
+            physical_q_lens: List[int],
+            real_q_lens: List[int],
+        ):
+            """Remove CP alignment rows before paged FIA reads the KV cache."""
+            if len(physical_q_lens) != len(real_q_lens):
+                raise ValueError(
+                    "MLA CP physical/real query metadata has different batch sizes"
+                )
+            if sum(physical_q_lens) != q_half.shape[0]:
+                raise ValueError(
+                    "MLA CP query metadata does not match the physical tensor: "
+                    f"q_rows={q_half.shape[0]}, q_lens={physical_q_lens}"
+                )
+            if any(
+                real_len < 0 or real_len > physical_len
+                for physical_len, real_len in zip(physical_q_lens, real_q_lens)
+            ):
+                raise ValueError(
+                    "MLA CP real query lengths must be within their physical blocks"
+                )
+            if physical_q_lens == real_q_lens:
+                return q_half, q_rope_half
+
+            q_chunks = torch.split(q_half, physical_q_lens, dim=0)
+            packed_q = torch.cat(
+                [chunk[:real_len] for chunk, real_len in zip(q_chunks, real_q_lens)],
+                dim=0,
+            ).contiguous()
+            if q_rope_half is None:
+                return packed_q, None
+            rope_chunks = torch.split(q_rope_half, physical_q_lens, dim=0)
+            packed_q_rope = torch.cat(
+                [
+                    chunk[:real_len]
+                    for chunk, real_len in zip(rope_chunks, real_q_lens)
+                ],
+                dim=0,
+            ).contiguous()
+            return packed_q, packed_q_rope
+
+        def restore_physical_queries(
+            output: torch.Tensor,
+            physical_q_lens: List[int],
+            real_q_lens: List[int],
+        ) -> torch.Tensor:
+            """Restore zero rows so downstream CP collectives keep fixed shapes."""
+            if physical_q_lens == real_q_lens:
+                return output
+            chunks = []
+            offset = 0
+            for physical_len, real_len in zip(physical_q_lens, real_q_lens):
+                chunk = output[offset : offset + real_len]
+                offset += real_len
+                if physical_len > real_len:
+                    chunk = torch.cat(
+                        [
+                            chunk,
+                            chunk.new_zeros(
+                                (physical_len - real_len, *chunk.shape[1:])
+                            ),
+                        ],
+                        dim=0,
+                    )
+                chunks.append(chunk)
+            if offset != output.shape[0]:
+                raise ValueError(
+                    "MLA CP real query metadata does not match FIA output: "
+                    f"output_rows={output.shape[0]}, q_lens={real_q_lens}"
+                )
+            return torch.cat(chunks, dim=0).contiguous()
+
         kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         rope_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
         if is_fia_nz():
@@ -1203,6 +1277,26 @@ class AscendAttnBackend(AttentionBackend):
             q_lens: List[int],
             kv_lens: List[int],
         ) -> torch.Tensor:
+            if len(q_lens) != len(kv_lens):
+                raise ValueError(
+                    "MLA CP query/KV metadata has different batch sizes"
+                )
+            active_indices = [
+                batch_id for batch_id, q_len in enumerate(q_lens) if q_len > 0
+            ]
+            if not active_indices:
+                return q_half[:, : layer.tp_q_head_num, :]
+
+            # A short request can leave a fully padded tail block. FIA expects
+            # one block-table row per non-empty sequence in the packed TND
+            # query, so remove those empty entries from all batch metadata.
+            if len(active_indices) != len(q_lens):
+                q_lens = [q_lens[index] for index in active_indices]
+                kv_lens = [kv_lens[index] for index in active_indices]
+                block_tables = self.forward_metadata.block_tables[active_indices]
+            else:
+                block_tables = self.forward_metadata.block_tables
+
             rope_kwargs = {}
             if q_rope_half is not None:
                 rope_kwargs = {
@@ -1213,7 +1307,7 @@ class AscendAttnBackend(AttentionBackend):
                 q_half,
                 kv_cache,
                 kv_cache,
-                block_table=self.forward_metadata.block_tables,
+                block_table=block_tables,
                 block_size=self.page_size,
                 num_heads=fia_q_head_num,
                 num_key_value_heads=layer.tp_k_head_num,
@@ -1228,17 +1322,36 @@ class AscendAttnBackend(AttentionBackend):
             )
             return output[:, : layer.tp_q_head_num, :]
 
-        output_prev = run_half(
-            q_prev,
-            q_rope_prev,
-            cp_meta.actual_seq_q_prev_list,
-            cp_meta.kv_len_prev_list,
+        physical_q_prev_lens = cp_meta.actual_seq_q_prev_list
+        physical_q_next_lens = cp_meta.actual_seq_q_next_list
+        real_q_prev_lens = getattr(
+            cp_meta, "real_seq_q_prev_list", None
+        ) or physical_q_prev_lens
+        real_q_next_lens = getattr(
+            cp_meta, "real_seq_q_next_list", None
+        ) or physical_q_next_lens
+        real_kv_prev_lens = getattr(
+            cp_meta, "real_kv_len_prev_list", None
+        ) or cp_meta.kv_len_prev_list
+        real_kv_next_lens = getattr(
+            cp_meta, "real_kv_len_next_list", None
+        ) or cp_meta.kv_len_next_list
+
+        q_prev, q_rope_prev = pack_real_queries(
+            q_prev, q_rope_prev, physical_q_prev_lens, real_q_prev_lens
         )
-        output_next = run_half(
-            q_next,
-            q_rope_next,
-            cp_meta.actual_seq_q_next_list,
-            cp_meta.kv_len_next_list,
+        q_next, q_rope_next = pack_real_queries(
+            q_next, q_rope_next, physical_q_next_lens, real_q_next_lens
+        )
+        output_prev = restore_physical_queries(
+            run_half(q_prev, q_rope_prev, real_q_prev_lens, real_kv_prev_lens),
+            physical_q_prev_lens,
+            real_q_prev_lens,
+        )
+        output_next = restore_physical_queries(
+            run_half(q_next, q_rope_next, real_q_next_lens, real_kv_next_lens),
+            physical_q_next_lens,
+            real_q_next_lens,
         )
         return torch.cat((output_prev, output_next), dim=0).view(
             -1, layer.tp_q_head_num * self.kv_lora_rank

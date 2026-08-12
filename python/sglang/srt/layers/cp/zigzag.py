@@ -88,6 +88,14 @@ class ZigzagContextParallelMetadata(BaseContextParallelMetadata):
     actual_seq_q_prev_list: Optional[List[int]] = None
     actual_seq_q_next_list: Optional[List[int]] = None
 
+    # Unpadded lengths for paged attention backends. CP collectives still use
+    # the physical lengths above, while a paged KV cache only contains real
+    # request tokens and therefore cannot address CP alignment padding.
+    real_kv_len_prev_list: Optional[List[int]] = None
+    real_kv_len_next_list: Optional[List[int]] = None
+    real_seq_q_prev_list: Optional[List[int]] = None
+    real_seq_q_next_list: Optional[List[int]] = None
+
 
 ContextParallelMetadata = ZigzagContextParallelMetadata
 
@@ -153,27 +161,31 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             extend_seqs_len = seqs_len or [num_tokens]
         extend_seqs_len = [int(x) for x in extend_seqs_len]
 
-        pad_len = int(num_tokens) - sum(extend_seqs_len)
-        if pad_len > 0:
-            extend_seqs_len[-1] += pad_len
-            if seqs_len is not None and len(seqs_len) == len(extend_seqs_len):
-                seqs_len = list(seqs_len)
-                seqs_len[-1] += pad_len
-
+        # Keep the request lengths before DP/attention-TP alignment padding.
+        # Padding is materialized at the tail of the final request, but it is
+        # not backed by pages in the request's KV cache.
+        real_extend_seqs_len = list(extend_seqs_len)
         bs = len(extend_seqs_len)
-        cp_segment_num = self.cp_size * 2
         if seqs_len is not None and len(seqs_len) == bs:
             prefix_offsets = [
-                max(int(seqs_len[i]) - extend_seqs_len[i], 0) for i in range(bs)
+                max(int(seqs_len[i]) - real_extend_seqs_len[i], 0)
+                for i in range(bs)
             ]
         else:
             prefix_offsets = [0] * bs
 
+        pad_len = int(num_tokens) - sum(extend_seqs_len)
+        if pad_len > 0:
+            extend_seqs_len[-1] += pad_len
+
+        cp_segment_num = self.cp_size * 2
+
         # TODO: move these per-request layout/index computations to a Triton
         # kernel if Python-side metadata construction becomes a bottleneck.
         per_seq_block_sizes: List[List[int]] = []
+        per_seq_real_block_sizes: List[List[int]] = []
         split_list: List[int] = []
-        for length in extend_seqs_len:
+        for length, real_length in zip(extend_seqs_len, real_extend_seqs_len):
             base = length // cp_segment_num
             rem = length % cp_segment_num
             block_sizes = [
@@ -182,6 +194,17 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             ]
             per_seq_block_sizes.append(block_sizes)
             split_list.extend(block_sizes)
+
+            # Alignment padding is appended after the real request tokens.
+            # Preserve the physical block boundaries and trim only the tail.
+            remaining = real_length
+            real_block_sizes = []
+            for block_size in block_sizes:
+                real_block_size = min(block_size, max(remaining, 0))
+                real_block_sizes.append(real_block_size)
+                remaining -= real_block_size
+            assert remaining == 0
+            per_seq_real_block_sizes.append(real_block_sizes)
 
         per_rank_actual_token = []
         for rank in range(self.cp_size):
@@ -230,7 +253,12 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         kv_len_next_list: List[int] = []
         actual_seq_q_prev_list: List[int] = []
         actual_seq_q_next_list: List[int] = []
+        real_kv_len_prev_list: List[int] = []
+        real_kv_len_next_list: List[int] = []
+        real_seq_q_prev_list: List[int] = []
+        real_seq_q_next_list: List[int] = []
         for batch_id, block_sizes in enumerate(per_seq_block_sizes):
+            real_block_sizes = per_seq_real_block_sizes[batch_id]
             kv_len_prev_list.append(
                 prefix_offsets[batch_id] + sum(block_sizes[: cp_rank + 1])
             )
@@ -239,6 +267,18 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             )
             actual_seq_q_prev_list.append(block_sizes[cp_rank])
             actual_seq_q_next_list.append(block_sizes[cp_segment_num - cp_rank - 1])
+            real_kv_len_prev_list.append(
+                prefix_offsets[batch_id]
+                + sum(real_block_sizes[: cp_rank + 1])
+            )
+            real_kv_len_next_list.append(
+                prefix_offsets[batch_id]
+                + sum(real_block_sizes[: cp_segment_num - cp_rank])
+            )
+            real_seq_q_prev_list.append(real_block_sizes[cp_rank])
+            real_seq_q_next_list.append(
+                real_block_sizes[cp_segment_num - cp_rank - 1]
+            )
 
         from sglang.srt.server_args import get_global_server_args
 
@@ -294,6 +334,10 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             kv_len_next_list=kv_len_next_list,
             actual_seq_q_prev_list=actual_seq_q_prev_list,
             actual_seq_q_next_list=actual_seq_q_next_list,
+            real_kv_len_prev_list=real_kv_len_prev_list,
+            real_kv_len_next_list=real_kv_len_next_list,
+            real_seq_q_prev_list=real_seq_q_prev_list,
+            real_seq_q_next_list=real_seq_q_next_list,
             total_seq_lens=total_seq_lens,
             bs=bs,
         )

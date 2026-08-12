@@ -469,6 +469,48 @@ class TestCPZigzagStrategy(CustomTestCase):
             self.assertFalse(is_cp_v2_active(unsafe_ragged_batch))
             self.assertTrue(is_cp_v2_active(safe_ragged_batch))
 
+    def test_paged_mla_metadata_excludes_cp_alignment_padding(self):
+        strategy = ZigzagCPStrategy(cp_size=4)
+        for rank in range(4):
+            with get_parallel().override(attn_cp_rank=rank):
+                metadata = strategy.build_metadata(
+                    num_tokens=3200,
+                    seqs_len=[3200],
+                    extend_seqs_len=[3197],
+                )
+
+            self.assertEqual(metadata.split_list, [400] * 8)
+            self.assertEqual(metadata.actual_seq_q_prev_list, [400])
+            self.assertEqual(metadata.actual_seq_q_next_list, [400])
+            self.assertLessEqual(metadata.real_kv_len_prev_list[0], 3200)
+            self.assertLessEqual(metadata.real_kv_len_next_list[0], 3200)
+
+            if rank == 0:
+                # The final zigzag block owns the three alignment rows. FIA
+                # computes only its 397 real queries against the 3200 real KV
+                # tokens; downstream communication still sees 400 rows.
+                self.assertEqual(metadata.kv_len_next_list, [3203])
+                self.assertEqual(metadata.real_kv_len_next_list, [3200])
+                self.assertEqual(metadata.real_seq_q_next_list, [397])
+                self.assertEqual(metadata.real_seq_q_prev_list, [400])
+
+    def test_paged_mla_metadata_trims_only_the_last_request(self):
+        strategy = ZigzagCPStrategy(cp_size=2)
+        with get_parallel().override(attn_cp_rank=0):
+            metadata = strategy.build_metadata(
+                num_tokens=16,
+                seqs_len=[6, 8],
+                extend_seqs_len=[4, 7],
+            )
+
+        # Five alignment rows are appended globally to request 1. Request 0
+        # retains its two-token radix prefix and all four real extend tokens.
+        self.assertEqual(metadata.split_list, [1, 1, 1, 1, 3, 3, 3, 3])
+        self.assertEqual(metadata.real_seq_q_prev_list, [1, 3])
+        self.assertEqual(metadata.real_seq_q_next_list, [1, 0])
+        self.assertEqual(metadata.real_kv_len_prev_list, [3, 4])
+        self.assertEqual(metadata.real_kv_len_next_list, [6, 8])
+
     def _expected_metadata(self, *, rank, cp_size, seq_lens, extend_seq_lens):
         bs = len(extend_seq_lens)
         cp_segment_num = cp_size * 2
