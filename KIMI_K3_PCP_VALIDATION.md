@@ -8,6 +8,69 @@
 
 裁层模型不能用于 GPQA 等业务精度结论，也不能代替完整 93 层模型的最终性能验收。
 
+## 四机完整模型统一部署验证
+
+四台机器、每机 16 NPU 时，可以先用非 PD 的统一服务验证完整 checkpoint。
+该方式覆盖完整模型的 PCP 计算、精度和 prefill 性能，但不覆盖 PD KV 传输、
+Mooncake/SMEM 或 Router。三份入口脚本均不传 `--json-model-override-args`，因此
+不会使用 12/24 层裁剪：
+
+| 配置 | 四台机器都执行的脚本 |
+|---|---|
+| A1/A2：PCP off | `run_64p_4node_full_pcp_off.sh` |
+| B：A2A/all-gather | `run_64p_4node_full_pcp_a2a.sh` |
+| C：FLA/ring | `run_64p_4node_full_pcp_fla_ring.sh` |
+
+默认沿用原四机地址
+`192.168.25.213,192.168.25.214,192.168.25.215,192.168.25.218`，拓扑为：
+
+```text
+PCP off: TP64 / DP4 / CP1 / attention-TP16
+PCP on : TP64 / DP4 / CP4 / attention-TP4
+```
+
+这里 `TP64` 是总进程数；CP4 从已有的 64 个 rank 中切分，不会额外需要
+`64 * 4` 张卡。统一服务只在 prefill/extend 阶段进入 CP，decode forward 不做
+context split。首轮验证关闭 DSpark、radix cache 和 CUDA graph，以隔离 PCP
+本身的功能和数值结果。
+
+四台机器都进入同一个代码目录，设置相同环境变量：
+
+```bash
+cd /home/q00886407/sgl/sglang-kimiK3
+export MODEL_PATH=/home/weights/Kimi-K3-W4A8
+export NODE_IPS=192.168.25.213,192.168.25.214,192.168.25.215,192.168.25.218
+export NET_IFACE=enp196s0f0
+```
+
+如果容器内 `hostname -I` 无法匹配业务 IP，再分别增加 `NODE_RANK=0/1/2/3`。
+正式启动前可在任一节点检查解析结果：
+
+```bash
+CONFIG_ONLY=1 NODE_RANK=0 ./run_64p_4node_full_pcp_a2a.sh
+```
+
+确认输出为 `TP64/DP4/CP4/attention-TP4` 且明确打印
+`FULL checkpoint profile (no layer override)`。然后在四台机器同时执行所需的
+同一份脚本。例如 B 配置：
+
+```bash
+./run_64p_4node_full_pcp_a2a.sh
+```
+
+rank 0 服务就绪后，在 rank 0 节点采集 B：
+
+```bash
+export BASE_URL=http://127.0.0.1:30000
+export RESULT_DIR=$PWD/logs/kimi_k3_4node_full_v2
+./scripts/run_kimi_k3_pcp_validation_suite.sh collect B
+```
+
+切换 A1、A2、B、C 时，必须停止四台机器上的旧服务，再让四台机器使用同一份
+目标脚本重新启动。A1 和 A2 都使用 PCP-off，中间也必须完整重启。若实际节点 IP、
+网卡或显存容量不同，通过 `NODE_IPS`、`NET_IFACE`、`MEM_FRACTION_STATIC`、
+`MAX_TOTAL_TOKENS` 覆盖默认值。
+
 ## 推荐的一键采集流程
 
 服务仍使用对应的 `run_16p_pd_layer12_pcp_*.sh` 启动。服务启动成功后，在 Router
