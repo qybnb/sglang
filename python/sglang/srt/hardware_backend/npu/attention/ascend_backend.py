@@ -2867,6 +2867,93 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_lengths_kv = (
                     self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                 )
+
+            if not self.graph_mode and not self.use_fia:
+                # Ordinary Kimi-K3 decode uses _npu_paged_attention_mla when
+                # ASCEND_USE_FIA is disabled.  Running target verification
+                # through the FIA/TND path changes the attention kernel (and
+                # its reduction numerics) exactly where speculative decoding
+                # requires target logits to agree with sequential decode.
+                #
+                # Treat every fixed-width verify token as a one-token paged
+                # decode query.  Repeating the request's block-table row and
+                # assigning prefix+1, ..., prefix+T context lengths lets one
+                # paged-attention call cover the whole verification batch;
+                # future candidate KVs are already in the cache but remain
+                # outside each query's context length.
+                draft_tokens = int(self.speculative_num_draft_tokens)
+                active_tokens = q_nope.shape[0]
+                if active_tokens % draft_tokens != 0:
+                    raise ValueError(
+                        "MLA target verify token count must be divisible by "
+                        f"the draft width, got tokens={active_tokens}, "
+                        f"draft_tokens={draft_tokens}."
+                    )
+                active_bs = active_tokens // draft_tokens
+                final_seq_lens = actual_seq_lengths_kv[:active_bs]
+                if len(final_seq_lens) != active_bs or any(
+                    seq_len < draft_tokens for seq_len in final_seq_lens
+                ):
+                    raise ValueError(
+                        "MLA target verify has invalid final sequence lengths: "
+                        f"batch={active_bs}, draft_tokens={draft_tokens}, "
+                        f"seq_lens={final_seq_lens}."
+                    )
+
+                final_seq_lens = torch.tensor(
+                    final_seq_lens, dtype=torch.int32, device="cpu"
+                )
+                verify_steps = torch.arange(
+                    1, draft_tokens + 1, dtype=torch.int32, device="cpu"
+                )
+                context_lens = (
+                    final_seq_lens[:, None] - draft_tokens + verify_steps[None, :]
+                ).reshape(-1)
+                verify_block_tables = self.forward_metadata.block_tables[
+                    :active_bs
+                ].repeat_interleave(draft_tokens, dim=0)
+
+                query = torch.cat([q_nope, q_rope], dim=-1).view(
+                    active_tokens, layer.tp_q_head_num, layer.head_dim
+                )
+                kv_cache = torch.cat([c_kv, k_rope], dim=-1).view(
+                    -1,
+                    self.page_size,
+                    layer.tp_k_head_num,
+                    self.kv_lora_rank + self.qk_rope_head_dim,
+                )
+                attn_output = torch.empty(
+                    [active_tokens, layer.tp_q_head_num, self.kv_lora_rank],
+                    dtype=q.dtype,
+                    device=q.device,
+                )
+                torch_npu._npu_paged_attention_mla(
+                    query=query,
+                    key_cache=kv_cache,
+                    num_kv_heads=layer.tp_k_head_num,
+                    num_heads=layer.tp_q_head_num,
+                    scale_value=layer.scaling,
+                    block_table=verify_block_tables,
+                    context_lens=context_lens,
+                    mla_vheadsize=self.kv_lora_rank,
+                    out=attn_output,
+                )
+                attn_output = attn_output.view(
+                    active_tokens, layer.tp_q_head_num * layer.v_head_dim
+                )
+                if active_tokens != num_token_padding:
+                    attn_output = torch.cat(
+                        [
+                            attn_output,
+                            attn_output.new_zeros(
+                                num_token_padding - active_tokens,
+                                *attn_output.shape[1:],
+                            ),
+                        ],
+                        dim=0,
+                    )
+                return attn_output
+
             actual_seq_lengths = np.arange(
                 self.speculative_num_draft_tokens,
                 self.speculative_num_draft_tokens + q_nope.shape[0],
