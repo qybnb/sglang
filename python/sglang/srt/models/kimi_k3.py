@@ -134,7 +134,8 @@ def _log_kimi_k3_npu_prefill_cp_input(
     logger.info(
         "[KIMI_K3_NPU_PCP_INPUT] attention=%s layer=%d "
         "cp_rank=%d cp_size=%d attn_tp_rank=%d attn_tp_size=%d "
-        "local_tokens=%d full_extend_tokens=%s has_cp_metadata=%s",
+        "local_tokens=%d full_extend_tokens=%s has_cp_metadata=%s "
+        "global_pcp_active=%s",
         attention_type,
         layer_id,
         parallel.attn_cp_rank,
@@ -144,6 +145,7 @@ def _log_kimi_k3_npu_prefill_cp_input(
         hidden_states.shape[0],
         full_extend_tokens,
         forward_batch.attn_cp_metadata is not None,
+        getattr(forward_batch, "global_prefill_cp_active", None),
     )
 
 

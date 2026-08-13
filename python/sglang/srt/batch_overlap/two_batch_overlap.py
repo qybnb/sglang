@@ -705,6 +705,7 @@ class TboForwardBatchPreparer:
             "forward_mode",
             "is_extend_in_batch",
             "all_extend_in_batch",
+            "global_prefill_cp_active",
             "return_logprob",
             "can_run_dp_cuda_graph",
             "can_run_dp_breakable_cuda_graph",

@@ -113,6 +113,11 @@ class ZigzagCPStrategy(ContextParallelStrategy):
 
         extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
         if extend_lens is None:
+            # ScheduleBatch carries the same unpadded values under
+            # ``extend_lens``. Accept both so the scheduler can evaluate the
+            # real batch before padding or idle-batch fabrication.
+            extend_lens = getattr(forward_batch, "extend_lens", None)
+        if extend_lens is None:
             extend_lens = [num_tokens]
         else:
             extend_lens = [int(length) for length in extend_lens]

@@ -388,6 +388,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     is_extend_in_batch: bool = False
     # Mirrors ScheduleBatch.all_extend_in_batch; kept for downstream forks.
     all_extend_in_batch: bool = False
+    # Synchronized Kimi-K3 PCP decision for the current global EP round.
+    # None keeps the standard per-local-batch CP policy.
+    global_prefill_cp_active: Optional[bool] = None
     can_run_dp_cuda_graph: bool = False
     can_run_dp_breakable_cuda_graph: bool = False
     global_forward_mode: Optional[ForwardMode] = None
@@ -700,6 +703,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             return_logprob=batch.return_logprob,
             is_extend_in_batch=batch.is_extend_in_batch,
             all_extend_in_batch=batch.all_extend_in_batch,
+            global_prefill_cp_active=batch.global_prefill_cp_active,
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             can_run_dp_breakable_cuda_graph=batch.can_run_dp_breakable_cuda_graph,
             global_forward_mode=batch.global_forward_mode,
@@ -1149,7 +1153,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # pad to attn_cp_size; CP off pads nothing (extra padding breaks EAGLE/MTP draft
         # prefill with NaN draft logits, see #23269).
         # FIXME(kpham-sgl): revisit so draft prefill-extend tolerates padded dummy tokens.
-        cp_align_size = get_cp_padding_align_size()
+        cp_align_size = get_cp_padding_align_size(self)
         for i in range(sync_group_size):
             global_num_tokens[i] = ceil_align(global_num_tokens[i], cp_align_size)
 

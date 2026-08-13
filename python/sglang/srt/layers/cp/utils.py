@@ -48,12 +48,17 @@ def enable_cp_v2() -> bool:
     return bool(envs.SGLANG_ENABLE_CP_V2.get())
 
 
-def is_cp_v2_active(forward_batch, num_tokens: Optional[int] = None) -> bool:
-    """Return whether the current forward batch is running through CP-v2.
+def can_cp_v2_apply(forward_batch, num_tokens: Optional[int] = None) -> bool:
+    """Return whether the real local batch is structurally eligible for CP-v2.
 
     ``num_tokens`` lets callers planning padding evaluate the final token count
     before ``forward_batch.input_ids`` is resized. The eager path omits it and
-    evaluates the already-padded input, so both stages use the same policy.
+    evaluates the already-padded input.
+
+    This helper deliberately ignores ``global_prefill_cp_active``. The DP
+    scheduler uses it to compute the local candidate before reaching global
+    consensus, while :func:`is_cp_v2_active` consumes that consensus during
+    buffer planning and execution.
     """
     if not enable_cp_v2():
         return False
@@ -74,6 +79,36 @@ def is_cp_v2_active(forward_batch, num_tokens: Optional[int] = None) -> bool:
         num_tokens = len(input_ids)
 
     return strategy.can_apply(int(num_tokens), forward_batch)
+
+
+def is_cp_v2_active(forward_batch, num_tokens: Optional[int] = None) -> bool:
+    """Return whether this forward must execute through CP-v2.
+
+    Kimi-K3 with DP-attention synchronizes this decision before idle batches
+    are fabricated. Reuse the synchronized value in every later stage so an
+    idle rank cannot plan non-CP buffers and then switch to CP after its
+    ``IDLE`` batch is converted to a shadow ``EXTEND`` batch.
+    """
+    forced = getattr(forward_batch, "global_prefill_cp_active", None)
+    if forced is not None:
+        if not forced or not enable_cp_v2() or get_cp_strategy() is None:
+            return False
+
+        forward_mode = getattr(forward_batch, "forward_mode", None)
+        if forward_mode is None:
+            return False
+        if forward_mode.is_context_parallel_extend():
+            return not getattr(forward_mode, "is_mixed", lambda: False)()
+
+        # During DP buffer planning an idle rank has not yet been converted to
+        # the fabricated EXTEND batch that shadows active ranks. It must still
+        # reserve the CP-local buffer selected by the synchronized decision.
+        return bool(
+            getattr(forward_mode, "is_idle", lambda: False)()
+            and getattr(forward_batch, "is_extend_in_batch", False)
+        )
+
+    return can_cp_v2_apply(forward_batch, num_tokens=num_tokens)
 
 
 def prepare_cp_forward(forward_batch) -> None:
@@ -144,6 +179,7 @@ __all__ = [
     "ZigzagCPStrategy",
     "ZigzagContextParallelMetadata",
     "CP_V2_DEFAULT_MODEL_CLASSES",
+    "can_cp_v2_apply",
     "enable_cp_v2",
     "get_cp_strategy",
     "is_cp_v2_active",

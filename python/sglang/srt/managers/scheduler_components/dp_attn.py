@@ -19,13 +19,66 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.metrics_collector import DPCooperationInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils.common import require_mlp_tp_gather
+from sglang.srt.utils.common import ceil_align, require_mlp_tp_gather
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
 
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
+
+_KIMI_K3_GLOBAL_PREFILL_CP_ARCHS = frozenset(
+    {
+        "KimiK3ForConditionalGeneration",
+        "KimiLinearForCausalLM",
+    }
+)
+
+
+def _requires_global_prefill_cp_consensus(
+    server_args: ServerArgs, model_config: ModelConfig
+) -> bool:
+    """Whether this worker needs the conservative phase-1 PCP policy."""
+    if (
+        not envs.SGLANG_ENABLE_CP_V2.get()
+        or not server_args.enable_prefill_cp
+        or server_args.attn_cp_size <= 1
+    ):
+        return False
+
+    architectures = set(
+        getattr(model_config.hf_config, "architectures", None) or []
+    )
+    text_config = getattr(model_config, "hf_text_config", None)
+    architectures.update(getattr(text_config, "architectures", None) or [])
+    return bool(architectures & _KIMI_K3_GLOBAL_PREFILL_CP_ARCHS)
+
+
+def _local_prefill_cp_candidate(
+    local_batch: Optional[ScheduleBatch],
+    num_tokens: int,
+    attn_tp_size: int,
+) -> bool:
+    """Evaluate PCP from the real batch before DP padding fabricates idle work."""
+    if local_batch is None or num_tokens <= 0:
+        return False
+
+    from sglang.srt.layers.cp.utils import can_cp_v2_apply
+    from sglang.srt.layers.utils.cp_utils import get_cp_padding_align_size
+
+    planned_num_tokens = ceil_align(num_tokens, attn_tp_size)
+    planned_num_tokens = ceil_align(
+        planned_num_tokens, get_cp_padding_align_size()
+    )
+    return can_cp_v2_apply(local_batch, num_tokens=planned_num_tokens)
+
+
+def _global_prefill_cp_active(rank_info: torch.Tensor) -> bool:
+    """Require every real active rank in this EP round to be PCP eligible."""
+    active = rank_info[:, 0] > 0
+    if not bool(active.any().item()):
+        return False
+    return bool(rank_info[active, 7].min().item())
 
 
 @dataclass
@@ -41,6 +94,8 @@ class MLPSyncBatchInfo:
     local_can_run_tbo: bool
     local_forward_mode: int
     can_run_breakable_cuda_graph: bool
+    local_prefill_cp_candidate: bool
+    enforce_global_prefill_cp_consensus: bool
 
     # some gathered elements
     tp0_info: torch.Tensor = None
@@ -48,6 +103,7 @@ class MLPSyncBatchInfo:
     global_num_tokens_for_logprob: list[int] = None
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
+    global_prefill_cp_active: Optional[bool] = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
 
     def _get_local_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
@@ -60,6 +116,7 @@ class MLPSyncBatchInfo:
                 int(self.local_can_run_tbo),
                 self.local_forward_mode,
                 int(self.can_run_breakable_cuda_graph),
+                int(self.local_prefill_cp_candidate),
             ],
             device=device,
             dtype=dtype,
@@ -75,6 +132,7 @@ class MLPSyncBatchInfo:
                 1,  # local_can_run_tbo
                 ForwardMode.IDLE.value,  # local_forward_mode
                 0,  # can_run_breakable_cuda_graph
+                0,  # local_prefill_cp_candidate
             ],
             device=device,
             dtype=dtype,
@@ -83,7 +141,7 @@ class MLPSyncBatchInfo:
     def all_gather(self, device, group: torch.distributed.ProcessGroup):
         local_info_tensor = self._get_local_tensor(device=device)
         global_info_tensor = torch.empty(
-            (self.dp_size, self.tp_size * self.cp_size, 7),
+            (self.dp_size, self.tp_size * self.cp_size, 8),
             dtype=torch.int64,
             device=device,
         )
@@ -99,7 +157,9 @@ class MLPSyncBatchInfo:
             tp_active_ranks = get_tp_group().active_ranks
 
         # Set fallback values for inactive ranks
-        tp_info = global_info_tensor.view(self.dp_size * self.tp_size * self.cp_size, 7)
+        tp_info = global_info_tensor.view(
+            self.dp_size * self.tp_size * self.cp_size, 8
+        )
         tp_info[tp_active_ranks == 0] = self._get_fallback_tensor(device=device)
 
         tp0_info = global_info_tensor[:, 0, :]
@@ -111,6 +171,8 @@ class MLPSyncBatchInfo:
         self.can_cuda_graph = bool(tp0_info[:, 2].min().item())
         self.is_extend_in_batch = bool(tp0_info[:, 3].max().item())
         self.can_run_breakable_cuda_graph = bool(tp0_info[:, 6].min().item())
+        if self.enforce_global_prefill_cp_consensus:
+            self.global_prefill_cp_active = _global_prefill_cp_active(tp_info)
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(tp0_info[:, 5].tolist())
 
@@ -138,6 +200,7 @@ def _update_gather_batch(
     # Check forward mode for cuda graph
     batch.can_run_dp_cuda_graph = mlp_sync_info.can_cuda_graph
     batch.can_run_dp_breakable_cuda_graph = mlp_sync_info.can_run_breakable_cuda_graph
+    batch.global_prefill_cp_active = mlp_sync_info.global_prefill_cp_active
 
 
 def prepare_mlp_sync_batch_raw(
@@ -151,6 +214,7 @@ def prepare_mlp_sync_batch_raw(
     require_mlp_tp_gather: bool,
     disable_overlap_schedule: bool,
     offload_tags: set[str],
+    enforce_global_prefill_cp_consensus: bool = False,
 ):
     # Check if other DP workers have running batches
     if (
@@ -206,6 +270,11 @@ def prepare_mlp_sync_batch_raw(
         device = "cpu"
 
     local_can_run_tbo, local_forward_mode = tbo_preparer.prepare_all_gather(local_batch)
+    local_prefill_cp_candidate = (
+        _local_prefill_cp_candidate(local_batch, num_tokens, attn_tp_size)
+        if enforce_global_prefill_cp_consensus
+        else False
+    )
 
     mlp_sync_info = MLPSyncBatchInfo(
         dp_size=dp_size,
@@ -218,6 +287,13 @@ def prepare_mlp_sync_batch_raw(
         local_can_run_tbo=local_can_run_tbo,
         local_forward_mode=local_forward_mode,
         can_run_breakable_cuda_graph=can_run_breakable_cuda_graph,
+        local_prefill_cp_candidate=local_prefill_cp_candidate,
+        enforce_global_prefill_cp_consensus=enforce_global_prefill_cp_consensus,
+        global_prefill_cp_active=(
+            local_prefill_cp_candidate
+            if enforce_global_prefill_cp_consensus and num_tokens > 0
+            else (False if enforce_global_prefill_cp_consensus else None)
+        ),
     )
 
     if not skip_all_gather:
@@ -281,6 +357,11 @@ class SchedulerDPAttnAdapter:
             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
             offload_tags=self.offload_tags,
+            enforce_global_prefill_cp_consensus=(
+                _requires_global_prefill_cp_consensus(
+                    self.server_args, self.model_config
+                )
+            ),
         )
 
     def maybe_prepare_mlp_sync_batch(

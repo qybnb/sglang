@@ -152,7 +152,7 @@ def cal_padded_tokens(forward_batch: "ForwardBatch"):
     sync_group_size = len(global_num_tokens)
     attn_cp_size = get_parallel().attn_cp_size
     # Must match the CP padding in ForwardBatch.prepare_mlp_sync_batch.
-    cp_align_size = get_cp_padding_align_size()
+    cp_align_size = get_cp_padding_align_size(forward_batch)
     for i in range(sync_group_size):
         global_num_tokens[i] = ceil_align(global_num_tokens[i], cp_align_size)
     dp_padding_mode = DpPaddingMode.get_dp_padding_mode(

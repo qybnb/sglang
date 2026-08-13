@@ -24,6 +24,7 @@ from sglang.srt.layers.cp.base import (
     is_zigzag,
 )
 from sglang.srt.layers.cp.utils import (
+    can_cp_v2_apply,
     cp_split_before_forward,
     enable_cp_v2,
     is_cp_v2_active,
@@ -60,6 +61,14 @@ class _ExtendMode:
 
 class _MixedMode(_ExtendMode):
     def is_mixed(self):
+        return True
+
+
+class _IdleMode:
+    def is_context_parallel_extend(self):
+        return False
+
+    def is_idle(self):
         return True
 
 
@@ -440,6 +449,41 @@ class TestCPZigzagStrategy(CustomTestCase):
         ):
             self.assertFalse(is_cp_v2_active(batch))
             self.assertTrue(is_cp_v2_active(batch, num_tokens=16))
+
+    def test_cp_v2_global_decision_overrides_local_recomputation(self):
+        eligible_batch_forced_off = SimpleNamespace(
+            input_ids=torch.arange(8),
+            forward_mode=_ExtendMode(),
+            extend_seq_lens_cpu=[8],
+            global_prefill_cp_active=False,
+        )
+        idle_shadow_forced_on = SimpleNamespace(
+            input_ids=torch.empty(0, dtype=torch.int64),
+            forward_mode=_IdleMode(),
+            is_extend_in_batch=True,
+            global_prefill_cp_active=True,
+        )
+
+        with patch(
+            "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=True
+        ), get_parallel().override(attn_tp_size=1):
+            self.assertTrue(can_cp_v2_apply(eligible_batch_forced_off))
+            self.assertFalse(is_cp_v2_active(eligible_batch_forced_off))
+            self.assertTrue(is_cp_v2_active(idle_shadow_forced_on, num_tokens=8))
+
+    def test_cp_v2_scheduler_batch_uses_unpadded_extend_lens(self):
+        scheduler_batch = SimpleNamespace(
+            forward_mode=_ExtendMode(),
+            extend_lens=[7],
+            global_prefill_cp_active=None,
+        )
+
+        with patch(
+            "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=True
+        ), get_parallel().override(attn_tp_size=1):
+            # Padding the tensor to eight rows must not make a real seven-token
+            # request eligible for zigzag CP4.
+            self.assertFalse(can_cp_v2_apply(scheduler_batch, num_tokens=8))
 
     def test_cp_v2_rejects_mixed_and_unbalanced_ragged_batches(self):
         mixed_batch = SimpleNamespace(

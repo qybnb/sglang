@@ -79,16 +79,25 @@ def is_prefill_cp_in_seq_split():
     )
 
 
-def get_cp_padding_align_size() -> int:
+def get_cp_padding_align_size(forward_batch=None) -> int:
     """Token-count alignment for CP padding of global_num_tokens: 2 * cp_size
     for zigzag (in-seq-split) CP, otherwise cp_size (1 when CP is off, so the
     padding is a no-op; extra padding breaks EAGLE/MTP draft prefill, see
     #23269). Keep prepare_mlp_sync_batch and cal_padded_tokens consistent
     through this helper.
+
+    When Kimi-K3's phase-1 global decision is present, a disabled PCP round
+    must not retain CP-only padding. Static buffer sizing calls this without a
+    batch and therefore continues to reserve for the maximum CP alignment.
     """
     from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
 
     attn_cp_size = get_parallel().attn_cp_size
+    if (
+        forward_batch is not None
+        and getattr(forward_batch, "global_prefill_cp_active", None) is False
+    ):
+        return 1
     if is_prefill_cp_in_seq_split() or is_dsa_prefill_cp_in_seq_split():
         return attn_cp_size * 2
     return attn_cp_size
