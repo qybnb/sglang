@@ -101,6 +101,44 @@ CONTAINER_NAME=qwen0727 ./run_64p_4node_full_pcp_cluster.sh start a2a
 `docker exec`，代码路径、模型路径和日志路径均指容器内部路径。如果远端仓库路径
 不同，设置 `REMOTE_REPO_ROOT`；如果 SSH 用户不是 root，设置 `SSH_USER`。
 
+### 可迁移的一键入口
+
+`run_64p_4node_full_pcp_portable.sh` 复用上述总控逻辑，但将常用环境固化为一套
+可覆盖的默认值。当前默认集群为：
+
+```text
+rank 0/API: 192.168.25.209
+rank 1:     192.168.25.212
+rank 2:     192.168.25.216
+rank 3:     192.168.25.217
+container:  sglang-zkk-k3
+HTTP/DIST:  15000/15100
+```
+
+在 `192.168.25.209` 宿主机直接执行：
+
+```bash
+cd /home/q00886407/sgl/sglang-kimiK3
+./run_64p_4node_full_pcp_portable.sh config
+./run_64p_4node_full_pcp_portable.sh start a2a
+./run_64p_4node_full_pcp_portable.sh status
+./run_64p_4node_full_pcp_portable.sh stop
+```
+
+以后迁移到另外四台机器时，不修改源码，只覆盖节点列表；第一个地址固定作为
+rank 0、API 地址和总控执行节点：
+
+```bash
+NODE_IPS=10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4 \
+CONTAINER_NAME=sglang-zkk-k3 \
+NET_IFACE=enp196s0f0 \
+./run_64p_4node_full_pcp_portable.sh start a2a
+```
+
+如果模型或容器内工程路径不同，再分别覆盖 `MODEL_PATH` 和
+`REMOTE_REPO_ROOT`。`off`、`a2a`、`fla` 三种 profile 的模型参数仍由同一份
+底层脚本生成。
+
 ## 推荐的一键采集流程
 
 服务仍使用对应的 `run_16p_pd_layer12_pcp_*.sh` 启动。服务启动成功后，在 Router
