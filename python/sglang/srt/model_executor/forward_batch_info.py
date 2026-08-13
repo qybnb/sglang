@@ -391,6 +391,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Synchronized Kimi-K3 PCP decision for the current global EP round.
     # None keeps the standard per-local-batch CP policy.
     global_prefill_cp_active: Optional[bool] = None
+    # True for a shape-compatible speculative target pass executed only so an
+    # otherwise idle DP-attention rank joins the global collectives.  Keep this
+    # as a dataclass field (instead of a dynamic attribute): eager/graph batch
+    # loaders rebuild ForwardBatch with dataclasses.replace.
+    is_speculative_idle_participation: bool = False
     can_run_dp_cuda_graph: bool = False
     can_run_dp_breakable_cuda_graph: bool = False
     global_forward_mode: Optional[ForwardMode] = None

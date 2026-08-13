@@ -2871,9 +2871,7 @@ class AscendAttnBackend(AttentionBackend):
             if (
                 not self.graph_mode
                 and not self.use_fia
-                and not getattr(
-                    forward_batch, "dspark_idle_participation", False
-                )
+                and not forward_batch.is_speculative_idle_participation
             ):
                 # Ordinary Kimi-K3 decode uses _npu_paged_attention_mla when
                 # ASCEND_USE_FIA is disabled.  Running target verification
