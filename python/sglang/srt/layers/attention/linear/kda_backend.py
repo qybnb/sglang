@@ -29,16 +29,15 @@ from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.utils import is_cpu, is_cuda, is_npu
 from sglang.srt.utils.common import rank0_log
 
-# Ascend's public decode wrapper assigns an FP32 updated state into the BF16
-# cache without casting. Use its functional implementation and write back with
-# an explicit cast in forward_decode.
+# Ascend computes the convolution window in the weight dtype and assigns the
+# updated window back into the persistent cache, with PyTorch casting to the
+# cache dtype on assignment.
 if is_npu():
     from sglang.srt.hardware_backend.npu.kernels.causal_conv1d_verify import (
         causal_conv1d_linear_verify_npu,
     )
     from sgl_kernel_npu.mamba.causal_conv1d import (
         causal_conv1d_fn_npu,
-        torch_causal_conv1d_update_npu,
         causal_conv1d_update_npu,
     )
 
@@ -563,25 +562,20 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         conv_states = self._channel_first_conv_states(conv_states)
         if is_npu():
+            # K3 keeps the persistent convolution cache in BF16, while the
+            # Ascend wrapper performs the convolution in the weight dtype and
+            # casts the updated window back on assignment.  Pass the persistent
+            # pool itself: converting the whole pool with ``.to(float32)`` here
+            # creates a temporary tensor, so its in-place update is discarded
+            # and every decode step reuses the stale prefill window.
             qkv = causal_conv1d_update(
                 mixed_qkv,
-                conv_states.to(torch.float32),
+                conv_states,
                 layer.conv_weights,
                 layer.bias,
                 activation="silu",
                 conv_state_indices=cache_indices,
             )
-            # qkv, updated_conv_states = torch_causal_conv1d_update_npu(
-            #     mixed_qkv.unsqueeze(-1),
-            #     conv_states[cache_indices],
-            #     layer.conv_weights,
-            #     bias=layer.bias,
-            #     activation="silu",
-            # )
-            # conv_states.index_copy_(
-            #     0, cache_indices, updated_conv_states.to(conv_states.dtype)
-            # )
-            # qkv = qkv.squeeze(-1)
         else:
             qkv = causal_conv1d_update(
                 mixed_qkv,
