@@ -7,7 +7,10 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import sglang.srt.server_args as server_args_module
-from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
+from sglang.srt.arg_groups.speculative_hook import (
+    _supports_dspark_prefill_cp,
+    handle_speculative_decoding,
+)
 from sglang.srt.layers.cp.base import is_cp_enabled, is_interleave
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -1056,6 +1059,42 @@ class TestDecoupledSpecArgs(CustomTestCase):
             prepare_server_args(
                 ["--model-path", "dummy", "--decoupled-spec-role", "bogus"]
             )
+
+
+class TestDSparkPrefillCPArgs(unittest.TestCase):
+    @staticmethod
+    def _make_args(**overrides):
+        args = SimpleNamespace(
+            device="npu",
+            enable_prefill_cp=True,
+            get_model_config=lambda: SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    model_type="kimi_k3",
+                    architectures=["KimiK3ForConditionalGeneration"],
+                )
+            ),
+        )
+        for name, value in overrides.items():
+            setattr(args, name, value)
+        return args
+
+    def test_kimi_k3_npu_supports_prefill_only_cp(self):
+        self.assertTrue(_supports_dspark_prefill_cp(self._make_args()))
+
+    def test_cuda_target_remains_rejected(self):
+        self.assertFalse(
+            _supports_dspark_prefill_cp(self._make_args(device="cuda"))
+        )
+
+    def test_other_npu_target_remains_rejected(self):
+        args = self._make_args(
+            get_model_config=lambda: SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    model_type="qwen3", architectures=["Qwen3ForCausalLM"]
+                )
+            )
+        )
+        self.assertFalse(_supports_dspark_prefill_cp(args))
 
 
 class TestAdaptiveSpecArgs(CustomTestCase):

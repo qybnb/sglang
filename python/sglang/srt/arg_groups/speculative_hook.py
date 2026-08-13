@@ -252,6 +252,27 @@ def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
     return checkpoint_bundles_dspark_draft(server_args.get_model_config().hf_config)
 
 
+def _supports_dspark_prefill_cp(server_args: ServerArgs) -> bool:
+    """Whether the target has the state bridge required by DSpark + CP.
+
+    Kimi-K3 on NPU runs context parallelism only for target-model prefill.  Its
+    DSpark draft/decode path remains CP-off, while the eager runner gathers the
+    target auxiliary hidden states back to global token order before handing
+    them to the draft worker.  Keep the exception deliberately narrow so other
+    DSpark models continue to fail closed until they provide the same bridge.
+    """
+    if not (
+        server_args.device.startswith("npu")
+        and getattr(server_args, "enable_prefill_cp", False)
+    ):
+        return False
+
+    hf_config = server_args.get_model_config().hf_config
+    model_type = getattr(hf_config, "model_type", None)
+    architectures = getattr(hf_config, "architectures", None) or []
+    return model_type == "kimi_k3" or "KimiK3ForConditionalGeneration" in architectures
+
+
 def _handle_dspark(server_args: ServerArgs) -> None:
     if not (server_args.device.startswith("cuda") or server_args.device.startswith("npu")):
         raise ValueError("DSpark speculative decoding only supports CUDA and NPU device.")
@@ -265,9 +286,15 @@ def _handle_dspark(server_args: ServerArgs) -> None:
         #         f"(moe_a2a_backend='none'), got {server_args.moe_a2a_backend!r}."
         #     )
         if server_args.attn_cp_size > 1:
-            raise ValueError(
-                "DSpark with dp attention does not support context parallel "
-                f"(attn_cp_size={server_args.attn_cp_size})."
+            if not _supports_dspark_prefill_cp(server_args):
+                raise ValueError(
+                    "DSpark with dp attention does not support context parallel "
+                    f"(attn_cp_size={server_args.attn_cp_size}) for this target."
+                )
+            logger.info(
+                "Enabling Kimi-K3 NPU DSpark with prefill-only context parallel "
+                "(attn_cp_size=%d); draft/decode remains CP-off.",
+                server_args.attn_cp_size,
             )
         # if (
         #     server_args.speculative_moe_a2a_backend is not None
