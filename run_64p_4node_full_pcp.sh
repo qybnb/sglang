@@ -137,6 +137,14 @@ PAGE_SIZE="${PAGE_SIZE:-128}"
 CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-8192}"
 MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-65536}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-16}"
+DEEPEP_MODE="${DEEPEP_MODE:-normal}"
+case "${DEEPEP_MODE}" in
+    auto|normal|low_latency) ;;
+    *)
+        echo "DEEPEP_MODE must be auto, normal, or low_latency; got ${DEEPEP_MODE}." >&2
+        exit 2
+        ;;
+esac
 if (( ENABLE_PCP == 1 )); then
     MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.90}"
 else
@@ -201,7 +209,7 @@ SERVER_ARGS=(
     --mamba-ssm-dtype bfloat16
     --reasoning-parser kimi_k3
     --moe-a2a-backend deepep
-    --deepep-mode normal
+    --deepep-mode "${DEEPEP_MODE}"
     --disable-radix-cache
     --disable-cuda-graph
     --watchdog-timeout 9000
@@ -216,7 +224,7 @@ echo "  TP=${TP_SIZE}, DP=${DP_SIZE}, CP=${ACTIVE_CP_SIZE}, attention-TP=${ATTN_
 echo "  PCP=${ENABLE_PCP}, KDA=${KDA_CP_BACKEND}, MLA=${MLA_CP_BACKEND}"
 echo "  model=${MODEL_PATH}, checkpoint-layers=${CHECKPOINT_LAYERS} (used as-is)"
 echo "  dist=${DIST_INIT_ADDR}, interface=${NET_IFACE}"
-echo "  chunk=${CHUNKED_PREFILL_SIZE}, max-tokens=${MAX_TOTAL_TOKENS}, mem=${MEM_FRACTION_STATIC}"
+echo "  chunk=${CHUNKED_PREFILL_SIZE}, max-tokens=${MAX_TOTAL_TOKENS}, mem=${MEM_FRACTION_STATIC}, DeepEP=${DEEPEP_MODE}"
 echo "  run-tag=${RUN_TAG}, log=${LOG_FILE}"
 
 if [[ "${CONFIG_ONLY}" == "1" ]]; then

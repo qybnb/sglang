@@ -38,6 +38,7 @@ Four-node PCP portable profile:
   NET_IFACE=${NET_IFACE}
   PORT=${PORT}
   DIST_PORT=${DIST_PORT}
+  DEEPEP_MODE=${DEEPEP_MODE:-normal}
 EOF
     exit 0
 fi
