@@ -1,5 +1,4 @@
 import unittest
-from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import torch
@@ -8,7 +7,6 @@ from sglang.srt.layers.dp_attention import (
     broadcast_tensor_within_attention_dp_group,
 )
 from sglang.srt.layers.sampler import Sampler
-from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dspark_components.dspark_verify import AcceptOuts
 from sglang.srt.speculative.dspark_components.dspark_worker_v2 import DSparkWorkerV2
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -43,7 +41,7 @@ class TestAttentionDPGenerationSync(unittest.TestCase):
 
     def test_dspark_syncs_all_scheduler_visible_accept_state(self):
         worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
-        worker.server_args = SimpleNamespace(enable_dp_attention=True)
+        worker._prefill_cp_generation_sync_enabled = True
         accept = AcceptOuts(
             correct_len=torch.tensor([1]),
             bonus=torch.tensor([2]),
@@ -53,13 +51,10 @@ class TestAttentionDPGenerationSync(unittest.TestCase):
             out_tokens=torch.tensor([[6, 7]]),
         )
 
-        with (
-            get_parallel().override(attn_cp_size=4),
-            patch(
-                "sglang.srt.speculative.dspark_components.dspark_worker_v2."
-                "broadcast_tensor_within_attention_dp_group"
-            ) as sync,
-        ):
+        with patch(
+            "sglang.srt.speculative.dspark_components.dspark_worker_v2."
+            "broadcast_tensor_within_attention_dp_group"
+        ) as sync:
             sync.side_effect = lambda packed: packed.fill_(41)
             result = worker._sync_prefill_cp_accept(accept)
 

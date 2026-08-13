@@ -96,6 +96,22 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._draft_dp_context_enabled = (
             server_args.enable_dp_attention and not self._draft_is_moe
         )
+        self._prefill_cp_generation_sync_enabled = bool(
+            server_args.enable_dp_attention
+            and server_args.enable_prefill_cp
+            and server_args.attn_cp_size > 1
+        )
+        if (
+            self._prefill_cp_generation_sync_enabled
+            and get_parallel().attn_cp_rank == 0
+            and get_parallel().attn_tp_rank == 0
+        ):
+            logger.info(
+                "[KIMI_K3_DSPARK_CP_SYNC] enabled dp_rank=%s cp_size=%d "
+                "authority=(cp=0,attn_tp=0)",
+                self.dp_rank,
+                server_args.attn_cp_size,
+            )
         attn_tp_size = server_args.tp_size // max(server_args.dp_size, 1)
         if server_args.enable_dp_attention and self._draft_is_moe and attn_tp_size > 1:
             raise ValueError(
@@ -309,17 +325,13 @@ class DSparkWorkerV2(BaseSpecWorker):
         """Keep dSparK generation state identical on replicated CP schedulers."""
         if (
             tensor is not None
-            and self.server_args.enable_dp_attention
-            and get_parallel().attn_cp_size > 1
+            and self._prefill_cp_generation_sync_enabled
         ):
             broadcast_tensor_within_attention_dp_group(tensor)
         return tensor
 
     def _sync_prefill_cp_accept(self, accept: AcceptOuts) -> AcceptOuts:
-        if not (
-            self.server_args.enable_dp_attention
-            and get_parallel().attn_cp_size > 1
-        ):
+        if not self._prefill_cp_generation_sync_enabled:
             return accept
         values = (
             accept.correct_len,
