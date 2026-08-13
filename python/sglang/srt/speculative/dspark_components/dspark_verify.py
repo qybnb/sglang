@@ -200,6 +200,12 @@ class TargetVerifyExecutor:
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
         )
+        # DP-attention idle ranks execute a shape-compatible target pass so
+        # every rank enters the same collectives as the rank serving a real
+        # request.  Preserve that fact after prepare_for_verify changes the
+        # forward mode to TARGET_VERIFY: attention backends must not interpret
+        # the dummy cache locations/block table as a real speculative request.
+        verify_forward_batch.dspark_idle_participation = True
         self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,

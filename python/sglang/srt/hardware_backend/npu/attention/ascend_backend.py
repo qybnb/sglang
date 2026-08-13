@@ -2868,7 +2868,13 @@ class AscendAttnBackend(AttentionBackend):
                     self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                 )
 
-            if not self.graph_mode and not self.use_fia:
+            if (
+                not self.graph_mode
+                and not self.use_fia
+                and not getattr(
+                    forward_batch, "dspark_idle_participation", False
+                )
+            ):
                 # Ordinary Kimi-K3 decode uses _npu_paged_attention_mla when
                 # ASCEND_USE_FIA is disabled.  Running target verification
                 # through the FIA/TND path changes the attention kernel (and
