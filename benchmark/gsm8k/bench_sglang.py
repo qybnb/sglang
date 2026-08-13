@@ -17,6 +17,7 @@ from sglang.utils import download_and_cache_file, dump_state_text, read_jsonl
 
 INVALID = -9999999
 SPECULATIVE_META_KEYS = (
+    "dp_rank",
     "prompt_tokens",
     "completion_tokens",
     "spec_accept_rate",
