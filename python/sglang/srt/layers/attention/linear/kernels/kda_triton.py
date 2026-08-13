@@ -127,13 +127,16 @@ def kda_decode_torch_native(
     k = k.repeat_interleave(k_gqa_ratio, dim=1)
     q = q.repeat_interleave(q_gqa_ratio, dim=1)
 
-    state = state * gate_exp.unsqueeze(2)
-    value = v - torch.matmul(state, k.unsqueeze(-1)).squeeze(-1)
+    # K3's chunk-prefill kernel persists the recurrent matrix as [K, V].
+    # Keep decode in that layout: k^T @ state -> value and q^T @ state
+    # -> output.
+    state = state * gate_exp.unsqueeze(-1)
+    value = v - torch.matmul(k.unsqueeze(2), state).squeeze(2)
     value = value * beta.unsqueeze(-1)
-    state = state + value.unsqueeze(-1) * k.unsqueeze(2)
+    state = state + k.unsqueeze(-1) * value.unsqueeze(-2)
     state = state * valid_mask
 
-    out = torch.matmul(state, q.unsqueeze(-1)).squeeze(-1)
+    out = torch.matmul(q.unsqueeze(2), state).squeeze(2)
     initial_state_source.index_copy_(
         0, safe_cache_indices, state.to(initial_state_source.dtype)
     )
@@ -226,17 +229,13 @@ def kda_target_verify_torch_native(
         gate = torch.exp(gate).repeat_interleave(k_gqa_ratio, dim=1)
         beta = torch.sigmoid(b[:, step].float())
 
-        state = state * gate.unsqueeze(2)
+        state = state * gate.unsqueeze(-1)
         value = v[:, step].float()
-        value = value - torch.matmul(
-            state, k_step.unsqueeze(-1)
-        ).squeeze(-1)
+        value = value - torch.matmul(k_step.unsqueeze(2), state).squeeze(2)
         value = value * beta.unsqueeze(-1)
-        state = state + value.unsqueeze(-1) * k_step.unsqueeze(2)
+        state = state + k_step.unsqueeze(-1) * value.unsqueeze(-2)
 
-        output = torch.matmul(
-            state, q_step.unsqueeze(-1)
-        ).squeeze(-1)
+        output = torch.matmul(q_step.unsqueeze(2), state).squeeze(2)
         outputs.append(output.to(v.dtype).unsqueeze(1))
         intermediate_states_buffer[:, step].index_copy_(
             0,
@@ -331,11 +330,11 @@ def kda_extend_torch_native(
                 qt = qt.repeat_interleave(gqa_ratio, dim=0)
                 ge = ge.repeat_interleave(gqa_ratio, dim=0)
 
-            state = state * ge.unsqueeze(1)
-            v_upd = vt - (state @ kt.unsqueeze(-1)).squeeze(-1)
+            state = state * ge.unsqueeze(-1)
+            v_upd = vt - (kt.unsqueeze(1) @ state).squeeze(1)
             v_upd = v_upd * bt.unsqueeze(-1)
-            state = state + v_upd.unsqueeze(-1) * kt.unsqueeze(1)
-            ot = (state @ qt.unsqueeze(-1)).squeeze(-1)
+            state = state + kt.unsqueeze(-1) * v_upd.unsqueeze(1)
+            ot = (qt.unsqueeze(1) @ state).squeeze(1)
             out[0, t] = ot.to(out.dtype)
 
         if idx >= 0:
