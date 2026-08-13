@@ -145,10 +145,26 @@ case "${DEEPEP_MODE}" in
         exit 2
         ;;
 esac
+DISABLE_CUDA_GRAPH="${DISABLE_CUDA_GRAPH:-1}"
+case "${DISABLE_CUDA_GRAPH}" in
+    0|1) ;;
+    *)
+        echo "DISABLE_CUDA_GRAPH must be 0 or 1; got ${DISABLE_CUDA_GRAPH}." >&2
+        exit 2
+        ;;
+esac
+CUDA_GRAPH_BS="${CUDA_GRAPH_BS:-1 4 16}"
 if (( ENABLE_PCP == 1 )); then
     MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.90}"
 else
     MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.78}"
+fi
+
+if [[ "${DISABLE_CUDA_GRAPH}" == "1" ]]; then
+    CUDA_GRAPH_ARGS=(--disable-cuda-graph)
+else
+    read -r -a CUDA_GRAPH_BS_ARRAY <<< "${CUDA_GRAPH_BS}"
+    CUDA_GRAPH_ARGS=(--cuda-graph-bs "${CUDA_GRAPH_BS_ARRAY[@]}")
 fi
 RUN_TAG="${RUN_TAG:-full_4node_${PROFILE}_cp${ACTIVE_CP_SIZE}}"
 LOG_DIR="${LOG_DIR:-${REPO_ROOT}/logs/kimi_k3_4node_full}"
@@ -211,7 +227,7 @@ SERVER_ARGS=(
     --moe-a2a-backend deepep
     --deepep-mode "${DEEPEP_MODE}"
     --disable-radix-cache
-    --disable-cuda-graph
+    "${CUDA_GRAPH_ARGS[@]}"
     --watchdog-timeout 9000
     --host "${HOST}"
     --port "${PORT}"
@@ -225,6 +241,7 @@ echo "  PCP=${ENABLE_PCP}, KDA=${KDA_CP_BACKEND}, MLA=${MLA_CP_BACKEND}"
 echo "  model=${MODEL_PATH}, checkpoint-layers=${CHECKPOINT_LAYERS} (used as-is)"
 echo "  dist=${DIST_INIT_ADDR}, interface=${NET_IFACE}"
 echo "  chunk=${CHUNKED_PREFILL_SIZE}, max-tokens=${MAX_TOTAL_TOKENS}, mem=${MEM_FRACTION_STATIC}, DeepEP=${DEEPEP_MODE}"
+echo "  cuda-graph-disabled=${DISABLE_CUDA_GRAPH}, cuda-graph-bs=${CUDA_GRAPH_BS}"
 echo "  run-tag=${RUN_TAG}, log=${LOG_FILE}"
 
 if [[ "${CONFIG_ONLY}" == "1" ]]; then

@@ -38,19 +38,27 @@ fi
 
 CONTROL_HOST="${CONTROL_HOST:-${NODE_IP_ARRAY[0]}}"
 LOCAL_ADDRESSES=" $(hostname -I 2>/dev/null || true) "
-if [[ "${LOCAL_ADDRESSES}" != *" ${CONTROL_HOST} "* ]]; then
+if [[ "${FORCE_SSH_ALL:-0}" != "1" && "${LOCAL_ADDRESSES}" != *" ${CONTROL_HOST} "* ]]; then
     echo "Run this controller on ${CONTROL_HOST}; local addresses:${LOCAL_ADDRESSES}" >&2
     exit 2
 fi
 
 SSH_USER="${SSH_USER:-root}"
 SSH_CONNECT_TIMEOUT="${SSH_CONNECT_TIMEOUT:-10}"
+SSH_BIN="${SSH_BIN:-ssh}"
+FORCE_SSH_ALL="${FORCE_SSH_ALL:-0}"
 CONTAINER_NAME="${CONTAINER_NAME:-}"
 SSH_OPTS=(
     -o BatchMode=yes
     -o ConnectTimeout="${SSH_CONNECT_TIMEOUT}"
     -o StrictHostKeyChecking=accept-new
 )
+if [[ -n "${SSH_IDENTITY_FILE:-}" ]]; then
+    SSH_OPTS+=(
+        -i "${SSH_IDENTITY_FILE}"
+        -o IdentitiesOnly=yes
+    )
+fi
 REMOTE_LOG_DIR="${REMOTE_LOG_DIR:-${REMOTE_REPO_ROOT}/logs/kimi_k3_4node_full/control}"
 
 remote_shell() {
@@ -61,11 +69,11 @@ remote_shell() {
         printf -v command '%q ' \
             docker exec "${CONTAINER_NAME}" bash -c "${command}"
     fi
-    if [[ "${host}" == "${CONTROL_HOST}" ]]; then
+    if [[ "${host}" == "${CONTROL_HOST}" && "${FORCE_SSH_ALL}" != "1" ]]; then
         bash -c "${command}"
     else
         printf '%s\n' "${command}" | \
-            ssh "${SSH_OPTS[@]}" "${SSH_USER}@${host}" bash -s
+            "${SSH_BIN}" "${SSH_OPTS[@]}" "${SSH_USER}@${host}" bash -s
     fi
 }
 
@@ -152,6 +160,7 @@ for var_name in \
     TP_SIZE DP_SIZE CP_SIZE DIST_PORT DIST_INIT_ADDR PORT PAGE_SIZE \
     CHUNKED_PREFILL_SIZE MAX_TOTAL_TOKENS MAX_RUNNING_REQUESTS \
     MEM_FRACTION_STATIC HCCL_BUFFSIZE DEEPEP_MODE \
+    DISABLE_CUDA_GRAPH CUDA_GRAPH_BS \
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK \
     DEEPEP_NORMAL_LONG_SEQ_ROUND DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS; do
     if [[ -v "${var_name}" ]]; then
