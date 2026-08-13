@@ -33,6 +33,17 @@ def get_few_shot_examples(lines, k):
     return ret
 
 
+def get_evaluation_examples(lines, num_shots, num_questions):
+    """Return held-out examples, excluding the demonstrations from scoring."""
+    if num_shots < 0:
+        raise ValueError(f"num_shots must be non-negative, got {num_shots}")
+    if num_questions < 0:
+        raise ValueError(
+            f"num_questions must be non-negative, got {num_questions}"
+        )
+    return lines[num_shots : num_shots + num_questions]
+
+
 def get_answer_value(answer_str):
     answer_str = answer_str.replace(",", "")
     numbers = re.findall(r"\d+", answer_str)
@@ -78,11 +89,14 @@ def main(args):
     num_questions = args.num_questions
     num_shots = args.num_shots
     few_shot_examples = get_few_shot_examples(lines, num_shots)
+    evaluation_lines = get_evaluation_examples(lines, num_shots, num_questions)
 
     questions = []
     labels = []
-    for i in range(len(lines[:num_questions])):
-        raw_question = few_shot_examples + get_one_example(lines, i, False)
+    for i, example in enumerate(evaluation_lines):
+        raw_question = few_shot_examples + get_one_example(
+            evaluation_lines, i, False
+        )
         if tokenizer is not None:
             messages = [{"role": "user", "content": raw_question}]
             raw_question = tokenizer.apply_chat_template(
@@ -92,7 +106,7 @@ def main(args):
                 enable_thinking=True,
             )
         questions.append(raw_question)
-        labels.append(get_answer_value(lines[i]["answer"]))
+        labels.append(get_answer_value(example["answer"]))
     assert all(l != INVALID for l in labels)
     arguments = [{"question": q} for q in questions]
 
@@ -162,10 +176,12 @@ def main(args):
             "num_gpus": 1,
             "latency": round(latency, 3),
             "accuracy": round(acc, 3),
-            "num_requests": args.num_questions,
+            "num_requests": len(evaluation_lines),
             "other": {
-                "num_questions": args.num_questions,
+                "num_questions": len(evaluation_lines),
                 "parallel": args.parallel,
+                "num_shots": num_shots,
+                "evaluation_start_index": num_shots,
             },
         }
         fout.write(json.dumps(value) + "\n")
