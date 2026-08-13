@@ -3,7 +3,9 @@ import tempfile
 import unittest
 
 from benchmark.gsm8k.bench_sglang import (
+    collect_state_outputs,
     collect_speculative_metrics,
+    dump_gsm8k_raw_result,
     get_evaluation_examples,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -94,6 +96,43 @@ class TestGSM8KBenchmarkSelection(unittest.TestCase):
 
         self.assertTrue(row["correct"])
         self.assertEqual(row["meta_info"]["spec_verify_ct"], 3)
+
+    def test_failed_request_is_retained_in_raw_artifact(self):
+        class FailedState:
+            def __getitem__(self, name):
+                raise KeyError(name)
+
+            def get_meta_info(self, name):
+                raise KeyError(name)
+
+            def error(self):
+                return "connection refused"
+
+            def text(self):
+                return "question"
+
+        state = FailedState()
+        answers, errors = collect_state_outputs([state])
+        per_request, summary = collect_speculative_metrics([state])
+
+        self.assertEqual(answers, [""])
+        self.assertEqual(errors, ["connection refused"])
+        self.assertEqual(summary["requests_with_spec_verify"], 0)
+        with tempfile.NamedTemporaryFile(mode="r+", suffix=".jsonl") as output:
+            dump_gsm8k_raw_result(
+                output.name,
+                [state],
+                answers,
+                [-9999999],
+                [42],
+                per_request,
+                errors,
+            )
+            output.seek(0)
+            row = json.loads(output.read())
+
+        self.assertFalse(row["correct"])
+        self.assertEqual(row["error"], "connection refused")
 
 
 if __name__ == "__main__":

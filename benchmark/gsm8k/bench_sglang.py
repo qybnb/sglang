@@ -11,7 +11,6 @@ from datasets import load_dataset
 from sglang.lang.api import set_default_backend
 from sglang.test.test_utils import (
     add_common_sglang_args_and_parse,
-    dump_bench_raw_result,
     select_sglang_backend,
 )
 from sglang.utils import download_and_cache_file, dump_state_text, read_jsonl
@@ -57,7 +56,13 @@ def get_evaluation_examples(lines, num_shots, num_questions):
 def collect_speculative_metrics(states):
     per_request = []
     for state in states:
-        meta_info = state.get_meta_info("answer") or {}
+        try:
+            meta_info = state.get_meta_info("answer") or {}
+        except Exception:
+            # A transport/server failure may leave no generated variable.  It
+            # must still be represented in the raw artifact instead of making
+            # the entire benchmark fail while summarizing metadata.
+            meta_info = {}
         per_request.append(
             {key: meta_info[key] for key in SPECULATIVE_META_KEYS if key in meta_info}
         )
@@ -84,6 +89,61 @@ def collect_speculative_metrics(states):
         ),
     }
     return per_request, summary
+
+
+def collect_state_outputs(states):
+    """Extract completed outputs while retaining failed request diagnostics."""
+    answers = []
+    errors = []
+    for state in states:
+        try:
+            answers.append(state["answer"])
+            errors.append(None)
+        except Exception as exc:
+            answers.append("")
+            try:
+                state_error = state.error()
+            except Exception:
+                state_error = None
+            errors.append(str(state_error or exc))
+    return answers, errors
+
+
+def dump_gsm8k_raw_result(
+    path, states, answers, preds, labels, per_request_spec_metrics, errors
+):
+    """Write one row per requested question, including failed requests."""
+    if not path:
+        return
+
+    rows = []
+    for i, state in enumerate(states):
+        try:
+            full_text = state.text()
+        except Exception:
+            full_text = ""
+        answer = answers[i]
+        prompt = (
+            full_text.removesuffix(answer)
+            if answer and full_text.endswith(answer)
+            else full_text
+        )
+        rows.append(
+            {
+                "prompt_id": i,
+                "prompt": prompt,
+                "output": answer,
+                "label": labels[i],
+                "prediction": preds[i],
+                "correct": bool(errors[i] is None and preds[i] == labels[i]),
+                "error": errors[i],
+                "meta_info": per_request_spec_metrics[i],
+            }
+        )
+
+    print(f"GSM8K raw results saved to {path}")
+    with open(path, "w") as fout:
+        fout.write("\n".join(json.dumps(row) for row in rows))
 
 
 def get_answer_value(answer_str):
@@ -182,26 +242,27 @@ def main(args):
     )
     latency = time.perf_counter() - tic
 
-    preds = []
-    for i in range(len(states)):
-        preds.append(get_answer_value(states[i]["answer"]))
+    answers, errors = collect_state_outputs(states)
+    preds = [get_answer_value(answer) for answer in answers]
 
     # Compute accuracy
     acc = np.mean(np.array(preds) == np.array(labels))
     invalid = np.mean(np.array(preds) == INVALID)
 
     # Compute speed
+    per_request_spec_metrics, spec_summary = collect_speculative_metrics(states)
     num_output_tokens = sum(
-        s.get_meta_info("answer")["completion_tokens"] for s in states
+        row.get("completion_tokens", 0) for row in per_request_spec_metrics
     )
     output_throughput = num_output_tokens / latency
-    per_request_spec_metrics, spec_summary = collect_speculative_metrics(states)
+    num_failed_requests = sum(error is not None for error in errors)
 
     # Print results
     print(f"Accuracy: {acc:.3f}")
     print(f"Invalid: {invalid:.3f}")
     print(f"Latency: {latency:.3f} s")
     print(f"Output throughput: {output_throughput:.3f} token/s")
+    print(f"Failed requests: {num_failed_requests}/{len(states)}")
     print(
         "Speculative decode: "
         f"requests={spec_summary['requests_with_spec_verify']}/{len(states)}, "
@@ -212,14 +273,14 @@ def main(args):
 
     # Dump results
     dump_state_text(f"tmp_output_{args.backend}.txt", states)
-    dump_bench_raw_result(
-        path=args.raw_result_file,
-        states=states,
-        preds=preds,
-        labels=labels,
-        per_state_extra_fields=[
-            {"meta_info": metrics} for metrics in per_request_spec_metrics
-        ],
+    dump_gsm8k_raw_result(
+        args.raw_result_file,
+        states,
+        answers,
+        preds,
+        labels,
+        per_request_spec_metrics,
+        errors,
     )
 
     with open(args.result_file, "a") as fout:
@@ -235,6 +296,7 @@ def main(args):
                 "parallel": args.parallel,
                 "num_shots": num_shots,
                 "evaluation_start_index": num_shots,
+                "failed_requests": num_failed_requests,
                 "speculative_decode": spec_summary,
             },
         }

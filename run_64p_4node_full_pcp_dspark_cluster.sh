@@ -134,7 +134,9 @@ for rank in "${!NODE_IP_ARRAY[@]}"; do
         "test -x $(printf '%q' "${REMOTE_REPO_ROOT}/run_64p_4node_full_pcp_dspark.sh") && test -f $(printf '%q' "${MODEL_PATH}/config.json") && test -f $(printf '%q' "${DRAFT_MODEL_PATH}/config.json") && command -v setsid >/dev/null && mkdir -p $(printf '%q' "${REMOTE_LOG_DIR}")"
 
     set +e
-    current_status="$(remote_shell "${host}" "$(process_status_command)" 2>&1)"
+    # Keep SSH login banners on stderr.  Folding them into stdout makes a
+    # banner-only, no-match conflict probe look like a running service.
+    current_status="$(remote_shell "${host}" "$(process_status_command)")"
     status_code=$?
     set -e
     case "${status_code}" in
@@ -151,7 +153,7 @@ for rank in "${!NODE_IP_ARRAY[@]}"; do
     if [[ "${ALLOW_EXISTING_SGLANG_SERVICE:-0}" != "1" ]]; then
         set +e
         conflicts="$(remote_shell "${host}" \
-            "ps -eo pid=,args= | grep -E '[s]glang\\.launch_server|[r]un_64p_4node_full_pcp(\\.sh|_cluster\\.sh)' | head -8" 2>&1)"
+            "ps -eo pid=,args= | grep -E '[s]glang\\.launch_server|[r]un_64p_4node_full_pcp(\\.sh|_cluster\\.sh)' | head -8")"
         conflict_status=$?
         set -e
         if [[ "${conflict_status}" == "0" && -n "${conflicts}" ]]; then
