@@ -39,6 +39,7 @@ if is_npu():
     from sgl_kernel_npu.mamba.causal_conv1d import (
         causal_conv1d_fn_npu,
         causal_conv1d_update_npu,
+        torch_causal_conv1d_update_npu,
     )
 
     causal_conv1d_fn = causal_conv1d_fn_npu
@@ -562,20 +563,26 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         conv_states = self._channel_first_conv_states(conv_states)
         if is_npu():
-            # K3 keeps the persistent convolution cache in BF16, while the
-            # Ascend wrapper performs the convolution in the weight dtype and
-            # casts the updated window back on assignment.  Pass the persistent
-            # pool itself: converting the whole pool with ``.to(float32)`` here
-            # creates a temporary tensor, so its in-place update is discarded
-            # and every decode step reuses the stale prefill window.
-            qkv = causal_conv1d_update(
-                mixed_qkv,
-                conv_states,
+            # The Ascend wrapper computes the updated window in the FP32 weight
+            # dtype and writes it back with advanced indexing. K3 stores the
+            # persistent cache in BF16, so that assignment fails during graph
+            # capture. Converting the whole cache pool to FP32 avoids the dtype
+            # error but only updates a temporary tensor, leaving decode with a
+            # stale prefill window. Compute on the active rows, then explicitly
+            # cast and commit the updated window to the persistent cache.
+            assert isinstance(mixed_qkv, torch.Tensor)
+            active_conv_states = conv_states.index_select(0, cache_indices)
+            qkv, updated_conv_states = torch_causal_conv1d_update_npu(
+                mixed_qkv.unsqueeze(-1),
+                active_conv_states,
                 layer.conv_weights,
-                layer.bias,
+                bias=layer.bias,
                 activation="silu",
-                conv_state_indices=cache_indices,
             )
+            conv_states.index_copy_(
+                0, cache_indices, updated_conv_states.to(conv_states.dtype)
+            )
+            qkv = qkv.squeeze(-1)
         else:
             qkv = causal_conv1d_update(
                 mixed_qkv,
