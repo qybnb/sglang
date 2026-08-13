@@ -60,20 +60,23 @@ class TestAttentionDPGenerationSync(unittest.TestCase):
                 "broadcast_tensor_within_attention_dp_group"
             ) as sync,
         ):
+            sync.side_effect = lambda packed: packed.fill_(41)
             result = worker._sync_prefill_cp_accept(accept)
 
         self.assertIs(result, accept)
-        self.assertEqual(
-            sync.call_args_list,
-            [
-                call(accept.correct_len),
-                call(accept.bonus),
-                call(accept.cap_trim_lens),
-                call(accept.commit_lens),
-                call(accept.new_seq_lens),
-                call(accept.out_tokens),
-            ],
-        )
+        sync.assert_called_once()
+        packed = sync.call_args.args[0]
+        self.assertEqual(packed.dtype, torch.int64)
+        self.assertEqual(packed.numel(), 7)
+        for value in (
+            accept.correct_len,
+            accept.bonus,
+            accept.cap_trim_lens,
+            accept.commit_lens,
+            accept.new_seq_lens,
+            accept.out_tokens,
+        ):
+            self.assertTrue(torch.equal(value, torch.full_like(value, 41)))
 
     def test_cp0_seeds_tp_row_then_cp_columns(self):
         tensor = torch.tensor([17], dtype=torch.int64)

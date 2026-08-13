@@ -321,15 +321,23 @@ class DSparkWorkerV2(BaseSpecWorker):
             and get_parallel().attn_cp_size > 1
         ):
             return accept
-        for value in (
+        values = (
             accept.correct_len,
             accept.bonus,
             accept.cap_trim_lens,
             accept.commit_lens,
             accept.new_seq_lens,
             accept.out_tokens,
-        ):
-            broadcast_tensor_within_attention_dp_group(value)
+        )
+        # All fields are integral and tiny.  Coalescing them avoids six pairs
+        # of attention-TP/CP collectives in every speculative decode step.
+        packed = torch.cat([value.reshape(-1).to(torch.int64) for value in values])
+        broadcast_tensor_within_attention_dp_group(packed)
+        offset = 0
+        for value in values:
+            end = offset + value.numel()
+            value.copy_(packed[offset:end].view_as(value).to(value.dtype))
+            offset = end
         return accept
 
     def alloc_memory_pool(
