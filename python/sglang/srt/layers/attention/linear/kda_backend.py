@@ -571,7 +571,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # stale prefill window. Compute on the active rows, then explicitly
             # cast and commit the updated window to the persistent cache.
             assert isinstance(mixed_qkv, torch.Tensor)
-            active_conv_states = conv_states.index_select(0, cache_indices)
+            # Slot 0 is reserved by MambaSlotAllocator as the dummy write target
+            # for padded rows. Eager attention-TP padding uses -1 while Ascend
+            # graph replay already maps padding to 0, so normalize both forms
+            # before the ordinary PyTorch gather/scatter operations.
+            safe_cache_indices = cache_indices.clamp_min(0).to(torch.int64)
+            active_conv_states = conv_states.index_select(0, safe_cache_indices)
             qkv, updated_conv_states = torch_causal_conv1d_update_npu(
                 mixed_qkv.unsqueeze(-1),
                 active_conv_states,
@@ -580,7 +585,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 activation="silu",
             )
             conv_states.index_copy_(
-                0, cache_indices, updated_conv_states.to(conv_states.dtype)
+                0, safe_cache_indices, updated_conv_states.to(conv_states.dtype)
             )
             qkv = qkv.squeeze(-1)
         else:
