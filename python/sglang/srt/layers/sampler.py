@@ -7,6 +7,8 @@ from torch import nn
 
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.dp_attention import (
+    broadcast_tensor_within_attention_dp_group,
+    get_attention_cp_size,
     get_attention_tp_group,
     is_dp_attention_enabled,
 )
@@ -379,6 +381,17 @@ class Sampler(nn.Module):
     def _sync_token_ids_across_tp(
         self, batch_next_token_ids: torch.Tensor, sampling_info: SamplingBatchInfo
     ):
+        if is_dp_attention_enabled() and get_attention_cp_size() > 1:
+            # Prefill CP creates multiple scheduler replicas for one logical
+            # DP request.  A one-token sampling difference is enough for one
+            # CP rank to finish while another enters decode, after which DP
+            # token planning (whose leader is CP0) no longer matches the live
+            # batch.  Always use the DP leader's token in this topology; this
+            # is a correctness collective, not the optional TP determinism
+            # safeguard below.
+            broadcast_tensor_within_attention_dp_group(batch_next_token_ids)
+            return
+
         if SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars:
             # For performance reasons, SGLang does not sync the final token IDs across TP ranks by default.
             # This saves one all-reduce, but the correctness of this approach depends on the determinism of several operators:

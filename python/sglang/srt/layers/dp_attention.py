@@ -352,6 +352,27 @@ def get_attention_cp_size() -> int:
     return get_attn_context_model_parallel_world_size()
 
 
+def broadcast_tensor_within_attention_dp_group(
+    tensor: torch.Tensor,
+) -> torch.Tensor:
+    """Broadcast a generation decision from the local attention-DP leader.
+
+    Attention ranks form a two-dimensional ``(CP, attention-TP)`` grid.  The
+    scheduler leader for one DP replica is ``(cp=0, attn_tp=0)``.  Seed the
+    CP0 attention-TP row first, then broadcast down every CP column.  This is
+    the tensor equivalent of RequestReceiver's work-request broadcast and
+    makes every scheduler replica consume exactly the same generation state.
+
+    The attention-TP broadcast intentionally only runs on CP0: every other CP
+    row has a different process group and no authoritative value to seed it.
+    """
+    if get_attention_tp_size() > 1 and get_attention_cp_rank() == 0:
+        get_attention_tp_group().broadcast(tensor, src=0)
+    if get_attention_cp_size() > 1:
+        get_attention_cp_group().broadcast(tensor, src=0)
+    return tensor
+
+
 def get_attention_dp_rank() -> int:
     assert _ATTN_DP_RANK is not None, "dp attention not initialized!"
     return _ATTN_DP_RANK
