@@ -17,6 +17,16 @@ from sglang.test.test_utils import (
 from sglang.utils import download_and_cache_file, dump_state_text, read_jsonl
 
 INVALID = -9999999
+SPECULATIVE_META_KEYS = (
+    "prompt_tokens",
+    "completion_tokens",
+    "spec_accept_rate",
+    "spec_accept_length",
+    "spec_num_correct_drafts",
+    "spec_num_proposed_drafts",
+    "spec_verify_ct",
+    "spec_correct_drafts_histogram",
+)
 
 
 def get_one_example(lines, i, include_answer):
@@ -42,6 +52,38 @@ def get_evaluation_examples(lines, num_shots, num_questions):
             f"num_questions must be non-negative, got {num_questions}"
         )
     return lines[num_shots : num_shots + num_questions]
+
+
+def collect_speculative_metrics(states):
+    per_request = []
+    for state in states:
+        meta_info = state.get_meta_info("answer") or {}
+        per_request.append(
+            {key: meta_info[key] for key in SPECULATIVE_META_KEYS if key in meta_info}
+        )
+
+    active = [row for row in per_request if row.get("spec_verify_ct", 0) > 0]
+    total_verify_ct = sum(row.get("spec_verify_ct", 0) for row in active)
+    total_correct_drafts = sum(
+        row.get("spec_num_correct_drafts", 0) for row in active
+    )
+    total_proposed_drafts = sum(
+        row.get("spec_num_proposed_drafts", 0) for row in active
+    )
+    total_completion_tokens = sum(row.get("completion_tokens", 0) for row in active)
+    summary = {
+        "requests_with_spec_verify": len(active),
+        "total_spec_verify_ct": total_verify_ct,
+        "spec_accept_rate": (
+            total_correct_drafts / total_proposed_drafts
+            if total_proposed_drafts > 0
+            else None
+        ),
+        "spec_accept_length": (
+            total_completion_tokens / total_verify_ct if total_verify_ct > 0 else None
+        ),
+    }
+    return per_request, summary
 
 
 def get_answer_value(answer_str):
@@ -153,12 +195,20 @@ def main(args):
         s.get_meta_info("answer")["completion_tokens"] for s in states
     )
     output_throughput = num_output_tokens / latency
+    per_request_spec_metrics, spec_summary = collect_speculative_metrics(states)
 
     # Print results
     print(f"Accuracy: {acc:.3f}")
     print(f"Invalid: {invalid:.3f}")
     print(f"Latency: {latency:.3f} s")
     print(f"Output throughput: {output_throughput:.3f} token/s")
+    print(
+        "Speculative decode: "
+        f"requests={spec_summary['requests_with_spec_verify']}/{len(states)}, "
+        f"verify_ct={spec_summary['total_spec_verify_ct']}, "
+        f"accept_rate={spec_summary['spec_accept_rate']}, "
+        f"accept_length={spec_summary['spec_accept_length']}"
+    )
 
     # Dump results
     dump_state_text(f"tmp_output_{args.backend}.txt", states)
@@ -167,6 +217,9 @@ def main(args):
         states=states,
         preds=preds,
         labels=labels,
+        per_state_extra_fields=[
+            {"meta_info": metrics} for metrics in per_request_spec_metrics
+        ],
     )
 
     with open(args.result_file, "a") as fout:
@@ -182,6 +235,7 @@ def main(args):
                 "parallel": args.parallel,
                 "num_shots": num_shots,
                 "evaluation_start_index": num_shots,
+                "speculative_decode": spec_summary,
             },
         }
         fout.write(json.dumps(value) + "\n")

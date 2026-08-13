@@ -2223,6 +2223,7 @@ def dump_bench_raw_result(
     states,
     preds,
     labels,
+    per_state_extra_fields=None,
 ):
     if not path:
         return
@@ -2232,14 +2233,15 @@ def dump_bench_raw_result(
         state = states[i]
         output = state["answer"]
         prompt = _ensure_remove_suffix(state.text(), output)
-        rows.append(
-            dict(
-                prompt_id=i,
-                prompt=prompt,
-                output=output,
-                correct=bool(preds[i] == labels[i]),
-            )
+        row = dict(
+            prompt_id=i,
+            prompt=prompt,
+            output=output,
+            correct=bool(preds[i] == labels[i]),
         )
+        if per_state_extra_fields is not None:
+            row.update(per_state_extra_fields[i])
+        rows.append(row)
 
     print(f"BenchRawResultDumper save results to {path}")
     Path(path).write_text("\n".join(json.dumps(row) for row in rows))
