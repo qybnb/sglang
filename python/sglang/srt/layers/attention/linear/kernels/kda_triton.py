@@ -63,14 +63,21 @@ def kda_decode_torch_native(
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: Optional[torch.Tensor] = None,
     is_kda: bool = False,
+    lower_bound: Optional[float] = None,
 ) -> torch.Tensor:
-    """Torch-native reference for KDA decode.
+    """Graph-safe Torch reference for one-token-per-request KDA decode.
 
-    Reproduces the byte-identical logic of
-    ``fused_sigmoid_gating_delta_rule_update`` with IS_KDA=True, using pure
-    PyTorch operations.  Useful as a ground-truth oracle on Ascend NPU hardware
-    where the Triton kernel may have layout or precision issues.
+    Decode presents one token per request as ``[1, batch, heads, dim]``.  Keep
+    the recurrence batched so the Ascend graph never performs the device-to-host
+    copies caused by ``Tensor.item()``.  Slot 0 is the allocator's reserved
+    dummy row; padded graph entries are redirected there and masked to zero.
+
+    This also implements K3's bounded (safe) gate.  The older
+    ``sgl_kernel_npu`` recurrent kernel only implements the unbounded softplus
+    gate, while K3 checkpoints set ``gate_lower_bound``.
     """
+    del cu_seqlens, is_kda
+
     if scale is None:
         scale = k.shape[-1] ** -0.5
     orig_type = q.dtype
@@ -101,44 +108,35 @@ def kda_decode_torch_native(
     A_log = A_log.float().view(k_head_num, 1)
 
     x = a + dt_bias
-    softplus_x = torch.where(
-        x <= softplus_threshold,
-        torch.log1p(torch.exp(x.to(torch.float32))) / softplus_beta,
-        x,
-    )
-    gate = -torch.exp(A_log) * softplus_x
+    if lower_bound is None:
+        gate = -torch.exp(A_log) * F.softplus(
+            x, beta=softplus_beta, threshold=softplus_threshold
+        )
+    else:
+        gate = lower_bound * torch.sigmoid(torch.exp(A_log) * x)
     gate_exp = torch.exp(gate)
-
     beta = torch.sigmoid(b_flat)
 
-    out = torch.empty(B, HV, V_dim, device=q.device, dtype=q.dtype)
-    ssm_pool = initial_state_source
+    valid_cache = initial_state_indices >= 0
+    safe_cache_indices = initial_state_indices.clamp_min(0).to(torch.int64)
+    state = initial_state_source.index_select(0, safe_cache_indices).float()
+    valid_mask = valid_cache.view(B, 1, 1, 1)
+    state = state * valid_mask
 
-    for tok in range(B):
-        idx = initial_state_indices[tok].item()
-        if idx < 0:
-            out[tok] = 0.0
-            continue
+    gate_exp = gate_exp.repeat_interleave(k_gqa_ratio, dim=1)
+    k = k.repeat_interleave(k_gqa_ratio, dim=1)
+    q = q.repeat_interleave(q_gqa_ratio, dim=1)
 
-        state = ssm_pool[idx].float()
-        g_exp_tok = gate_exp[tok].repeat_interleave(k_gqa_ratio, dim=0)
-        beta_tok = beta[tok]
-        k_tok = k[tok].repeat_interleave(k_gqa_ratio, dim=0)
-        q_tok = q[tok].repeat_interleave(q_gqa_ratio, dim=0)
+    state = state * gate_exp.unsqueeze(2)
+    value = v - torch.matmul(state, k.unsqueeze(-1)).squeeze(-1)
+    value = value * beta.unsqueeze(-1)
+    state = state + value.unsqueeze(-1) * k.unsqueeze(2)
+    state = state * valid_mask
 
-        state = state * g_exp_tok.unsqueeze(1)
-
-        v_upd = v[tok] - (state @ k_tok.unsqueeze(-1)).squeeze(-1)
-
-        v_upd = v_upd * beta_tok.unsqueeze(-1)
-
-        state = state + v_upd.unsqueeze(-1) * k_tok.unsqueeze(1)
-
-        o_tok = (state @ q_tok.unsqueeze(-1)).squeeze(-1)
-        out[tok] = o_tok.to(q.dtype)
-
-        ssm_pool[idx] = state.to(ssm_pool.dtype)
-
+    out = torch.matmul(state, q.unsqueeze(-1)).squeeze(-1)
+    initial_state_source.index_copy_(
+        0, safe_cache_indices, state.to(initial_state_source.dtype)
+    )
     return out.unsqueeze(0).to(orig_type)
 
 
@@ -455,7 +453,11 @@ class TritonKDAKernel(LinearAttnKernelBase):
         _diag = _os.getenv("SGLANG_KDA_DEBUG", "0") == "1"
         import sys as _sys
 
-        if _KDA_USE_TORCH_NATIVE:
+        # The generic Triton recurrent kernel replaced the dedicated NPU path
+        # when bounded-gate support was added, but it is not precision-safe for
+        # K3's Ascend state layout.  Use the graph-safe batched recurrence on
+        # NPU; keep the Triton path on other accelerators.
+        if is_npu() or _KDA_USE_TORCH_NATIVE:
             if _diag:
                 s_norm = ssm_states[cache_indices[0]].float().norm().item() if cache_indices[0] >= 0 else -1
                 print(f"[KDA-torch decode] q_norm={q.float().norm().item():.2f} "
@@ -478,6 +480,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
                 use_qk_l2norm_in_kernel=True,
                 cu_seqlens=query_start_loc,
                 is_kda=True,
+                lower_bound=lower_bound,
             )
             if _diag and cache_indices[0] >= 0:
                 s_norm_after = ssm_states[cache_indices[0]].float().norm().item()
@@ -540,6 +543,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
                 use_qk_l2norm_in_kernel=True,
                 cu_seqlens=query_start_loc,
                 is_kda=True,
+                lower_bound=lower_bound,
             )
             t_f = out_triton.float()
             n_f = out_native.float()
