@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import torch
@@ -7,6 +8,9 @@ from sglang.srt.layers.dp_attention import (
     broadcast_tensor_within_attention_dp_group,
 )
 from sglang.srt.layers.sampler import Sampler
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.speculative.dspark_components.dspark_verify import AcceptOuts
+from sglang.srt.speculative.dspark_components.dspark_worker_v2 import DSparkWorkerV2
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -36,6 +40,40 @@ class TestAttentionDPGenerationSync(unittest.TestCase):
 
         sync.assert_called_once_with(token_ids)
         reduce.assert_not_called()
+
+    def test_dspark_syncs_all_scheduler_visible_accept_state(self):
+        worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
+        worker.server_args = SimpleNamespace(enable_dp_attention=True)
+        accept = AcceptOuts(
+            correct_len=torch.tensor([1]),
+            bonus=torch.tensor([2]),
+            cap_trim_lens=torch.tensor([3]),
+            commit_lens=torch.tensor([4]),
+            new_seq_lens=torch.tensor([5]),
+            out_tokens=torch.tensor([[6, 7]]),
+        )
+
+        with (
+            get_parallel().override(attn_cp_size=4),
+            patch(
+                "sglang.srt.speculative.dspark_components.dspark_worker_v2."
+                "broadcast_tensor_within_attention_dp_group"
+            ) as sync,
+        ):
+            result = worker._sync_prefill_cp_accept(accept)
+
+        self.assertIs(result, accept)
+        self.assertEqual(
+            sync.call_args_list,
+            [
+                call(accept.correct_len),
+                call(accept.bonus),
+                call(accept.cap_trim_lens),
+                call(accept.commit_lens),
+                call(accept.new_seq_lens),
+                call(accept.out_tokens),
+            ],
+        )
 
     def test_cp0_seeds_tp_row_then_cp_columns(self):
         tensor = torch.tensor([17], dtype=torch.int64)
