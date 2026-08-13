@@ -84,7 +84,12 @@ class TestKDATargetVerifyNPU(unittest.TestCase):
             outputs.append(
                 torch.matmul(q_step.unsqueeze(2), state).squeeze(2)
             )
-            expected_snapshots.append(state.clone())
+            # Sequential decode persists BF16 state after every token.  The
+            # next speculative verification step must start from that exact
+            # rounded state, not from an FP32 accumulator kept across steps.
+            persisted_state = state.to(dtype)
+            expected_snapshots.append(persisted_state)
+            state = persisted_state.float()
 
         expected = torch.stack(outputs, dim=1).reshape_as(actual)
         expected_snapshots = torch.stack(expected_snapshots, dim=1)

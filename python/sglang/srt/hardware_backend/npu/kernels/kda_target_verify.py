@@ -147,6 +147,14 @@ def _kda_target_verify_kernel(
             mask=(snapshot_idx >= 0) & mask_state,
         )
 
+        # Ordinary one-token KDA decode writes the updated recurrent state
+        # back to the persistent cache after every token.  The cache is BF16
+        # for Kimi-K3, so the next token observes the rounded value rather
+        # than this kernel's FP32 accumulator.  Target verification executes
+        # several speculative tokens in one program; reproduce that boundary
+        # here or later verified logits can diverge from sequential decode.
+        state = state.to(snapshot_ptr.dtype.element_ty).to(tl.float32)
+
 
 def kda_target_verify_npu(
     *,
