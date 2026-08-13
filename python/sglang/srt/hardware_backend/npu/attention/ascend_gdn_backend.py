@@ -176,6 +176,22 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         assert isinstance(mixed_qkv, torch.Tensor)
         seq_len = mixed_qkv.shape[0]
         is_target_verify = forward_batch.forward_mode.is_target_verify()
+        # An idle speculative DP rank (and the empty TBO child derived from
+        # it) owns no recurrent state rows.  It still runs padded transformer
+        # tokens to participate in the global MoE collectives.  Do not feed
+        # those tokens to causal-conv/KDA state kernels: slot 0 is not a dummy
+        # slot and mutating it would corrupt a live request.
+        if is_target_verify and not self.graph_mode and (
+            forward_batch.is_speculative_idle_participation
+            or forward_batch.num_token_non_padded_cpu == 0
+        ):
+            return mixed_qkv.new_zeros(
+                (
+                    mixed_qkv.shape[0],
+                    layer.num_v_heads,
+                    layer.head_v_dim,
+                )
+            )
         forward_metadata = self.forward_metadata
 
         query_start_loc = forward_metadata.query_start_loc

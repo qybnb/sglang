@@ -560,6 +560,35 @@ class AscendAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         self.forward_metadata = ForwardMetadata()
+        # TBO may split an idle speculative-participation batch into an empty
+        # child after the original verify metadata was planned.  The child
+        # still has to execute the padded transformer path so that it joins
+        # the global MoE collectives, but it has no request/KV rows.  Keep a
+        # valid empty attention plan instead of reducing seq_lens_cpu below.
+        # forward_mtp() turns this child into a zero attention contribution.
+        if (
+            forward_batch.seq_lens_cpu is None
+            or forward_batch.seq_lens_cpu.numel() == 0
+        ):
+            empty_seq_lens = (
+                forward_batch.seq_lens.int()
+                if forward_batch.seq_lens is not None
+                else torch.empty(0, dtype=torch.int32, device=self.device)
+            )
+            self.forward_metadata.block_tables = torch.empty(
+                (0, 0), dtype=torch.int32, device=self.device
+            )
+            if self.is_hybrid_swa:
+                self.forward_metadata.block_tables_swa = torch.empty(
+                    (0, 0), dtype=torch.int32, device=self.device
+                )
+            self.forward_metadata.seq_lens = empty_seq_lens
+            self.forward_metadata.seq_lens_cpu_int = torch.empty(
+                0, dtype=torch.int32
+            )
+            self.forward_metadata.seq_lens_cpu_list = []
+            self.graph_mode = False
+            return
         if forward_batch.forward_mode.is_target_verify():
             # Overlap scheduling can publish the CPU sequence length one step
             # ahead of the device tensor. FIA consumes seq_lens_cpu below, so
@@ -2716,6 +2745,18 @@ class AscendAttnBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ):
+        # DP-attention idle participation and an empty TBO child carry padded
+        # tokens only.  They must traverse the transformer/MoE collectives but
+        # must neither touch a real KV/state slot nor invoke an NPU attention
+        # kernel with zero request rows.  A zero attention contribution has
+        # exactly those semantics; the padded hidden states are discarded.
+        if not self.graph_mode and (
+            forward_batch.is_speculative_idle_participation
+            or forward_batch.num_token_non_padded_cpu == 0
+        ):
+            return q.new_zeros(
+                (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+            )
         if save_kv_cache:
             if self.use_mla:
                 k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
