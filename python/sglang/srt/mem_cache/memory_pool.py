@@ -494,12 +494,26 @@ class MambaPool:
 
             if speculative_num_draft_tokens is not None:
                 if _is_npu:
-                    temporal_state = temporal_state.transpose(-1, -2)
-                    temporal_state_shape = (
+                    npu_temporal_state_shape = (
                         *temporal_state_shape[:-2],
                         temporal_state_shape[-1],
                         temporal_state_shape[-2],
                     )
+                    if cache_params.is_kda:
+                        # KDA's FLA chunk kernel addresses each state head as
+                        # a flat row-major [K, V] matrix.  Reinterpret the
+                        # existing contiguous [V, K] allocation with that
+                        # shape; transpose() would produce a non-contiguous
+                        # view whose strides make target verify observe the
+                        # transpose of the state written by prefill.  Kimi-K3
+                        # has K == V, so the bad view evaded shape checks.
+                        temporal_state = temporal_state.view(
+                            *temporal_state.shape[:-3],
+                            *npu_temporal_state_shape,
+                        )
+                    else:
+                        temporal_state = temporal_state.transpose(-1, -2)
+                    temporal_state_shape = npu_temporal_state_shape
                 intermediate_conv_shapes = [
                     (shape[1], shape[0]) if cache_params.is_kda else shape
                     for shape in conv_state_shape

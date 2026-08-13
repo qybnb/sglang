@@ -47,12 +47,10 @@ def _kda_target_verify_kernel(
     offset_v = pid_v * BV + tl.arange(0, BV)
     mask_k = offset_k < K
     mask_v = offset_v < V
-    # Speculative KDA caches use the logical [K, V] layout.  The generic
-    # cache pool is born as [V, K] and transposed when the speculative
-    # scratch buffers are enabled (see MambaPool), so respecting the tensor
-    # strides here is essential even though Kimi-K3 happens to use K == V.
-    # Keeping the old [V, K] indexing silently transposed every recurrent
-    # state during target verify and corrupted all tokens after prefill.
+    # Speculative KDA caches use the logical [K, V] layout.  MambaPool
+    # reinterprets the original allocation as a contiguous [K, V] tensor so
+    # this agrees with the flat row-major addressing in the FLA prefill kernel.
+    # Keep the axes explicit because Kimi-K3's K == V would hide a transpose.
     mask_state = mask_k[:, None] & mask_v[None, :]
 
     q_ratio = H_V // H_Q
