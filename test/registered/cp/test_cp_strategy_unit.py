@@ -25,6 +25,7 @@ from sglang.srt.layers.cp.base import (
 )
 from sglang.srt.layers.cp.utils import (
     can_cp_v2_apply,
+    cp_gather_aux_hidden_states_after_forward,
     cp_split_before_forward,
     enable_cp_v2,
     is_cp_v2_active,
@@ -114,6 +115,35 @@ class _FakeFixedShapeGatherGroup:
 class TestCPStrategyUnit(CustomTestCase):
     def tearDown(self):
         init_cp_strategy(SimpleNamespace(enable_prefill_cp=False))
+
+    def test_cp_gathers_each_aux_hidden_stream_before_draft_consumes_it(self):
+        aux_hidden_states = [
+            torch.tensor([[1.0], [2.0]]),
+            torch.tensor([[11.0], [12.0]]),
+        ]
+        calls = []
+
+        def gather_hidden_states(hidden_states, forward_batch, stream):
+            calls.append((hidden_states, forward_batch, stream))
+            return hidden_states + 100
+
+        strategy = SimpleNamespace(gather_hidden_states=gather_hidden_states)
+        forward_batch = SimpleNamespace()
+        stream = object()
+        with patch(
+            "sglang.srt.layers.cp.utils.is_cp_v2_active", return_value=True
+        ), patch(
+            "sglang.srt.layers.cp.utils.get_cp_strategy", return_value=strategy
+        ):
+            gathered = cp_gather_aux_hidden_states_after_forward(
+                aux_hidden_states, forward_batch, stream
+            )
+
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(call[1] is forward_batch for call in calls))
+        self.assertTrue(all(call[2] is stream for call in calls))
+        torch.testing.assert_close(gathered[0], aux_hidden_states[0] + 100)
+        torch.testing.assert_close(gathered[1], aux_hidden_states[1] + 100)
 
     def test_ascend_prefill_cp_dispatches_to_mla(self):
         forward_mode = SimpleNamespace(

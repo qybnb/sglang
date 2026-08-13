@@ -160,6 +160,30 @@ def cp_gather_after_forward(x: Any, forward_batch, stream: Optional[Any] = None)
     return strategy.gather_hidden_states(x, forward_batch, stream)
 
 
+def cp_gather_aux_hidden_states_after_forward(
+    aux_hidden_states: Optional[list[Any]],
+    forward_batch,
+    stream: Optional[Any] = None,
+) -> Optional[list[Any]]:
+    """Restore captured per-layer hidden states to the full CP token order.
+
+    The CP model boundary gathers the final hidden state before logits.  Draft
+    models such as DSpark additionally consume intermediate target hidden
+    states, which leave the model in the same CP-local zigzag layout and must
+    undergo the identical inverse gather before they are written to draft KV.
+    """
+    if aux_hidden_states is None:
+        return None
+
+    assert is_cp_v2_active(forward_batch)
+    strategy = get_cp_strategy()
+    assert strategy is not None
+    return [
+        strategy.gather_hidden_states(hidden_states, forward_batch, stream)
+        for hidden_states in aux_hidden_states
+    ]
+
+
 def _to_int_list(values) -> Optional[list[int]]:
     if values is None:
         return None
@@ -184,6 +208,7 @@ __all__ = [
     "get_cp_strategy",
     "is_cp_v2_active",
     "cp_gather_after_forward",
+    "cp_gather_aux_hidden_states_after_forward",
     "cp_split_before_forward",
     "prepare_cp_forward",
 ]

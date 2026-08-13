@@ -26,6 +26,7 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
+    cp_gather_aux_hidden_states_after_forward,
     cp_split_before_forward,
     is_cp_v2_active,
     prepare_cp_forward,
@@ -371,10 +372,16 @@ class EagerRunner(BaseRunner):
                 if capture_aux_hidden_states:
                     hidden_states, aux_hidden_states = hidden_states
                 if model_runner.model.pp_group.is_last_rank:
+                    current_stream = get_current_device_stream_fast()
                     hidden_states = cp_gather_after_forward(
                         hidden_states,
                         forward_batch,
-                        get_current_device_stream_fast(),
+                        current_stream,
+                    )
+                    aux_hidden_states = cp_gather_aux_hidden_states_after_forward(
+                        aux_hidden_states,
+                        forward_batch,
+                        current_stream,
                     )
                     ret = model_runner.model.logits_processor(
                         forward_batch.input_ids,

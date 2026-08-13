@@ -1246,13 +1246,15 @@ class KimiLinearModel(nn.Module):
                 if _use_kimi_attn_tp_token_scatter():
                     attn_tp_size = get_parallel().attn_tp_size
                     expected_num_tokens = captured_hidden.shape[0] * attn_tp_size
-                    if expected_num_tokens != forward_batch.input_ids.shape[0]:
+                    model_local_num_tokens = positions.numel()
+                    if expected_num_tokens != model_local_num_tokens:
                         raise ValueError(
                             "DSpark aux hidden token mismatch before attention-TP "
                             f"allgather: local={captured_hidden.shape[0]}, "
                             f"attn_tp_size={attn_tp_size}, "
-                            f"expected_full={expected_num_tokens}, "
-                            f"forward_tokens={forward_batch.input_ids.shape[0]}"
+                            f"expected_model_local={expected_num_tokens}, "
+                            f"model_local_tokens={model_local_num_tokens}, "
+                            f"global_forward_tokens={forward_batch.input_ids.shape[0]}"
                         )
                     gathered_hidden = captured_hidden.new_empty(
                         (expected_num_tokens, *captured_hidden.shape[1:])
