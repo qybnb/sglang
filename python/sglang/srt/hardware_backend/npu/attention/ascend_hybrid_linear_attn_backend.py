@@ -311,9 +311,9 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
             move_intermediate_cache(
                 ssm_states,
                 intermediate_state_cache,
-                dst_indices_tensor,
+                mamba_track_indices,
                 src_indices_tensor,
-                last_steps,
+                mamba_steps_to_track,
             )
 
             if use_dspark_conv_snapshots:
