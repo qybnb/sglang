@@ -73,13 +73,13 @@ def get_batch_sizes_to_capture(
         mul_base *= 2
         num_tokens_per_bs = 1
 
-    if require_gathered_buffer(server_args) and not is_dp_local_cuda_graph_capture(
-        model_runner
-    ):
-        mul_base *= get_parallel().attn_tp_size
+    dp_local_capture = is_dp_local_cuda_graph_capture(model_runner)
+    if not dp_local_capture:
+        if require_gathered_buffer(server_args):
+            mul_base *= get_parallel().attn_tp_size
 
-    if mul_base % get_parallel().attn_cp_size != 0:
-        mul_base *= get_parallel().attn_cp_size
+        if mul_base % get_parallel().attn_cp_size != 0:
+            mul_base *= get_parallel().attn_cp_size
 
     # pad `num_max_requests` to avoid being filtered out
     num_max_requests = (num_max_requests + mul_base - 1) // mul_base * mul_base
