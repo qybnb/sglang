@@ -97,7 +97,7 @@ PAGE_SIZE="${PAGE_SIZE:-128}"
 # DeepEP windows above their configured max-BS requirements without retaining
 # the larger PP2-era buffers (prefill maxBs=64 needs about 462 MiB; decode
 # maxBs=16 needs substantially less).
-PREFILL_HCCL_BUFFSIZE="${PREFILL_HCCL_BUFFSIZE:-600}"
+PREFILL_HCCL_BUFFSIZE="${PREFILL_HCCL_BUFFSIZE:-550}"
 DECODE_HCCL_BUFFSIZE="${DECODE_HCCL_BUFFSIZE:-400}"
 PREFILL_DEEPEP_MAX_DISPATCH="${PREFILL_DEEPEP_MAX_DISPATCH:-64}"
 DECODE_DEEPEP_MAX_DISPATCH="${DECODE_DEEPEP_MAX_DISPATCH:-16}"
