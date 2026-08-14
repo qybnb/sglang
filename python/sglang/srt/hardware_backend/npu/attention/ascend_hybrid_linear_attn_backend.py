@@ -213,6 +213,11 @@ class AscendMamba2AttnBackend(AscendMambaAttnBackendBase):
 
 
 class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
+    # The wrapped Ascend full-attention backend adds the verify width while
+    # constructing metadata.  Expose the capability on the model runner's
+    # top-level hybrid backend, which is what DSpark sees.
+    target_verify_self_adds_seq_lens = True
+
     def __init__(
         self,
         full_attn_backend: AttentionBackend,

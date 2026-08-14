@@ -401,6 +401,12 @@ def _get_mla_cp_ring_source_layouts(forward_batch, cp_size, cp_rank):
 
 class AscendAttnBackend(AttentionBackend):
 
+    # init_forward_metadata() receives the unextended prefix lengths and adds
+    # speculative_num_draft_tokens for TARGET_VERIFY.  DSpark consults this
+    # marker before preparing the ForwardBatch so the verify width is not
+    # counted twice.
+    target_verify_self_adds_seq_lens = True
+
     def __init__(self, model_runner: ModelRunner, speculative_step_id: int = 0):
         super().__init__()
         self.forward_metadata = None

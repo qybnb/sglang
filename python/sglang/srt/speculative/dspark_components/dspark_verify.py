@@ -426,8 +426,15 @@ class TargetVerifyExecutor:
     def _verify_backend_self_adds_seq_lens(self) -> bool:
         if self._verify_backend_self_adds_seq_lens_cache is None:
             backend = self.target_worker.model_runner.attn_backend
-            self._verify_backend_self_adds_seq_lens_cache = hasattr(
-                backend, "make_forward_metadata_from_raw_verify"
+            # Some attention backends consume prefix lengths and add the
+            # target-verify width while building their metadata.  Do not also
+            # publish already-extended CPU lengths to those backends: that
+            # would turn prefix+T into prefix+2T.  Ascend uses this explicit
+            # capability marker; the raw-verify builder check preserves the
+            # existing DeepSeek-v4 behavior.
+            self._verify_backend_self_adds_seq_lens_cache = bool(
+                getattr(backend, "target_verify_self_adds_seq_lens", False)
+                or hasattr(backend, "make_forward_metadata_from_raw_verify")
             )
         return self._verify_backend_self_adds_seq_lens_cache
 
