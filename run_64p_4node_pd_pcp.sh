@@ -3,8 +3,8 @@
 # Full-model Kimi-K3 2P2D deployment on four 16-NPU nodes.
 #
 # Topology:
-#   192.168.25.209 / 192.168.25.212: Prefill, TP16 / PP2 / DP1 / CP4
-#   192.168.25.216 / 192.168.25.217: Decode,  TP16 / PP2 / DP1 / CP1
+#   192.168.25.209 / 192.168.25.212: Prefill, TP32 / PP1 / DP1 / CP4
+#   192.168.25.216 / 192.168.25.217: Decode,  TP32 / PP1 / DP1 / CP1
 #
 # Run inside the sglang-zkk-k3 container on every node:
 #   # 209
@@ -17,8 +17,9 @@
 #   # 217
 #   NODE_RANK=1 bash run_64p_4node_pd_pcp.sh decode
 #
-# The full 93-layer checkpoint needs PP2 on these machines. DSpark is therefore
-# deliberately not enabled here because its worker currently requires PP1.
+# Keep PP disabled so this profile validates PD+PCP without introducing a Kimi
+# pipeline-parallel weight-loading path. DSpark remains disabled by default so
+# the first validation changes only the P/D topology.
 
 set -euo pipefail
 
@@ -61,14 +62,13 @@ PREFILL_DIST_PORT="${PREFILL_DIST_PORT:-15001}"
 DECODE_DIST_PORT="${DECODE_DIST_PORT:-15002}"
 MF_STORE_PORT="${MF_STORE_PORT:-34670}"
 
-TP_SIZE="${TP_SIZE:-16}"
-PP_SIZE="${PP_SIZE:-2}"
+TP_SIZE="${TP_SIZE:-32}"
+PP_SIZE="${PP_SIZE:-1}"
 DP_SIZE="${DP_SIZE:-1}"
 PREFILL_CP_SIZE="${PREFILL_CP_SIZE:-4}"
 ENABLE_PCP="${ENABLE_PCP:-1}"
-PP_LAYER_PARTITION="${SGLANG_PP_LAYER_PARTITION:-48,45}"
-if [[ "${TP_SIZE}" != "16" || "${PP_SIZE}" != "2" || "${DP_SIZE}" != "1" ]]; then
-    echo "This full-model profile requires TP_SIZE=16, PP_SIZE=2, DP_SIZE=1." >&2
+if [[ "${TP_SIZE}" != "32" || "${PP_SIZE}" != "1" || "${DP_SIZE}" != "1" ]]; then
+    echo "This no-PP profile requires TP_SIZE=32, PP_SIZE=1, DP_SIZE=1." >&2
     exit 2
 fi
 case "${ENABLE_PCP}" in
@@ -174,7 +174,7 @@ export SGLANG_MAMBA_CONV_DTYPE="${SGLANG_MAMBA_CONV_DTYPE:-bfloat16}"
 export ASCEND_MF_STORE_URL="${ASCEND_MF_STORE_URL:-tcp://${PREFILL_RANK0_IP}:${MF_STORE_PORT}}"
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT="${SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT:-3600}"
 export SGLANG_DISAGGREGATION_WAITING_TIMEOUT="${SGLANG_DISAGGREGATION_WAITING_TIMEOUT:-3600}"
-export SGLANG_PP_LAYER_PARTITION="${PP_LAYER_PARTITION}"
+unset SGLANG_PP_LAYER_PARTITION
 
 find_iface_by_ip() {
     "${PYTHON_BIN}" - "$1" <<'PY'
@@ -307,7 +307,7 @@ export GLOO_SOCKET_IFNAME="${NET_IFACE}"
 
 ATTN_TP_SIZE=$((TP_SIZE / DP_SIZE / PREFILL_CP_SIZE))
 echo "Kimi-K3 PD ${ROLE}: rank=${NODE_RANK}/2 ip=${LOCAL_IP} iface=${NET_IFACE}"
-echo "  model=${MODEL_PATH}, TP=${TP_SIZE}, PP=${PP_SIZE}, DP=${DP_SIZE}, partition=${PP_LAYER_PARTITION}"
+echo "  model=${MODEL_PATH}, TP=${TP_SIZE}, PP=${PP_SIZE}, DP=${DP_SIZE}"
 if [[ "${ROLE}" == "prefill" ]]; then
     echo "  PCP=${ENABLE_PCP}, CP=${PREFILL_CP_SIZE}, attention-TP=${ATTN_TP_SIZE}, KDA=${KDA_CP_BACKEND}, MLA=${MLA_CP_BACKEND}"
 else
