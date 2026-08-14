@@ -132,8 +132,9 @@ def run_eval(args):
     elif args.eval_name == "gpqa":
         from sglang.test.simple_eval_gpqa import GPQAEval
 
-        filename = (
-            "https://openaipublic.blob.core.windows.net/simple-evals/gpqa_diamond.csv"
+        filename = getattr(args, "gpqa_data_path", None) or (
+            "https://openaipublic.blob.core.windows.net/simple-evals/"
+            "gpqa_diamond.csv"
         )
         eval_obj = GPQAEval(filename, args.num_examples, args.num_threads)
     elif args.eval_name == "humaneval":
@@ -268,15 +269,28 @@ def run_eval(args):
 
     # Dump reports
     file_stem = f"{args.eval_name}_{sampler.model.replace('/', '_')}"
-    report_filename = f"/tmp/{file_stem}.html"
+    output_dir = os.path.abspath(getattr(args, "output_dir", None) or "/tmp")
+    os.makedirs(output_dir, exist_ok=True)
+    report_filename = os.path.join(output_dir, f"{file_stem}.html")
     print(f"Writing report to {report_filename}")
     with open(report_filename, "w") as fh:
         fh.write(make_report(result))
     print(metrics)
-    result_filename = f"/tmp/{file_stem}.json"
+    result_filename = os.path.join(output_dir, f"{file_stem}.json")
     with open(result_filename, "w") as f:
         f.write(json.dumps(metrics, indent=2))
     print(f"Writing results to {result_filename}")
+
+    raw_result_file = getattr(args, "raw_result_file", None)
+    if raw_result_file:
+        raw_result_file = os.path.abspath(raw_result_file)
+        raw_parent = os.path.dirname(raw_result_file)
+        if raw_parent:
+            os.makedirs(raw_parent, exist_ok=True)
+        with open(raw_result_file, "w") as f:
+            for index, record in enumerate(result.records):
+                f.write(json.dumps({"index": index, **record}) + "\n")
+        print(f"Writing raw results to {raw_result_file}")
 
     if getattr(args, "return_latency", False):
         return metrics, latency
@@ -377,6 +391,24 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="Path to GSM8K data file (e.g., test.jsonl)",
+    )
+    parser.add_argument(
+        "--gpqa-data-path",
+        type=str,
+        default=None,
+        help="Path to a local GPQA Diamond CSV; defaults to the public URL.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Directory for the HTML report and summary JSON (default: /tmp).",
+    )
+    parser.add_argument(
+        "--raw-result-file",
+        type=str,
+        default=None,
+        help="Optional JSONL file for machine-readable per-example results.",
     )
     parser.add_argument(
         "--mixed-prefix-gsm8k-secondary-pool-size",

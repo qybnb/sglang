@@ -91,6 +91,14 @@ class GPQAEval(Eval):
                 score=score,
                 convo=convo,
                 metrics={"chars": len(response_text)},
+                record={
+                    "question": row["Question"],
+                    "choices": choices_dict,
+                    "correct_answer": correct_answer,
+                    "extracted_answer": extracted_answer,
+                    "response": response_text,
+                    "score": score,
+                },
             )
 
         results = common.map_with_progress(fn, self.examples, self.num_threads)
