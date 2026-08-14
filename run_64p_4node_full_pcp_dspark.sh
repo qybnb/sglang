@@ -110,12 +110,16 @@ DSPARK_DRAFT_QUANTIZATION="${DSPARK_DRAFT_QUANTIZATION:-unquant}"
 DISABLE_CUDA_GRAPH="${DISABLE_CUDA_GRAPH:-1}"
 case "${DEEPEP_MODE}" in auto|normal|low_latency) ;; *) exit 2 ;; esac
 case "${DISABLE_CUDA_GRAPH}" in 0|1) ;; *) exit 2 ;; esac
+if [[ "${DISABLE_CUDA_GRAPH}" == "0" && "${DEEPEP_MODE}" != "low_latency" ]]; then
+    echo "Decode graph capture requires DEEPEP_MODE=low_latency; got ${DEEPEP_MODE}." >&2
+    exit 2
+fi
 
 if [[ "${DISABLE_CUDA_GRAPH}" == "1" ]]; then
     CUDA_GRAPH_ARGS=(--disable-cuda-graph)
 else
     read -r -a CUDA_GRAPH_BS_ARRAY <<< "${CUDA_GRAPH_BS:-1 4 16}"
-    CUDA_GRAPH_ARGS=(--cuda-graph-bs "${CUDA_GRAPH_BS_ARRAY[@]}")
+    CUDA_GRAPH_ARGS=(--cuda-graph-bs-decode "${CUDA_GRAPH_BS_ARRAY[@]}")
 fi
 
 RUN_TAG="${RUN_TAG:-full_4node_dspark_${PROFILE}_cp${CP_SIZE}}"
@@ -130,6 +134,7 @@ unset ASCEND_LAUNCH_BLOCKING
 export SGLANG_ENABLE_CP_V2=1
 export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_RAGGED_VERIFY_MODE="${SGLANG_RAGGED_VERIFY_MODE:-static}"
+export SGLANG_LOG_DECODE_GRAPH_KEY="${SGLANG_LOG_DECODE_GRAPH_KEY:-0}"
 export SGLANG_SET_CPU_AFFINITY="${SGLANG_SET_CPU_AFFINITY:-1}"
 export SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS="${SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS:-1}"
 export PYTORCH_NPU_ALLOC_CONF="${PYTORCH_NPU_ALLOC_CONF:-expandable_segments:True}"
@@ -194,7 +199,8 @@ echo "  target=${MODEL_PATH}, draft=${DRAFT_MODEL_PATH}, block=${DSPARK_BLOCK_SI
 echo "  KDA=${KDA_CP_BACKEND}, MLA=${MLA_CP_BACKEND}, ragged=${SGLANG_RAGGED_VERIFY_MODE}"
 echo "  dist=${DIST_INIT_ADDR}, port=${PORT}, interface=${NET_IFACE}"
 echo "  chunk=${CHUNKED_PREFILL_SIZE}, max-tokens=${MAX_TOTAL_TOKENS}, mem=${MEM_FRACTION_STATIC}"
-echo "  HCCL_BUFFSIZE=${HCCL_BUFFSIZE}, DeepEP=${DEEPEP_MODE}, log=${LOG_FILE}"
+echo "  HCCL_BUFFSIZE=${HCCL_BUFFSIZE}, DeepEP=${DEEPEP_MODE}, decode-graph=$((1 - DISABLE_CUDA_GRAPH))"
+echo "  graph-replay-log=${SGLANG_LOG_DECODE_GRAPH_KEY}, log=${LOG_FILE}"
 
 if [[ "${CONFIG_ONLY}" == "1" ]]; then
     printf '  command:'
