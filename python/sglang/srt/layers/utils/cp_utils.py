@@ -80,17 +80,27 @@ def is_prefill_cp_in_seq_split():
 
 
 def get_cp_padding_align_size(forward_batch=None) -> int:
-    """Token-count alignment for CP padding of global_num_tokens: 2 * cp_size
-    for zigzag (in-seq-split) CP, otherwise cp_size (1 when CP is off, so the
-    padding is a no-op; extra padding breaks EAGLE/MTP draft prefill, see
-    #23269). Keep prepare_mlp_sync_batch and cal_padded_tokens consistent
-    through this helper.
+    """Token-count alignment for CP padding of ``global_num_tokens``.
+
+    Zigzag uses ``2 * cp_size`` sequence segments; other CP modes use
+    ``cp_size``.  CP-v2 subsequently reduce-scatters each CP-local shard over
+    attention TP, so the *local* shard must also be divisible by
+    ``attn_tp_size``.  Aligning globally first to attention TP and then only
+    to the segment count is insufficient (e.g. 709 -> 712 gives CP4 zigzag
+    shards of 178, which are not divisible by TP4).  Use their product for
+    CP-v2 so candidate planning and materialized padding both produce a safe
+    layout.  CP-off remains 1; extra padding there breaks EAGLE/MTP draft
+    prefill (see #23269).
+
+    Keep prepare_mlp_sync_batch and cal_padded_tokens consistent through this
+    helper.
 
     When Kimi-K3's phase-1 global decision is present, a disabled PCP round
     must not retain CP-only padding. Static buffer sizing calls this without a
     batch and therefore continues to reserve for the maximum CP alignment.
     """
     from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
+    from sglang.srt.layers.cp.utils import enable_cp_v2
 
     attn_cp_size = get_parallel().attn_cp_size
     if (
@@ -98,9 +108,14 @@ def get_cp_padding_align_size(forward_batch=None) -> int:
         and getattr(forward_batch, "global_prefill_cp_active", None) is False
     ):
         return 1
-    if is_prefill_cp_in_seq_split() or is_dsa_prefill_cp_in_seq_split():
-        return attn_cp_size * 2
-    return attn_cp_size
+    cp_segment_align = (
+        attn_cp_size * 2
+        if is_prefill_cp_in_seq_split() or is_dsa_prefill_cp_in_seq_split()
+        else attn_cp_size
+    )
+    if enable_cp_v2():
+        return cp_segment_align * get_parallel().attn_tp_size
+    return cp_segment_align
 
 
 def is_mla_prefill_cp_enabled() -> bool:

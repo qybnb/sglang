@@ -90,6 +90,23 @@ class TestDPPrefillCPConsensus(unittest.TestCase):
             self.assertEqual(get_cp_padding_align_size(forced_off), 1)
             self.assertEqual(get_cp_padding_align_size(forced_on), 8)
 
+    def test_cp_v2_alignment_keeps_cp_local_shard_tp_divisible(self):
+        forced_on = SimpleNamespace(global_prefill_cp_active=True)
+
+        with (
+            get_parallel().override(attn_cp_size=4, attn_tp_size=4),
+            patch(
+                "sglang.srt.layers.utils.cp_utils.is_prefill_cp_in_seq_split",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get",
+                return_value=True,
+            ),
+        ):
+            # Eight zigzag segments, and each CP-local shard must divide TP4.
+            self.assertEqual(get_cp_padding_align_size(forced_on), 32)
+
 
 if __name__ == "__main__":
     unittest.main()
