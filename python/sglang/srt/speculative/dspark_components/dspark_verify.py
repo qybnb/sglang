@@ -118,8 +118,15 @@ class TargetVerifyExecutor:
             cutoff_layout=layout,
         )
         if self._simulate_acc_len > 0:
-            correct_len = self._simulated_correct_len(
-                bs=bs, dtype=correct_len.dtype, device=correct_len.device
+            if target_logits is None:
+                raise RuntimeError(
+                    "DSpark simulated acceptance requires target verify logits."
+                )
+            correct_len, bonus, cap_trim_lens = self._simulated_accept_outcome(
+                bs=bs,
+                dtype=correct_len.dtype,
+                device=correct_len.device,
+                target_logits=target_logits,
             )
 
         finalized = FinalizeAcceptLens.execute(
@@ -143,11 +150,50 @@ class TargetVerifyExecutor:
             out_tokens=out_tokens,
         )
 
+    def _simulated_accept_outcome(
+        self,
+        *,
+        bs: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        target_logits: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build a self-consistent forced acceptance result.
+
+        ``correct_len`` selects both the number of accepted draft tokens and
+        the target-logit row that supplies the bonus token.  Reusing the bonus
+        and cap-trim values computed for the real acceptance length mixes two
+        different chains: ``BuildOutTokens`` then publishes a token from the
+        old rejection position while the cache/state commit advances to the
+        simulated position.
+
+        DSpark permits simulated lengths greater than one only for verify-all
+        schedules, so a forced result has no cap trimming.  Length one maps to
+        ``correct_len == 0`` and is safe for every non-empty verify window.
+        """
+        correct_len = self._simulated_correct_len(
+            bs=bs, dtype=dtype, device=device
+        )
+        target_predict = torch.argmax(target_logits, dim=-1).reshape(
+            bs, self.verify_num_draft_tokens
+        )
+        row_ids = torch.arange(bs, dtype=torch.int64, device=device)
+        bonus = target_predict[
+            row_ids, correct_len.to(dtype=torch.int64)
+        ].to(torch.int64)
+        cap_trim_lens = torch.zeros_like(correct_len)
+        return correct_len, bonus, cap_trim_lens
+
     def _simulated_correct_len(
         self, *, bs: int, dtype: torch.dtype, device: torch.device
     ) -> torch.Tensor:
         buf = self._simulated_correct_drafts_buf
-        if buf is None or buf.numel() < bs or buf.dtype != dtype:
+        if (
+            buf is None
+            or buf.numel() < bs
+            or buf.dtype != dtype
+            or buf.device != device
+        ):
             correct_target = int(
                 round(min(max(self._simulate_acc_len - 1.0, 0.0), float(self.gamma)))
             )
