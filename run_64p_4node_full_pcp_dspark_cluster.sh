@@ -94,6 +94,7 @@ process_status_command() {
 process_stop_command() {
     local pid_file="${REMOTE_LOG_DIR}/server.pid"
     local pgid_file="${REMOTE_LOG_DIR}/server.pgid"
+    local service_port="${PORT:-15010}"
     printf '%s' \
         "pid_file=$(printf '%q' "${pid_file}"); pgid_file=$(printf '%q' "${pgid_file}"); " \
         'if [[ ! -s "${pid_file}" ]]; then echo ALREADY_STOPPED; exit 0; fi; ' \
@@ -103,7 +104,12 @@ process_stop_command() {
         'if [[ "${cmdline}" != *run_64p_4node_full_pcp_dspark.sh* ]]; then echo "Refusing stale PID ${pid}: ${cmdline}" >&2; exit 2; fi; ' \
         'pgid=$(cat "${pgid_file}" 2>/dev/null || true); ' \
         'if [[ ! "${pgid}" =~ ^[1-9][0-9]*$ ]]; then echo "Invalid process group for PID ${pid}" >&2; exit 2; fi; ' \
-        'kill -TERM -- "-${pgid}"; rm -f "${pid_file}" "${pgid_file}"; echo "STOPPED pid=${pid} pgid=${pgid}"'
+        'kill -TERM -- "-${pgid}"; ' \
+        'stopped=0; for _ in $(seq 1 30); do ' \
+        "if ! kill -0 \"\${pid}\" 2>/dev/null && ! ps -eo args= | grep -Eq '[s]glang\\.launch_server.*--port[ =]${service_port}([[:space:]]|$)'; then stopped=1; break; fi; " \
+        'sleep 1; done; ' \
+        'if [[ "${stopped}" != "1" ]]; then echo "Timed out waiting for SGLang service cleanup after PID ${pid}" >&2; exit 3; fi; ' \
+        'rm -f "${pid_file}" "${pgid_file}"; echo "STOPPED pid=${pid} pgid=${pgid}"'
 }
 
 for rank in "${!NODE_IP_ARRAY[@]}"; do
