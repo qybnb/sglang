@@ -96,6 +96,7 @@ from sglang.srt.utils.common import BumpAllocator, add_prefix, set_weight_attrs
 from sglang.srt.hardware_backend.npu.utils import situ_and_mul, apply_attn_res
 
 logger = logging.getLogger(__name__)
+_kimi_k3_npu_pcp_log_keys: set[tuple[str, bool, bool]] = set()
 
 
 def _use_kimi_attn_tp_token_scatter() -> bool:
@@ -131,6 +132,15 @@ def _log_kimi_k3_npu_prefill_cp_input(
     else:
         full_extend_tokens = sum(int(length) for length in extend_seq_lens_cpu)
 
+    has_cp_metadata = forward_batch.attn_cp_metadata is not None
+    global_pcp_active = bool(
+        getattr(forward_batch, "global_prefill_cp_active", False)
+    )
+    log_key = (attention_type, has_cp_metadata, global_pcp_active)
+    if log_key in _kimi_k3_npu_pcp_log_keys:
+        return
+    _kimi_k3_npu_pcp_log_keys.add(log_key)
+
     logger.info(
         "[KIMI_K3_NPU_PCP_INPUT] attention=%s layer=%d "
         "cp_rank=%d cp_size=%d attn_tp_rank=%d attn_tp_size=%d "
@@ -144,8 +154,8 @@ def _log_kimi_k3_npu_prefill_cp_input(
         parallel.attn_tp_size,
         hidden_states.shape[0],
         full_extend_tokens,
-        forward_batch.attn_cp_metadata is not None,
-        getattr(forward_batch, "global_prefill_cp_active", None),
+        has_cp_metadata,
+        global_pcp_active,
     )
 
 

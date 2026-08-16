@@ -104,6 +104,12 @@ MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-16384}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-16}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.85}"
 DEEPEP_MODE="${DEEPEP_MODE:-auto}"
+HCCL_BUFFSIZE="${HCCL_BUFFSIZE:-2000}"
+# The Kimi-K3 EP64 low-latency combine kernel requires 1709 MB when
+# SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128.  Keep a small,
+# log-proven safety margin and fail before loading weights if a caller
+# overrides the window with an undersized value.
+KIMI_K3_DEEPEP_GRAPH_MIN_HCCL_BUFFSIZE="${KIMI_K3_DEEPEP_GRAPH_MIN_HCCL_BUFFSIZE:-1800}"
 DSPARK_BLOCK_SIZE="${DSPARK_BLOCK_SIZE:-7}"
 DSPARK_DRAFT_ATTENTION_BACKEND="${DSPARK_DRAFT_ATTENTION_BACKEND:-ascend}"
 DSPARK_DRAFT_QUANTIZATION="${DSPARK_DRAFT_QUANTIZATION:-unquant}"
@@ -112,6 +118,17 @@ case "${DEEPEP_MODE}" in auto|normal|low_latency) ;; *) exit 2 ;; esac
 case "${DISABLE_CUDA_GRAPH}" in 0|1) ;; *) exit 2 ;; esac
 if [[ "${DISABLE_CUDA_GRAPH}" == "0" && "${DEEPEP_MODE}" == "normal" ]]; then
     echo "Decode graph capture requires DEEPEP_MODE=auto or low_latency; got normal." >&2
+    exit 2
+fi
+if [[ ! "${HCCL_BUFFSIZE}" =~ ^[1-9][0-9]*$ ]] || \
+   [[ ! "${KIMI_K3_DEEPEP_GRAPH_MIN_HCCL_BUFFSIZE}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "HCCL buffer sizes must be positive integers in MB." >&2
+    exit 2
+fi
+if [[ "${DISABLE_CUDA_GRAPH}" == "0" && "${DEEPEP_MODE}" != "normal" ]] && \
+   (( HCCL_BUFFSIZE < KIMI_K3_DEEPEP_GRAPH_MIN_HCCL_BUFFSIZE )); then
+    echo "HCCL_BUFFSIZE=${HCCL_BUFFSIZE}MB is too small for Kimi-K3 EP64 DeepEP low-latency graph capture." >&2
+    echo "The combine operator reports a 1709MB minimum at maxBs=128; use at least ${KIMI_K3_DEEPEP_GRAPH_MIN_HCCL_BUFFSIZE}MB (default: 2000MB)." >&2
     exit 2
 fi
 
@@ -143,7 +160,7 @@ export GLOO_SOCKET_IFNAME="${NET_IFACE}"
 export STREAMS_PER_DEVICE="${STREAMS_PER_DEVICE:-32}"
 export DEEP_NORMAL_MODE_USE_INT8_QUANT="${DEEP_NORMAL_MODE_USE_INT8_QUANT:-1}"
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK="${SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK:-128}"
-export HCCL_BUFFSIZE="${HCCL_BUFFSIZE:-2000}"
+export HCCL_BUFFSIZE
 export DEEPEP_NORMAL_LONG_SEQ_ROUND="${DEEPEP_NORMAL_LONG_SEQ_ROUND:-64}"
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS="${DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS:-512}"
 export HCCL_OP_EXPANSION_MODE="${HCCL_OP_EXPANSION_MODE:-AIV}"

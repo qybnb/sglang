@@ -129,6 +129,26 @@ if [[ "${ACTION}" != "start" ]]; then
     exit 0
 fi
 
+# Decode graph capture selects DeepEP low-latency mode for verify batches.
+# Kimi-K3 EP64 with maxBs=128 has a measured combine-kernel minimum of
+# 1709 MB, so reject undersized overrides before starting four expensive
+# model loads.  The per-node launcher repeats this validation as a guard.
+DEEPEP_MODE="${DEEPEP_MODE:-auto}"
+DISABLE_CUDA_GRAPH="${DISABLE_CUDA_GRAPH:-1}"
+HCCL_BUFFSIZE="${HCCL_BUFFSIZE:-2000}"
+KIMI_K3_DEEPEP_GRAPH_MIN_HCCL_BUFFSIZE="${KIMI_K3_DEEPEP_GRAPH_MIN_HCCL_BUFFSIZE:-1800}"
+if [[ ! "${HCCL_BUFFSIZE}" =~ ^[1-9][0-9]*$ ]] || \
+   [[ ! "${KIMI_K3_DEEPEP_GRAPH_MIN_HCCL_BUFFSIZE}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "HCCL buffer sizes must be positive integers in MB." >&2
+    exit 2
+fi
+if [[ "${DISABLE_CUDA_GRAPH}" == "0" && "${DEEPEP_MODE}" != "normal" ]] && \
+   (( HCCL_BUFFSIZE < KIMI_K3_DEEPEP_GRAPH_MIN_HCCL_BUFFSIZE )); then
+    echo "Refusing to start: HCCL_BUFFSIZE=${HCCL_BUFFSIZE}MB is below the Kimi-K3 EP64 DeepEP graph minimum." >&2
+    echo "The combine operator requires 1709MB at maxBs=128; use at least ${KIMI_K3_DEEPEP_GRAPH_MIN_HCCL_BUFFSIZE}MB (default: 2000MB)." >&2
+    exit 2
+fi
+
 echo "Preflight: PCP+DSpark profile=${PROFILE}, target=${MODEL_PATH}, draft=${DRAFT_MODEL_PATH}"
 if [[ -n "${CONTAINER_NAME}" ]]; then
     echo "Container mode: ${CONTAINER_NAME} on all four hosts"
@@ -180,7 +200,8 @@ FORWARDED_ENV=(
 for var_name in \
     TP_SIZE DP_SIZE CP_SIZE DIST_PORT DIST_INIT_ADDR PORT PAGE_SIZE \
     CHUNKED_PREFILL_SIZE MAX_TOTAL_TOKENS MAX_RUNNING_REQUESTS \
-    MEM_FRACTION_STATIC HCCL_BUFFSIZE DEEPEP_MODE DISABLE_CUDA_GRAPH CUDA_GRAPH_BS \
+    MEM_FRACTION_STATIC HCCL_BUFFSIZE KIMI_K3_DEEPEP_GRAPH_MIN_HCCL_BUFFSIZE \
+    DEEPEP_MODE DISABLE_CUDA_GRAPH CUDA_GRAPH_BS \
     DSPARK_BLOCK_SIZE DSPARK_DRAFT_ATTENTION_BACKEND DSPARK_DRAFT_QUANTIZATION \
     SGLANG_RAGGED_VERIFY_MODE SGLANG_SIMULATE_ACC_LEN \
     SGLANG_SIMULATE_ACC_METHOD SGLANG_SIMULATE_ACC_TOKEN_MODE \

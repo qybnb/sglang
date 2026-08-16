@@ -1189,35 +1189,59 @@ def chunk_kda_fwd(
         num_segments = len(cu_seqlens) - 1
         _, _, num_heads, key_dim = kg.shape
         value_dim = u.shape[-1]
-        affine_state = torch.zeros(
-            num_segments,
-            num_heads,
-            key_dim,
-            value_dim + key_dim,
-            dtype=torch.float32,
-            device=k.device,
-        )
-        affine_state[..., value_dim:].copy_(
-            torch.eye(key_dim, dtype=torch.float32, device=k.device).view(
-                1, 1, key_dim, key_dim
-            )
-        )
         affine_indices = torch.arange(
             num_segments, dtype=torch.int32, device=k.device
         )
-        augmented_u = torch.cat(
-            (u, u.new_zeros((*u.shape[:-1], key_dim))), dim=-1
+        # The recurrence is independent across value columns.  Compute the
+        # additive H and transition M halves separately, then concatenate them
+        # for the existing PR-691-style composition.  Besides being
+        # mathematically identical to running [u | 0] from [0 | I], this keeps
+        # both Ascend Triton specializations at V=128.  The combined V=256
+        # specialization is known to crash bishengir-compile for Kimi-K3's
+        # DP2/CP4 local-head shape (H=12).
+        affine_additive = torch.zeros(
+            num_segments,
+            num_heads,
+            key_dim,
+            value_dim,
+            dtype=torch.float32,
+            device=k.device,
         )
         chunk_gated_delta_rule_fwd_h(
             k=kg,
             w=w,
-            u=augmented_u,
+            u=u,
             gk=g,
-            initial_state=affine_state,
+            initial_state=affine_additive,
             initial_state_indices=affine_indices,
             save_new_value=False,
             cu_seqlens=cu_seqlens,
         )
+
+        affine_transition = torch.zeros(
+            num_segments,
+            num_heads,
+            key_dim,
+            key_dim,
+            dtype=torch.float32,
+            device=k.device,
+        )
+        affine_transition.copy_(
+            torch.eye(key_dim, dtype=torch.float32, device=k.device).view(
+                1, 1, key_dim, key_dim
+            )
+        )
+        chunk_gated_delta_rule_fwd_h(
+            k=kg,
+            w=w,
+            u=u.new_zeros((*u.shape[:-1], key_dim)),
+            gk=g,
+            initial_state=affine_transition,
+            initial_state_indices=affine_indices,
+            save_new_value=False,
+            cu_seqlens=cu_seqlens,
+        )
+        affine_state = torch.cat((affine_additive, affine_transition), dim=-1)
         initial_state = compose_kda_cp_affine_states(
             affine_state,
             initial_state,

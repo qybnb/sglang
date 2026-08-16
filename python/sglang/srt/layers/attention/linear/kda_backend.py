@@ -429,6 +429,30 @@ def ragged_verify_dense_scatter_indices(
     ).clamp_(max=batch_size * draft_token_num)
 
 
+def build_dspark_verify_scratch_indices(
+    *, num_rows: int, scratch_slots: int, device: torch.device
+) -> torch.Tensor:
+    """Map verify rows to speculative scratch, reserving the last slot as pad.
+
+    DP-attention graph buckets are expressed in global batch sizes, while each
+    DP worker allocates speculative Mamba scratch for only its local request
+    capacity.  Consequently a graph bucket can have more rows than locally
+    usable scratch slots (for example global BS4 with DP4 has one real row per
+    worker).  The extra graph rows are padding and may safely share the final
+    sentinel slot; real rows remain mapped one-to-one from zero.
+
+    The returned tensor is deliberately precomputed before graph capture so
+    the target-verify kernels see a stable pointer during capture and replay.
+    """
+    if num_rows < 0:
+        raise ValueError(f"num_rows must be non-negative, got {num_rows}")
+    if scratch_slots < 1:
+        raise ValueError(f"scratch_slots must be positive, got {scratch_slots}")
+    return torch.arange(num_rows, dtype=torch.int32, device=device).clamp_max_(
+        scratch_slots - 1
+    )
+
+
 class KDAAttnBackend(MambaAttnBackendBase):
     """Attention backend for KDA (Kimi Delta Attention) linear attention."""
 
@@ -454,10 +478,38 @@ class KDAAttnBackend(MambaAttnBackendBase):
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = KDAKernelDispatcher(decode_backend, prefill_backend)
         self._dspark_target_verify = model_runner.spec_algorithm.is_dspark()
-        self.verify_intermediate_state_indices = torch.arange(
-            self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
+        self.verify_intermediate_state_indices = self._make_verify_scratch_indices(
+            self.req_to_token_pool.size
         )
         self._kda_fla_cp_logged = False
+
+    def _make_verify_scratch_indices(self, num_rows: int) -> torch.Tensor:
+        if not self._dspark_target_verify:
+            return torch.arange(
+                num_rows, dtype=torch.int32, device=self.device
+            )
+        speculative_cache = (
+            self.req_to_token_pool.get_speculative_mamba2_params_all_layers()
+        )
+        scratch_slots = speculative_cache.intermediate_ssm.shape[1]
+        return build_dspark_verify_scratch_indices(
+            num_rows=num_rows,
+            scratch_slots=scratch_slots,
+            device=self.device,
+        )
+
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        super().init_cuda_graph_state(max_bs, max_num_tokens)
+        if not self._dspark_target_verify:
+            return
+
+        # Keep eager capacity when it is larger, but extend the stable index
+        # template to every captured graph row.  Rows beyond local speculative
+        # capacity map to the scratch pool's final sentinel slot.
+        num_rows = max(max_bs, self.verify_intermediate_state_indices.numel())
+        self.verify_intermediate_state_indices = self._make_verify_scratch_indices(
+            num_rows
+        )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
