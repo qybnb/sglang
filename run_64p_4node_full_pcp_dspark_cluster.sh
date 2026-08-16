@@ -38,9 +38,10 @@ if (( ${#NODE_IP_ARRAY[@]} != 4 )); then
 fi
 
 CONTROL_HOST="${CONTROL_HOST:-${NODE_IP_ARRAY[0]}}"
+LOCAL_CONTROL_HOST="${LOCAL_CONTROL_HOST:-${CONTROL_HOST}}"
 LOCAL_ADDRESSES=" $(hostname -I 2>/dev/null || true) "
-if [[ "${FORCE_SSH_ALL:-0}" != "1" && "${LOCAL_ADDRESSES}" != *" ${CONTROL_HOST} "* ]]; then
-    echo "Run this controller on ${CONTROL_HOST}; local addresses:${LOCAL_ADDRESSES}" >&2
+if [[ "${FORCE_SSH_ALL:-0}" != "1" && "${LOCAL_ADDRESSES}" != *" ${LOCAL_CONTROL_HOST} "* ]]; then
+    echo "Run this controller on ${CONTROL_HOST} (local address ${LOCAL_CONTROL_HOST}); local addresses:${LOCAL_ADDRESSES}" >&2
     exit 2
 fi
 
