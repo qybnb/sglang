@@ -134,7 +134,7 @@ fi
 # 1709 MB, so reject undersized overrides before starting four expensive
 # model loads.  The per-node launcher repeats this validation as a guard.
 DEEPEP_MODE="${DEEPEP_MODE:-auto}"
-DISABLE_CUDA_GRAPH="${DISABLE_CUDA_GRAPH:-1}"
+DISABLE_CUDA_GRAPH="${DISABLE_CUDA_GRAPH:-0}"
 HCCL_BUFFSIZE="${HCCL_BUFFSIZE:-2000}"
 KIMI_K3_DEEPEP_GRAPH_MIN_HCCL_BUFFSIZE="${KIMI_K3_DEEPEP_GRAPH_MIN_HCCL_BUFFSIZE:-1800}"
 if [[ ! "${HCCL_BUFFSIZE}" =~ ^[1-9][0-9]*$ ]] || \
