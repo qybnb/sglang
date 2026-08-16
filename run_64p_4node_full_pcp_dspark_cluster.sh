@@ -100,8 +100,6 @@ DRAFT_MODEL_PATH="${DRAFT_MODEL_PATH:-/home/weights/Kimi-K3-DSpark}"
 NET_IFACE="${NET_IFACE:-enp196s0f0}"
 
 COMMON_ENV=(
-    "MODEL_PATH=${MODEL_PATH}"
-    "DRAFT_MODEL_PATH=${DRAFT_MODEL_PATH}"
     "NODE_IPS=${NODE_IPS}"
     "NET_IFACE=${NET_IFACE}"
     "TP_SIZE=${TP_SIZE:-64}"
@@ -127,7 +125,18 @@ for rank in 1 2 3 0; do
     log_file="${REMOTE_LOG_DIR}/${PROFILE}_rank${rank}_launcher.log"
     pid_file="${REMOTE_LOG_DIR}/server.pid"
     pgid_file="${REMOTE_LOG_DIR}/server.pgid"
-    env_args=("${COMMON_ENV[@]}" "NODE_RANK=${rank}")
+    model_var="MODEL_PATH_RANK${rank}"
+    draft_var="DRAFT_MODEL_PATH_RANK${rank}"
+    rank_model_path="${MODEL_PATH}"
+    rank_draft_model_path="${DRAFT_MODEL_PATH}"
+    [[ -z "${!model_var:-}" ]] || rank_model_path="${!model_var}"
+    [[ -z "${!draft_var:-}" ]] || rank_draft_model_path="${!draft_var}"
+    env_args=(
+        "${COMMON_ENV[@]}"
+        "MODEL_PATH=${rank_model_path}"
+        "DRAFT_MODEL_PATH=${rank_draft_model_path}"
+        "NODE_RANK=${rank}"
+    )
 
     printf -v launch '%q ' \
         nohup setsid env "${env_args[@]}" \
