@@ -97,7 +97,6 @@ NET_IFACE="${NET_IFACE:-enp196s0f0}"
 
 COMMON_ENV=(
     "NODE_IPS=${NODE_IPS}"
-    "NET_IFACE=${NET_IFACE}"
     "TP_SIZE=${TP_SIZE:-64}"
     "DP_SIZE=${DP_SIZE:-2}"
     "CP_SIZE=${CP_SIZE:-4}"
@@ -123,14 +122,18 @@ for rank in 1 2 3 0; do
     pgid_file="${REMOTE_LOG_DIR}/server.pgid"
     model_var="MODEL_PATH_RANK${rank}"
     draft_var="DRAFT_MODEL_PATH_RANK${rank}"
+    net_iface_var="NET_IFACE_RANK${rank}"
     rank_model_path="${MODEL_PATH}"
     rank_draft_model_path="${DRAFT_MODEL_PATH}"
+    rank_net_iface="${NET_IFACE}"
     [[ -z "${!model_var:-}" ]] || rank_model_path="${!model_var}"
     [[ -z "${!draft_var:-}" ]] || rank_draft_model_path="${!draft_var}"
+    [[ -z "${!net_iface_var:-}" ]] || rank_net_iface="${!net_iface_var}"
     env_args=(
         "${COMMON_ENV[@]}"
         "MODEL_PATH=${rank_model_path}"
         "DRAFT_MODEL_PATH=${rank_draft_model_path}"
+        "NET_IFACE=${rank_net_iface}"
         "NODE_RANK=${rank}"
     )
 
