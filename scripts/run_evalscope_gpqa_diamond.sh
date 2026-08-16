@@ -28,7 +28,7 @@ GPQA_DATASET_PATH="${GPQA_DATASET_PATH:-/home/hanwlax/datasets/gpqa}"
 WORK_ROOT="${WORK_ROOT:-/home/hanwlax/workspace/progress/kimi_k3/gpqa}"
 RUN_TAG="${RUN_TAG:-gpqa_$(date +%Y-%m-%d_%H-%M-%S)}"
 WORK_DIR="${WORK_DIR:-${WORK_ROOT}/${RUN_TAG}}"
-EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-32}"
+EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-8}"
 SEED="${SEED:-42}"
 
 if [[ ! -d "${GPQA_DATASET_PATH}" ]]; then
