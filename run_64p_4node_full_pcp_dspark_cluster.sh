@@ -67,18 +67,14 @@ status_command() {
         'if [[ "${pid}" =~ ^[1-9][0-9]*$ ]] && kill -0 "${pid}" 2>/dev/null; then echo "RUNNING pid=${pid}"; else echo STOPPED; fi'
 }
 
-stop_command() {
+cleanup_command() {
     local pid_file="${REMOTE_LOG_DIR}/server.pid"
     local pgid_file="${REMOTE_LOG_DIR}/server.pgid"
     printf '%s' \
         "pid_file=$(printf '%q' "${pid_file}"); pgid_file=$(printf '%q' "${pgid_file}"); " \
-        'pid=$(cat "${pid_file}" 2>/dev/null || true); ' \
-        'pgid=$(cat "${pgid_file}" 2>/dev/null || true); ' \
-        'if [[ "${pid}" =~ ^[1-9][0-9]*$ ]] && kill -0 "${pid}" 2>/dev/null; then ' \
-        'cmdline=$(tr "\0" " " <"/proc/${pid}/cmdline" 2>/dev/null || true); ' \
-        'if [[ "${cmdline}" == *run_64p_4node_full_pcp_dspark.sh* ]]; then ' \
-        'if [[ "${pgid}" =~ ^[1-9][0-9]*$ ]]; then kill -TERM -- "-${pgid}" 2>/dev/null || true; else kill -TERM "${pid}" 2>/dev/null || true; fi; ' \
-        'fi; fi; ' \
+        'pkill -9 -f "[r]un_64p_4node_full_pcp_dspark.sh" 2>/dev/null || true; ' \
+        'pkill -9 -f "[s]glang.launch_server" 2>/dev/null || true; ' \
+        'pkill -9 -f "[s]glang::scheduler" 2>/dev/null || true; ' \
         'rm -f "${pid_file}" "${pgid_file}"; echo STOPPED'
 }
 
@@ -89,7 +85,7 @@ if [[ "${ACTION}" == "status" || "${ACTION}" == "stop" ]]; then
         if [[ "${ACTION}" == "status" ]]; then
             run_on "${host}" "$(status_command)"
         else
-            run_on "${host}" "$(stop_command)"
+            run_on "${host}" "$(cleanup_command)"
         fi
     done
     exit 0
@@ -137,6 +133,8 @@ for rank in 1 2 3 0; do
         "DRAFT_MODEL_PATH=${rank_draft_model_path}"
         "NODE_RANK=${rank}"
     )
+
+    run_on "${host}" "$(cleanup_command)" >/dev/null
 
     printf -v launch '%q ' \
         nohup setsid env "${env_args[@]}" \
