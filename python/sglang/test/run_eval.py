@@ -6,6 +6,7 @@ python3 -m sglang.test.run_eval --port 30000 --eval-name mmlu --num-examples 10
 import argparse
 import json
 import os
+import threading
 import time
 
 from sglang.test.simple_eval_common import (
@@ -15,6 +16,76 @@ from sglang.test.simple_eval_common import (
     make_report,
     set_ulimit,
 )
+
+
+class _IncrementalResultWriter:
+    """Persist completed examples so an interrupted evaluation remains usable."""
+
+    def __init__(self, raw_result_file: str, total: int):
+        self.raw_result_file = os.path.abspath(raw_result_file)
+        self.summary_file = os.path.join(
+            os.path.dirname(self.raw_result_file), "partial_summary.json"
+        )
+        self.total = int(total)
+        self.completed = 0
+        self.scored = 0
+        self.score_sum = 0.0
+        self.status = "running"
+        self._lock = threading.Lock()
+        os.makedirs(os.path.dirname(self.raw_result_file), exist_ok=True)
+        with open(self.raw_result_file, "w"):
+            pass
+        self._write_summary_locked("running")
+
+    @staticmethod
+    def _serialize_result(result) -> dict:
+        record = dict(result.record or {})
+        record.setdefault("score", result.score)
+        record.setdefault("metrics", result.metrics)
+        record.setdefault("conversation", result.convo)
+        return record
+
+    def __call__(self, result) -> None:
+        record = self._serialize_result(result)
+        line = json.dumps(record) + "\n"
+        with self._lock:
+            with open(self.raw_result_file, "a") as f:
+                f.write(line)
+                f.flush()
+                os.fsync(f.fileno())
+            self.completed += 1
+            if result.score is not None:
+                self.scored += 1
+                self.score_sum += float(result.score)
+            self._write_summary_locked(self.status)
+
+    def mark_interrupted(self) -> None:
+        with self._lock:
+            self.status = "interrupted"
+            self._write_summary_locked(self.status)
+
+    def mark_complete(self) -> None:
+        with self._lock:
+            self.status = "complete"
+            self._write_summary_locked(self.status)
+
+    def _write_summary_locked(self, status: str) -> None:
+        score = self.score_sum / self.scored if self.scored else None
+        summary = {
+            "status": status,
+            "completed": self.completed,
+            "total": self.total,
+            "score_on_completed": score,
+            "raw_result_file": self.raw_result_file,
+            "updated_at_unix": time.time(),
+        }
+        tmp_file = f"{self.summary_file}.tmp"
+        with open(tmp_file, "w") as f:
+            json.dump(summary, f, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_file, self.summary_file)
 
 
 def get_thinking_kwargs(args):
@@ -84,9 +155,20 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
             extra_body=extra_body if extra_body else None,
         )
 
-    # Run eval
+    # Run eval. GPQA may attach a durable per-example writer so Ctrl+C keeps
+    # every response that finished before the interruption.
     tic = time.perf_counter()
-    result = eval_obj(sampler)
+    try:
+        result = eval_obj(sampler)
+    except KeyboardInterrupt:
+        result_callback = getattr(eval_obj, "result_callback", None)
+        if hasattr(result_callback, "mark_interrupted"):
+            result_callback.mark_interrupted()
+            print(
+                "GPQA interrupted; completed examples were preserved at "
+                f"{result_callback.raw_result_file}"
+            )
+        raise
     latency = time.perf_counter() - tic
 
     return result, latency, sampler
@@ -104,6 +186,8 @@ def run_eval(args):
     base_url = (
         f"{args.base_url}/v1" if args.base_url else f"http://{args.host}:{args.port}/v1"
     )
+
+    incremental_result_writer = None
 
     if args.eval_name == "mmlu":
         from sglang.test.simple_eval_mmlu import MMLUEval
@@ -137,6 +221,13 @@ def run_eval(args):
             "gpqa_diamond.csv"
         )
         eval_obj = GPQAEval(filename, args.num_examples, args.num_threads)
+        raw_result_file = getattr(args, "raw_result_file", None)
+        if raw_result_file and getattr(args, "repeat", 1) == 1:
+            incremental_result_writer = _IncrementalResultWriter(
+                raw_result_file=raw_result_file,
+                total=len(eval_obj.examples),
+            )
+            eval_obj.result_callback = incremental_result_writer
     elif args.eval_name == "humaneval":
         from sglang.test.simple_eval_humaneval import HumanEval
 
@@ -291,6 +382,9 @@ def run_eval(args):
             for index, record in enumerate(result.records):
                 f.write(json.dumps({"index": index, **record}) + "\n")
         print(f"Writing raw results to {raw_result_file}")
+
+    if incremental_result_writer is not None:
+        incremental_result_writer.mark_complete()
 
     if getattr(args, "return_latency", False):
         return metrics, latency

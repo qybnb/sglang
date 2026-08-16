@@ -8,7 +8,7 @@ https://arxiv.org/abs/2311.12022
 
 import random
 import re
-from typing import Optional
+from typing import Callable, Optional
 
 import pandas
 
@@ -31,6 +31,7 @@ class GPQAEval(Eval):
         num_examples: Optional[int],
         num_threads: int,
         n_repeats: int = 1,
+        result_callback: Optional[Callable[[SingleEvalResult], None]] = None,
     ):
         if "://" in filename:
             df = pandas.read_csv(filename, storage_options={"timeout": 30})
@@ -43,11 +44,17 @@ class GPQAEval(Eval):
             examples = rng.sample(examples, num_examples)
         examples = examples * n_repeats
         examples = [
-            example | {"permutation": rng.sample(range(4), 4)} for example in examples
+            example
+            | {
+                "permutation": rng.sample(range(4), 4),
+                "_eval_index": index,
+            }
+            for index, example in enumerate(examples)
         ]
         self.examples = examples
         self.n_repeats = n_repeats
         self.num_threads = num_threads
+        self.result_callback = result_callback
 
     def __call__(self, sampler: SamplerBase) -> EvalResult:
         def fn(row: dict):
@@ -86,12 +93,13 @@ class GPQAEval(Eval):
                 extracted_answer=extracted_answer,
             )
             convo = prompt_messages + [dict(content=response_text, role="assistant")]
-            return SingleEvalResult(
+            result = SingleEvalResult(
                 html=html,
                 score=score,
                 convo=convo,
                 metrics={"chars": len(response_text)},
                 record={
+                    "index": row["_eval_index"],
                     "question": row["Question"],
                     "choices": choices_dict,
                     "correct_answer": correct_answer,
@@ -100,6 +108,9 @@ class GPQAEval(Eval):
                     "score": score,
                 },
             )
+            if self.result_callback is not None:
+                self.result_callback(result)
+            return result
 
         results = common.map_with_progress(fn, self.examples, self.num_threads)
         return common.aggregate_results(results)
