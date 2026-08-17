@@ -29,16 +29,20 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_kv_cache,
+    get_prefix_block_slices,
     get_zigzag_cp_rank_block_lengths,
     get_zigzag_cp_rank_chunk_indices,
     get_zigzag_mla_cp_ring_visibility,
-    pack_paged_prefix_cache,
 )
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.utils import get_bool_env_var, get_current_device_stream_fast
+from sglang.srt.utils import (
+    get_bool_env_var,
+    get_current_device_stream_fast,
+    get_int_env_var,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -507,6 +511,18 @@ class AscendAttnBackend(AttentionBackend):
         self.mla_cp_backend = getattr(
             model_runner.server_args, "mla_cp_backend", "allgather"
         )
+        self.mla_cp_ring_prefix_block_size = get_int_env_var(
+            "SGLANG_NPU_MLA_CP_RING_PREFIX_BLOCK_SIZE", 32768
+        )
+        if (
+            self.mla_cp_ring_prefix_block_size <= 0
+            or self.mla_cp_ring_prefix_block_size % self.page_size != 0
+        ):
+            raise ValueError(
+                "SGLANG_NPU_MLA_CP_RING_PREFIX_BLOCK_SIZE must be a positive "
+                f"multiple of page_size={self.page_size}, got "
+                f"{self.mla_cp_ring_prefix_block_size}."
+            )
         self._mla_cp_ring_logged = False
 
     def _is_swa_layer(self, layer: RadixAttention) -> bool:
@@ -1423,51 +1439,114 @@ class AscendAttnBackend(AttentionBackend):
             request.wait()
         return recv_kv
 
-    def _load_mla_cp_ring_prefix_kv(
-        self, layer: RadixAttention, forward_batch: ForwardBatch
+    def _iter_mla_cp_ring_prefix_kv_blocks(
+        self,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        prefix_lens: List[int],
+        minimum_block_lens: List[int],
     ):
-        """Load and expand an exactly packed radix prefix for ring attention."""
-        prefix_lens = [int(length) for length in forward_batch.extend_prefix_lens_cpu]
-        if len(prefix_lens) != int(forward_batch.attn_cp_metadata.bs):
-            raise ValueError(
-                "MLA CP ring prefix lengths do not match batch size: "
-                f"prefixes={len(prefix_lens)}, "
-                f"bs={forward_batch.attn_cp_metadata.bs}."
-            )
+        """Load and expand the radix prefix in bounded blocks.
+
+        Expanding the complete accumulated prefix made the eager prefill peak
+        grow with every chunk and also presented a new, ever-larger shape to
+        AtbRingMLA.  Yielding one bounded block at a time caps both the
+        projection tensors and the operator workspace shapes.
+        """
         if not any(prefix_lens):
-            return prefix_lens, None, None, None
+            return
         if (
             self.forward_metadata.prefix_lens is None
             or self.forward_metadata.flatten_prefix_block_tables is None
         ):
             raise ValueError("MLA CP ring prefix metadata is missing")
 
-        prefix_block_tables = self.forward_metadata.flatten_prefix_block_tables
+        prefix_block_tables = (
+            self.forward_metadata.flatten_prefix_block_tables.reshape(-1)
+        )
         k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         v_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
-        prefix_k_pages = torch.index_select(k_buffer, 0, prefix_block_tables)
-        prefix_rope_pages = torch.index_select(v_buffer, 0, prefix_block_tables)
-        prefix_latent_k = pack_paged_prefix_cache(
-            prefix_k_pages, prefix_lens, self.page_size
-        )
-        prefix_k_rope_compact = pack_paged_prefix_cache(
-            prefix_rope_pages, prefix_lens, self.page_size
-        )
-        if prefix_latent_k.shape[0] != sum(prefix_lens):
-            raise ValueError("MLA CP ring packed prefix length is inconsistent")
+        request_page_offsets = []
+        page_offset = 0
+        for prefix_len in prefix_lens:
+            request_page_offsets.append(page_offset)
+            page_offset += (prefix_len + self.page_size - 1) // self.page_size
+        if page_offset != prefix_block_tables.numel():
+            raise ValueError(
+                "Selected MLA CP ring prefix pages do not match prefix lengths: "
+                f"pages={prefix_block_tables.numel()}, expected={page_offset}."
+            )
 
-        projected_kv = layer.kv_b_proj(prefix_latent_k.squeeze(1))[0].view(
-            -1,
-            layer.tp_k_head_num,
-            layer.v_head_dim * 2,
+        block_rounds = get_prefix_block_slices(
+            prefix_lens,
+            self.mla_cp_ring_prefix_block_size,
+            minimum_block_lens,
         )
-        prefix_k_nope, prefix_value = projected_kv.split(
-            [layer.v_head_dim, layer.v_head_dim], dim=-1
-        )
-        prefix_k_rope = prefix_k_rope_compact.expand(
-            -1, layer.tp_k_head_num, -1
-        )
-        return prefix_lens, prefix_k_nope, prefix_k_rope, prefix_value
+        for block_slices in block_rounds:
+            block_lens = [length for _, length in block_slices]
+            latent_chunks = []
+            rope_chunks = []
+            for request_index, (start, length) in enumerate(block_slices):
+                if length == 0:
+                    continue
+                first_page = start // self.page_size
+                page_start_offset = start % self.page_size
+                page_count = (
+                    page_start_offset + length + self.page_size - 1
+                ) // self.page_size
+                table_start = request_page_offsets[request_index] + first_page
+                page_indices = prefix_block_tables[
+                    table_start : table_start + page_count
+                ]
+                latent_pages = torch.index_select(k_buffer, 0, page_indices)
+                rope_pages = torch.index_select(v_buffer, 0, page_indices)
+                latent_chunks.append(
+                    latent_pages.flatten(0, 1)[
+                        page_start_offset : page_start_offset + length
+                    ]
+                )
+                rope_chunks.append(
+                    rope_pages.flatten(0, 1)[
+                        page_start_offset : page_start_offset + length
+                    ]
+                )
+
+            if len(latent_chunks) == 1:
+                prefix_latent_k = latent_chunks[0]
+                prefix_k_rope_compact = rope_chunks[0]
+            else:
+                prefix_latent_k = torch.cat(latent_chunks, dim=0).contiguous()
+                prefix_k_rope_compact = torch.cat(rope_chunks, dim=0).contiguous()
+            if prefix_latent_k.shape[0] != sum(block_lens):
+                raise ValueError(
+                    "MLA CP ring packed prefix block length is inconsistent"
+                )
+
+            projected_kv = layer.kv_b_proj(prefix_latent_k.squeeze(1))[0].view(
+                -1,
+                layer.tp_k_head_num,
+                layer.v_head_dim * 2,
+            )
+            prefix_k_nope, prefix_value = projected_kv.split(
+                [layer.v_head_dim, layer.v_head_dim], dim=-1
+            )
+            prefix_k_rope = prefix_k_rope_compact.expand(
+                -1, layer.tp_k_head_num, -1
+            )
+            # The projected K/V no longer depends on the compact latent
+            # tensor. Release page-selection intermediates before ATB runs.
+            del prefix_latent_k, latent_chunks, rope_chunks
+            yield block_lens, prefix_k_nope, prefix_k_rope, prefix_value
+            # A generator retains its frame across ``yield``. Explicitly drop
+            # the yielded block before constructing the next one, otherwise
+            # consecutive expanded blocks overlap in allocator lifetime.
+            del (
+                projected_kv,
+                prefix_k_nope,
+                prefix_k_rope,
+                prefix_k_rope_compact,
+                prefix_value,
+            )
 
     def _run_mla_cp_ring_segment(
         self,
@@ -1567,11 +1646,12 @@ class AscendAttnBackend(AttentionBackend):
                 "MLA prefill CP ring active: cp_size=%d, batch_size=%d, "
                 "max_block_len=%d, max_rank_tokens=%d, "
                 "cache_backend=ring-direct, uneven_blocks=true, "
-                "prefix_cache=operator-guarded",
+                "prefix_cache=blocked-%d",
                 cp_size,
                 bs,
                 max(cp_meta.split_list),
                 max_rank_tokens,
+                self.mla_cp_ring_prefix_block_size,
             )
             self._mla_cp_ring_logged = True
 
@@ -1649,12 +1729,14 @@ class AscendAttnBackend(AttentionBackend):
         cache_locs_by_rank = _get_mla_cp_ring_cache_locs(
             forward_batch, layer, cp_size
         )
-        (
-            prefix_lens,
-            prefix_k_nope,
-            prefix_k_rope,
-            prefix_value,
-        ) = self._load_mla_cp_ring_prefix_kv(layer, forward_batch)
+        prefix_lens = [
+            int(length) for length in forward_batch.extend_prefix_lens_cpu
+        ]
+        if len(prefix_lens) != bs:
+            raise ValueError(
+                "MLA CP ring prefix lengths do not match batch size: "
+                f"prefixes={len(prefix_lens)}, bs={bs}."
+            )
         output_prev = lse_prev = None
         output_next = lse_next = None
 
@@ -1772,42 +1854,76 @@ class AscendAttnBackend(AttentionBackend):
                     recv_kv, exchange_requests
                 )
 
-        if prefix_k_nope is not None:
+        if any(prefix_lens):
             # Prefix KV precedes both local zigzag blocks and is therefore an
             # unmasked segment. Merge it after the ring so requests with an
             # empty prefix already have initialized output/LSE buffers. The
             # ring guard guarantees each non-empty prefix is at least as long
             # as its Q block, as required by npu_ring_mla.
-            prefix_prev_seq_lens = torch.tensor(
-                [block_lens_prev, prefix_lens], dtype=torch.int32
+            prefix_blocks = iter(
+                self._iter_mla_cp_ring_prefix_kv_blocks(
+                    layer,
+                    forward_batch,
+                    prefix_lens,
+                    [
+                        max(prev_len, next_len)
+                        for prev_len, next_len in zip(
+                            block_lens_prev, block_lens_next
+                        )
+                    ],
+                )
             )
-            prefix_next_seq_lens = torch.tensor(
-                [block_lens_next, prefix_lens], dtype=torch.int32
-            )
-            output_prev, lse_prev = self._run_mla_cp_ring_segment(
-                q_nope_prev,
-                q_rope_prev,
-                prefix_k_nope,
-                prefix_k_rope,
-                prefix_value,
-                prefix_prev_seq_lens,
-                layer,
-                causal=False,
-                previous_output=output_prev,
-                previous_lse=lse_prev,
-            )
-            output_next, lse_next = self._run_mla_cp_ring_segment(
-                q_nope_next,
-                q_rope_next,
-                prefix_k_nope,
-                prefix_k_rope,
-                prefix_value,
-                prefix_next_seq_lens,
-                layer,
-                causal=False,
-                previous_output=output_next,
-                previous_lse=lse_next,
-            )
+            while True:
+                try:
+                    prefix_block = next(prefix_blocks)
+                except StopIteration:
+                    break
+                (
+                    prefix_block_lens,
+                    prefix_k_nope,
+                    prefix_k_rope,
+                    prefix_value,
+                ) = prefix_block
+                prefix_prev_seq_lens = torch.tensor(
+                    [block_lens_prev, prefix_block_lens], dtype=torch.int32
+                )
+                prefix_next_seq_lens = torch.tensor(
+                    [block_lens_next, prefix_block_lens], dtype=torch.int32
+                )
+                output_prev, lse_prev = self._run_mla_cp_ring_segment(
+                    q_nope_prev,
+                    q_rope_prev,
+                    prefix_k_nope,
+                    prefix_k_rope,
+                    prefix_value,
+                    prefix_prev_seq_lens,
+                    layer,
+                    causal=False,
+                    previous_output=output_prev,
+                    previous_lse=lse_prev,
+                )
+                output_next, lse_next = self._run_mla_cp_ring_segment(
+                    q_nope_next,
+                    q_rope_next,
+                    prefix_k_nope,
+                    prefix_k_rope,
+                    prefix_value,
+                    prefix_next_seq_lens,
+                    layer,
+                    causal=False,
+                    previous_output=output_next,
+                    previous_lse=lse_next,
+                )
+                # Drop the current block before requesting the next one so two
+                # expanded prefix blocks never overlap in allocator lifetime.
+                del (
+                    prefix_block,
+                    prefix_k_nope,
+                    prefix_k_rope,
+                    prefix_value,
+                    prefix_prev_seq_lens,
+                    prefix_next_seq_lens,
+                )
 
         assert output_prev is not None and output_next is not None
         del forward_batch.mla_cp_local_k

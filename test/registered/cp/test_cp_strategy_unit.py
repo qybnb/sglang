@@ -33,6 +33,7 @@ from sglang.srt.layers.cp.utils import (
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
 from sglang.srt.layers.utils.cp_utils import (
     get_npu_mla_cp_ring_fallback_reason,
+    get_prefix_block_slices,
     get_zigzag_cp_rank_block_lengths,
     get_zigzag_cp_rank_chunk_indices,
     get_zigzag_mla_cp_ring_visibility,
@@ -334,6 +335,20 @@ class TestCPStrategyUnit(CustomTestCase):
         )
         torch.testing.assert_close(
             packed_prefix.flatten(), torch.tensor([0, 1, 2, 4, 5, 6, 7, 8])
+        )
+
+    def test_mla_cp_ring_prefix_blocks_fold_short_tails(self):
+        self.assertEqual(
+            get_prefix_block_slices(
+                prefix_lens=[0, 10, 25],
+                block_size=8,
+                minimum_block_lens=[0, 3, 6],
+            ),
+            [
+                [(0, 0), (0, 10), (0, 8)],
+                [(0, 0), (10, 0), (8, 8)],
+                [(0, 0), (10, 0), (16, 9)],
+            ],
         )
 
     def test_mla_cp_ring_zigzag_visibility_is_causal(self):

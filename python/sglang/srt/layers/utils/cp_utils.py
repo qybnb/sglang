@@ -277,6 +277,65 @@ def pack_paged_prefix_cache(paged_cache, prefix_lens, page_size: int):
     return torch.cat(packed_requests, dim=0)
 
 
+def get_prefix_block_slices(
+    prefix_lens: List[int],
+    block_size: int,
+    minimum_block_lens: List[int] | None = None,
+):
+    """Plan bounded, round-major slices for packed per-request prefixes.
+
+    ``npu_ring_mla`` requires every non-empty KV segment to be at least as
+    long as its query segment.  A short tail is therefore folded into the
+    preceding block instead of being emitted as a separate undersized block.
+    The resulting block size is bounded by ``block_size + minimum - 1``.
+    """
+    if block_size <= 0:
+        raise ValueError(f"prefix block size must be positive, got {block_size}")
+    if minimum_block_lens is None:
+        minimum_block_lens = [0] * len(prefix_lens)
+    if len(prefix_lens) != len(minimum_block_lens):
+        raise ValueError(
+            "prefix and minimum block length lists must have the same size"
+        )
+
+    request_slices = []
+    for prefix_len, minimum_block_len in zip(prefix_lens, minimum_block_lens):
+        prefix_len = int(prefix_len)
+        minimum_block_len = int(minimum_block_len)
+        if prefix_len < 0 or minimum_block_len < 0:
+            raise ValueError(
+                "prefix and minimum block lengths must be non-negative, got "
+                f"prefix={prefix_len}, minimum={minimum_block_len}"
+            )
+
+        slices = []
+        start = 0
+        while start < prefix_len:
+            remaining = prefix_len - start
+            length = min(block_size, remaining)
+            tail = remaining - length
+            if tail and tail < minimum_block_len:
+                length = remaining
+            slices.append((start, length))
+            start += length
+        request_slices.append(slices)
+
+    rounds = []
+    max_rounds = max((len(slices) for slices in request_slices), default=0)
+    for round_index in range(max_rounds):
+        rounds.append(
+            [
+                (
+                    slices[round_index]
+                    if round_index < len(slices)
+                    else (int(prefix_len), 0)
+                )
+                for prefix_len, slices in zip(prefix_lens, request_slices)
+            ]
+        )
+    return rounds
+
+
 def can_cp_split(seq_len: int, cp_size: int, forward_batch):
     # Base conditions: CP must be enabled, size > 1, and this must be a
     # CP-extend (prefill) step. The seq_len // (cp_size * 2) check ensures
