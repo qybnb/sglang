@@ -114,8 +114,10 @@ DSPARK_BLOCK_SIZE="${DSPARK_BLOCK_SIZE:-7}"
 DSPARK_DRAFT_ATTENTION_BACKEND="${DSPARK_DRAFT_ATTENTION_BACKEND:-ascend}"
 DSPARK_DRAFT_QUANTIZATION="${DSPARK_DRAFT_QUANTIZATION:-unquant}"
 DISABLE_CUDA_GRAPH="${DISABLE_CUDA_GRAPH:-0}"
+ENABLE_PREFIX_CACHE="${ENABLE_PREFIX_CACHE:-1}"
 case "${DEEPEP_MODE}" in auto|normal|low_latency) ;; *) exit 2 ;; esac
 case "${DISABLE_CUDA_GRAPH}" in 0|1) ;; *) exit 2 ;; esac
+case "${ENABLE_PREFIX_CACHE}" in 0|1) ;; *) exit 2 ;; esac
 if [[ "${DISABLE_CUDA_GRAPH}" == "0" && "${DEEPEP_MODE}" == "normal" ]]; then
     echo "Decode graph capture requires DEEPEP_MODE=auto or low_latency; got normal." >&2
     exit 2
@@ -137,6 +139,11 @@ if [[ "${DISABLE_CUDA_GRAPH}" == "1" ]]; then
 else
     read -r -a CUDA_GRAPH_BS_ARRAY <<< "${CUDA_GRAPH_BS:-1 4}"
     CUDA_GRAPH_ARGS=(--cuda-graph-bs-decode "${CUDA_GRAPH_BS_ARRAY[@]}")
+fi
+
+CACHE_ARGS=()
+if [[ "${ENABLE_PREFIX_CACHE}" == "0" ]]; then
+    CACHE_ARGS=(--disable-radix-cache)
 fi
 
 RUN_TAG="${RUN_TAG:-full_4node_dspark_${PROFILE}_cp${CP_SIZE}}"
@@ -197,7 +204,7 @@ SERVER_ARGS=(
     --reasoning-parser kimi_k3
     --moe-a2a-backend deepep
     --deepep-mode "${DEEPEP_MODE}"
-    --disable-radix-cache
+    "${CACHE_ARGS[@]}"
     "${CUDA_GRAPH_ARGS[@]}"
     --speculative-algorithm DSPARK
     --speculative-draft-model-path "${DRAFT_MODEL_PATH}"
@@ -218,6 +225,7 @@ echo "  KDA=${KDA_CP_BACKEND}, MLA=${MLA_CP_BACKEND}, ragged=${SGLANG_RAGGED_VER
 echo "  dist=${DIST_INIT_ADDR}, port=${PORT}, interface=${NET_IFACE}"
 echo "  chunk=${CHUNKED_PREFILL_SIZE}, max-tokens=${MAX_TOTAL_TOKENS}, mem=${MEM_FRACTION_STATIC}"
 echo "  HCCL_BUFFSIZE=${HCCL_BUFFSIZE}, DeepEP=${DEEPEP_MODE}, decode-graph=$((1 - DISABLE_CUDA_GRAPH))"
+echo "  prefix-cache=${ENABLE_PREFIX_CACHE}"
 echo "  HCCL_NPU_SOCKET_PORT_RANGE=${HCCL_NPU_SOCKET_PORT_RANGE}"
 echo "  graph-replay-log=${SGLANG_LOG_DECODE_GRAPH_KEY}, log=${LOG_FILE}"
 
