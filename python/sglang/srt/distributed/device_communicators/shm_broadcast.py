@@ -19,7 +19,7 @@ from zmq import IPV6  # type: ignore
 from zmq import SUB, SUBSCRIBE, XPUB, XPUB_VERBOSE, Context  # type: ignore
 
 from sglang.srt.environ import envs
-from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto, get_open_port
+from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 
 # SGLANG_RINGBUFFER_WARNING_INTERVAL can be set to 60
@@ -237,13 +237,23 @@ class MessageQueue:
             # create a publish-subscribe socket to communicate large data
             self.remote_socket = context.socket(XPUB)
             self.remote_socket.setsockopt(XPUB_VERBOSE, True)
-            remote_subscribe_port = get_open_port()
-            na = NetworkAddress(connect_ip, remote_subscribe_port)
+            na = NetworkAddress(connect_ip, 0)
             if na.is_ipv6:
                 self.remote_socket.setsockopt(IPV6, 1)
-            address = na.to_tcp()
-            logger.debug(f"class MessageQueue: Binding remote socket to {address=}")
-            self.remote_socket.bind(address)
+            # Select and bind the remote endpoint atomically. Calling
+            # get_open_port() first closes its probe socket before the XPUB
+            # bind, so concurrent process-group writers can select the same
+            # port during multi-node DP/CP initialization.
+            bind_host = f"[{connect_ip}]" if na.is_ipv6 else connect_ip
+            bind_address = f"tcp://{bind_host}"
+            remote_subscribe_port = self.remote_socket.bind_to_random_port(
+                bind_address
+            )
+            logger.debug(
+                "class MessageQueue: Bound remote socket to %s:%d",
+                bind_address,
+                remote_subscribe_port,
+            )
 
         else:
             remote_subscribe_port = None
