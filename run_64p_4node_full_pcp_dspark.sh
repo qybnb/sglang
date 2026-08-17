@@ -148,7 +148,50 @@ fi
 
 RUN_TAG="${RUN_TAG:-full_4node_dspark_${PROFILE}_cp${CP_SIZE}}"
 LOG_DIR="${LOG_DIR:-${REPO_ROOT}/logs/kimi_k3_4node_full_pcp_dspark}"
-LOG_FILE="${LOG_DIR}/${RUN_TAG}_rank${NODE_RANK}_$(date '+%Y-%m-%d_%H-%M-%S').log"
+LOG_STAMP="$(date '+%Y-%m-%d_%H-%M-%S')"
+LOG_FILE="${LOG_DIR}/${RUN_TAG}_rank${NODE_RANK}_${LOG_STAMP}.log"
+STARTUP_LOG_FILE="${LOG_DIR}/${RUN_TAG}_rank${NODE_RANK}_${LOG_STAMP}.startup.log"
+
+# Keep startup diagnostics independent from the controller's launcher log.  In
+# particular, this records failures before launch_server and leaves the last
+# completed phase behind even when the process is killed by SIGKILL.
+mkdir -p "${LOG_DIR}"
+exec > >(tee -a "${STARTUP_LOG_FILE}") 2>&1
+STARTUP_PHASE="configuration-complete"
+STARTUP_STARTED_AT="$(date --iso-8601=seconds)"
+
+startup_log() {
+    printf '[KIMI_K3_STARTUP] ts=%s pid=%s rank=%s phase=%s %s\n' \
+        "$(date --iso-8601=seconds)" "$$" "${NODE_RANK}" \
+        "${STARTUP_PHASE}" "$*"
+}
+
+startup_error() {
+    local rc=$?
+    local line="${BASH_LINENO[0]:-unknown}"
+    local command="${BASH_COMMAND:-unknown}"
+    trap - ERR
+    startup_log "event=error rc=${rc} line=${line} command=$(printf '%q' "${command}")"
+    exit "${rc}"
+}
+
+startup_exit() {
+    local rc=$?
+    startup_log "event=exit rc=${rc} started_at=${STARTUP_STARTED_AT}"
+}
+
+startup_signal() {
+    local signal="$1"
+    startup_log "event=signal signal=${signal}"
+    exit 128
+}
+
+trap startup_error ERR
+trap startup_exit EXIT
+trap 'startup_signal HUP' HUP
+trap 'startup_signal INT' INT
+trap 'startup_signal TERM' TERM
+startup_log "event=start startup_log=${STARTUP_LOG_FILE} runtime_log=${LOG_FILE}"
 
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
 export NO_PROXY="${NO_PROXY:+${NO_PROXY},}127.0.0.1,localhost,${NODE_IPS}"
@@ -236,18 +279,32 @@ if [[ "${CONFIG_ONLY}" == "1" ]]; then
     exit 0
 fi
 
+STARTUP_PHASE="source-ascend-environment"
 for env_script in \
     /usr/local/Ascend/ascend-toolkit/set_env.sh \
     /usr/local/Ascend/nnal/atb/set_env.sh; do
     if [[ -f "${env_script}" ]]; then
+        startup_log "event=source-begin file=${env_script}"
         set +u
         # shellcheck disable=SC1090
         source "${env_script}"
         set -u
+        startup_log "event=source-end file=${env_script} rc=0"
+    else
+        startup_log "event=source-skip file=${env_script} reason=not-found"
     fi
 done
 
-mkdir -p "${LOG_DIR}"
+STARTUP_PHASE="launch-server"
+startup_log "event=exec-begin python=${PYTHON_BIN} runtime_log=${LOG_FILE}"
+# launch_server owns the long-running process.  Capture its status explicitly
+# so the ERR trap does not report the final `tee` process as the failed command.
+trap - ERR
+set +e
 "${PYTHON_BIN}" -m sglang.launch_server "${SERVER_ARGS[@]}" \
     2>&1 | tee "${LOG_FILE}"
-exit "${PIPESTATUS[0]}"
+server_rc="${PIPESTATUS[0]}"
+set -e
+trap startup_error ERR
+startup_log "event=exec-end rc=${server_rc}"
+exit "${server_rc}"

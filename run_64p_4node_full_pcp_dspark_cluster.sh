@@ -61,21 +61,24 @@ run_on() {
 
 status_command() {
     local pid_file="${REMOTE_LOG_DIR}/server.pid"
+    local exit_file="${REMOTE_LOG_DIR}/server.exit"
     printf '%s' \
-        "pid_file=$(printf '%q' "${pid_file}"); " \
+        "pid_file=$(printf '%q' "${pid_file}"); exit_file=$(printf '%q' "${exit_file}"); " \
         'pid=$(cat "${pid_file}" 2>/dev/null || true); ' \
-        'if [[ "${pid}" =~ ^[1-9][0-9]*$ ]] && kill -0 "${pid}" 2>/dev/null; then echo "RUNNING pid=${pid}"; else echo STOPPED; fi'
+        'if [[ "${pid}" =~ ^[1-9][0-9]*$ ]] && kill -0 "${pid}" 2>/dev/null; then echo "RUNNING pid=${pid}"; ' \
+        'else rc=$(cat "${exit_file}" 2>/dev/null || true); if [[ "${rc}" =~ ^[0-9]+$ ]]; then echo "STOPPED rc=${rc}"; else echo "STOPPED rc=unknown (possible SIGKILL)"; fi; fi'
 }
 
 cleanup_command() {
     local pid_file="${REMOTE_LOG_DIR}/server.pid"
     local pgid_file="${REMOTE_LOG_DIR}/server.pgid"
+    local exit_file="${REMOTE_LOG_DIR}/server.exit"
     printf '%s' \
-        "pid_file=$(printf '%q' "${pid_file}"); pgid_file=$(printf '%q' "${pgid_file}"); " \
+        "pid_file=$(printf '%q' "${pid_file}"); pgid_file=$(printf '%q' "${pgid_file}"); exit_file=$(printf '%q' "${exit_file}"); " \
         'pkill -9 -f "[r]un_64p_4node_full_pcp_dspark.sh" 2>/dev/null || true; ' \
         'pkill -9 -f "[s]glang.launch_server" 2>/dev/null || true; ' \
         'pkill -9 -f "[s]glang::scheduler" 2>/dev/null || true; ' \
-        'rm -f "${pid_file}" "${pgid_file}"; echo STOPPED'
+        'rm -f "${pid_file}" "${pgid_file}" "${exit_file}"; echo STOPPED'
 }
 
 if [[ "${ACTION}" == "status" || "${ACTION}" == "stop" ]]; then
@@ -122,6 +125,7 @@ for rank in 1 2 3 0; do
     log_file="${REMOTE_LOG_DIR}/${PROFILE}_rank${rank}_launcher.log"
     pid_file="${REMOTE_LOG_DIR}/server.pid"
     pgid_file="${REMOTE_LOG_DIR}/server.pgid"
+    exit_file="${REMOTE_LOG_DIR}/server.exit"
     model_var="MODEL_PATH_RANK${rank}"
     draft_var="DRAFT_MODEL_PATH_RANK${rank}"
     net_iface_var="NET_IFACE_RANK${rank}"
@@ -141,13 +145,19 @@ for rank in 1 2 3 0; do
 
     run_on "${host}" "$(cleanup_command)" >/dev/null
 
-    printf -v launch '%q ' \
-        nohup setsid env "${env_args[@]}" \
+    printf -v server_command '%q ' \
+        env "${env_args[@]}" \
         ./run_64p_4node_full_pcp_dspark.sh "${PROFILE}"
+    printf -v exit_file_q '%q' "${exit_file}"
+    wrapper_command="printf '[KIMI_K3_CONTROLLER] ts=%s event=child-start pid=%s\\n' \"\$(date --iso-8601=seconds)\" \"\$\$\"; "
+    wrapper_command+="${server_command}; rc=\$?; "
+    wrapper_command+="printf '[KIMI_K3_CONTROLLER] ts=%s event=child-exit rc=%s\\n' \"\$(date --iso-8601=seconds)\" \"\${rc}\"; "
+    wrapper_command+="printf '%s\\n' \"\${rc}\" >${exit_file_q}; exit \"\${rc}\""
+    printf -v launch '%q ' nohup setsid bash -c "${wrapper_command}"
 
     command="cd $(printf '%q' "${REMOTE_REPO_ROOT}") || exit 1; "
     command+="mkdir -p $(printf '%q' "${REMOTE_LOG_DIR}"); "
-    command+="rm -f $(printf '%q' "${pid_file}") $(printf '%q' "${pgid_file}"); "
+    command+="rm -f $(printf '%q' "${pid_file}") $(printf '%q' "${pgid_file}") $(printf '%q' "${exit_file}"); "
     command+="${launch}>$(printf '%q' "${log_file}") 2>&1 < /dev/null & "
     command+='pid=$!; echo "${pid}" >'"$(printf '%q' "${pid_file}")"'; '
     command+='pgid=$(ps -o pgid= -p "${pid}" 2>/dev/null | tr -d " " || true); echo "${pgid}" >'"$(printf '%q' "${pgid_file}")"
