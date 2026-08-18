@@ -64,7 +64,7 @@ if [[ ! "${NODE_RANK}" =~ ^[0-3]$ ]]; then
 fi
 
 TP_SIZE="${TP_SIZE:-64}"
-DP_SIZE="${DP_SIZE:-2}"
+DP_SIZE="${DP_SIZE:-1}"
 CP_SIZE="${CP_SIZE:-4}"
 if (( TP_SIZE % NNODES != 0 )); then
     echo "TP_SIZE must be divisible by NNODES." >&2
@@ -91,6 +91,16 @@ case "${PROFILE}" in
         MLA_CP_BACKEND=ring
         ;;
 esac
+if [[ -n "${MLA_CP_BACKEND_OVERRIDE:-}" ]]; then
+    MLA_CP_BACKEND="${MLA_CP_BACKEND_OVERRIDE}"
+fi
+case "${MLA_CP_BACKEND}" in
+    allgather|ring) ;;
+    *)
+        echo "MLA_CP_BACKEND_OVERRIDE must be allgather or ring (got ${MLA_CP_BACKEND})." >&2
+        exit 2
+        ;;
+esac
 
 # Dedicated defaults keep this service separate from the PCP-only service.
 DIST_PORT="${DIST_PORT:-15110}"
@@ -98,13 +108,17 @@ DIST_INIT_ADDR="${DIST_INIT_ADDR:-${NODE_IP_ARRAY[0]}:${DIST_PORT}}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-15010}"
 NET_IFACE="${NET_IFACE:-enp196s0f0}"
-PAGE_SIZE="${PAGE_SIZE:-64}"
-CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-4096}"
-MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-212992}"
-MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-4}"
-MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.85}"
+PAGE_SIZE="${PAGE_SIZE:-128}"
+CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-8192}"
+MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-131072}"
+MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-2}"
+MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.82}"
 DEEPEP_MODE="${DEEPEP_MODE:-auto}"
 HCCL_BUFFSIZE="${HCCL_BUFFSIZE:-2000}"
+# Avoid importing torch from ATB's set_env.sh during every distributed launch.
+# The current Kimi-K3 image uses the CXX11 ABI; callers using another image can
+# override this with ATB_CXX_ABI=0.
+ATB_CXX_ABI="${ATB_CXX_ABI:-1}"
 # The Kimi-K3 EP64 low-latency combine kernel requires 1709 MB when
 # SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128.  Keep a small,
 # log-proven safety margin and fail before loading weights if a caller
@@ -118,6 +132,10 @@ ENABLE_PREFIX_CACHE="${ENABLE_PREFIX_CACHE:-1}"
 case "${DEEPEP_MODE}" in auto|normal|low_latency) ;; *) exit 2 ;; esac
 case "${DISABLE_CUDA_GRAPH}" in 0|1) ;; *) exit 2 ;; esac
 case "${ENABLE_PREFIX_CACHE}" in 0|1) ;; *) exit 2 ;; esac
+case "${ATB_CXX_ABI}" in
+    0|1) ;;
+    *) echo "ATB_CXX_ABI must be 0 or 1 (got ${ATB_CXX_ABI})." >&2; exit 2 ;;
+esac
 if [[ "${DISABLE_CUDA_GRAPH}" == "0" && "${DEEPEP_MODE}" == "normal" ]]; then
     echo "Decode graph capture requires DEEPEP_MODE=auto or low_latency; got normal." >&2
     exit 2
@@ -137,7 +155,7 @@ fi
 if [[ "${DISABLE_CUDA_GRAPH}" == "1" ]]; then
     CUDA_GRAPH_ARGS=(--disable-cuda-graph)
 else
-    read -r -a CUDA_GRAPH_BS_ARRAY <<< "${CUDA_GRAPH_BS:-1 4}"
+    read -r -a CUDA_GRAPH_BS_ARRAY <<< "${CUDA_GRAPH_BS:-2}"
     CUDA_GRAPH_ARGS=(--cuda-graph-bs-decode "${CUDA_GRAPH_BS_ARRAY[@]}")
 fi
 
@@ -268,6 +286,7 @@ echo "  KDA=${KDA_CP_BACKEND}, MLA=${MLA_CP_BACKEND}, ragged=${SGLANG_RAGGED_VER
 echo "  dist=${DIST_INIT_ADDR}, port=${PORT}, interface=${NET_IFACE}"
 echo "  chunk=${CHUNKED_PREFILL_SIZE}, max-tokens=${MAX_TOTAL_TOKENS}, mem=${MEM_FRACTION_STATIC}"
 echo "  HCCL_BUFFSIZE=${HCCL_BUFFSIZE}, DeepEP=${DEEPEP_MODE}, decode-graph=$((1 - DISABLE_CUDA_GRAPH))"
+echo "  ATB_CXX_ABI=${ATB_CXX_ABI}"
 echo "  prefix-cache=${ENABLE_PREFIX_CACHE}"
 echo "  HCCL_NPU_SOCKET_PORT_RANGE=${HCCL_NPU_SOCKET_PORT_RANGE}"
 echo "  graph-replay-log=${SGLANG_LOG_DECODE_GRAPH_KEY}, log=${LOG_FILE}"
@@ -287,7 +306,11 @@ for env_script in \
         startup_log "event=source-begin file=${env_script}"
         set +u
         # shellcheck disable=SC1090
-        source "${env_script}"
+        if [[ "${env_script}" == */nnal/atb/set_env.sh ]]; then
+            source "${env_script}" "--cxx_abi=${ATB_CXX_ABI}"
+        else
+            source "${env_script}"
+        fi
         set -u
         startup_log "event=source-end file=${env_script} rc=0"
     else
