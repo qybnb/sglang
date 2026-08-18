@@ -64,7 +64,7 @@ if [[ ! "${NODE_RANK}" =~ ^[0-3]$ ]]; then
 fi
 
 TP_SIZE="${TP_SIZE:-64}"
-DP_SIZE="${DP_SIZE:-1}"
+DP_SIZE="${DP_SIZE:-2}"
 CP_SIZE="${CP_SIZE:-4}"
 if (( TP_SIZE % NNODES != 0 )); then
     echo "TP_SIZE must be divisible by NNODES." >&2
