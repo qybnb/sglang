@@ -1,6 +1,22 @@
+import math
 from typing import Optional, Tuple, Union
 
 import torch
+
+from sgl_kernel_npu.fla.kda_chunk_delta_h import (
+    chunk_gated_delta_rule_fwd_h_npu,
+)
+from sgl_kernel_npu.fla.kda_prefill import (
+    chunk_gla_fwd_o_gk_npu,
+    recompute_w_u_fwd_npu,
+)
+from sgl_kernel_npu.fla.solve_tril import solve_tril_npu
+from sgl_kernel_npu.fla.utils import prepare_chunk_indices
+from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
+from sglang.kernels.ops.attention.fla.kda import chunk_kda_scaled_dot_kkt_fwd
+from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
+
+_LOG2_E = math.log2(math.e)
 
 from sglang.srt.layers.attention.fla.chunk_delta_h import (
     CHUNK_SIZE as KDA_CHUNK_SIZE,
@@ -264,6 +280,87 @@ class KDAKernelDispatcher:
             **kwargs,
         )
 
+    def extend_recompute(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        *,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        return_intermediate_states: bool = False,
+        **kwargs,
+    ):
+        chunk_size = 64
+        q = l2norm_fwd(q.contiguous())
+        k = l2norm_fwd(k.contiguous())
+        v = v.contiguous()
+        beta = beta.contiguous()
+        chunk_indices = prepare_chunk_indices(query_start_loc, chunk_size)
+        g = chunk_local_cumsum(
+            g.contiguous(),
+            chunk_size=chunk_size,
+            scale=_LOG2_E,
+            cu_seqlens=query_start_loc,
+            chunk_indices=chunk_indices,
+        )
+
+        triangular, query_key = chunk_kda_scaled_dot_kkt_fwd(
+            q=q,
+            k=k,
+            gk=g,
+            beta=beta,
+            scale=k.shape[-1] ** -0.5,
+            cu_seqlens=query_start_loc,
+            output_dtype=torch.float32,
+        )
+        triangular = solve_tril_npu(
+            A=triangular,
+            cu_seqlens=query_start_loc,
+            output_dtype=k.dtype,
+        )
+        w, u, _, gated_k = recompute_w_u_fwd_npu(
+            k=k,
+            v=v,
+            beta=beta,
+            A=triangular,
+            gk=g,
+            cu_seqlens=query_start_loc,
+            chunk_indices=chunk_indices,
+        )
+        del triangular
+        chunk_states, new_values = chunk_gated_delta_rule_fwd_h_npu(
+            k=gated_k,
+            w=w,
+            u=u,
+            gk=g,
+            initial_state=ssm_states,
+            initial_state_indices=cache_indices,
+            cu_seqlens=query_start_loc,
+            chunk_indices=chunk_indices,
+            use_exp2=True,
+        )
+        del w, u, gated_k
+        out = chunk_gla_fwd_o_gk_npu(
+            q=q,
+            v=new_values,
+            g=g,
+            A=query_key,
+            h=chunk_states,
+            out=v,
+            scale=k.shape[-1] ** -0.5,
+            cu_seqlens=query_start_loc,
+            chunk_size=chunk_size,
+            chunk_indices=chunk_indices,
+        )
+        del query_key, new_values
+        if return_intermediate_states:
+            return out, chunk_states.transpose(-1, -2).contiguous()
+        return out
+
     def extend(
         self,
         q: torch.Tensor,
@@ -277,7 +374,7 @@ class KDAKernelDispatcher:
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        return self.extend_kernel.extend(
+        return self.extend_recompute(
             q,
             k,
             v,
@@ -289,7 +386,9 @@ class KDAKernelDispatcher:
             **kwargs,
         )
 
+
 from torch.nn import functional as F
+
 
 def causal_conv1d_fn_native(
     x: torch.Tensor,
@@ -336,7 +435,6 @@ def causal_conv1d_fn_native(
             final_states_out = final_states
     out = (out if activation is None else F.silu(out)).to(dtype=dtype_in)
     return (out, None) if not return_final_states else (out, final_states_out)
-
 
 
 def causal_conv1d_fn_npu_old(
@@ -485,9 +583,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
     def _make_verify_scratch_indices(self, num_rows: int) -> torch.Tensor:
         if not self._dspark_target_verify:
-            return torch.arange(
-                num_rows, dtype=torch.int32, device=self.device
-            )
+            return torch.arange(num_rows, dtype=torch.int32, device=self.device)
         speculative_cache = (
             self.req_to_token_pool.get_speculative_mamba2_params_all_layers()
         )
@@ -514,9 +610,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
         if self.forward_metadata.has_mamba_track_mask:
-            track_mask_indices = forward_batch.mamba_track_mask.nonzero(
-                as_tuple=True
-            )[0]
+            track_mask_indices = forward_batch.mamba_track_mask.nonzero(as_tuple=True)[
+                0
+            ]
             self.forward_metadata.conv_states_mask_indices = (
                 self.forward_metadata.mamba_track_indices[track_mask_indices]
             )
@@ -691,7 +787,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
-        
+
         ret = self.kernel_dispatcher.decode(
             q=q,
             k=k,
@@ -730,9 +826,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         q = q.unflatten(-1, (num_heads, layer.head_q_dim))
         k = k.unflatten(-1, (num_heads, layer.head_k_dim))
         v = v.unflatten(-1, (num_heads, layer.head_v_dim))
-        if not (
-            layer.num_q_heads == layer.num_k_heads == layer.num_v_heads
-        ):
+        if not (layer.num_q_heads == layer.num_k_heads == layer.num_v_heads):
             raise NotImplementedError(
                 "KDA prefill CP currently requires equal Q/K/V head counts."
             )
@@ -806,8 +900,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
         tracked_full = self._heads_to_qkv_channels(tracked_full, layer).transpose(
             -1, -2
         )
-        conv_states[self.forward_metadata.conv_states_mask_indices] = (
-            tracked_full.to(conv_states.dtype, copy=False)
+        conv_states[self.forward_metadata.conv_states_mask_indices] = tracked_full.to(
+            conv_states.dtype, copy=False
         )
 
     def _sync_kda_cp_final_states(
@@ -897,10 +991,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 )
                 self._kda_fla_cp_logged = True
         elif use_kda_a2a:
-            mixed_qkv, a, b, head_start, num_cp_heads = (
-                self._transpose_kda_cp_inputs(
-                    layer, forward_batch, mixed_qkv, a, b
-                )
+            mixed_qkv, a, b, head_start, num_cp_heads = self._transpose_kda_cp_inputs(
+                layer, forward_batch, mixed_qkv, a, b
             )
 
         # Save the raw QKV convolution window at the last cacheable chunk
@@ -915,9 +1007,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 mixed_qkv_to_track = mixed_qkv[
                     self.forward_metadata.track_conv_indices
                 ].transpose(-1, -2)
-                conv_states[
-                    self.forward_metadata.conv_states_mask_indices
-                ] = mixed_qkv_to_track.to(conv_states.dtype, copy=False)
+                conv_states[self.forward_metadata.conv_states_mask_indices] = (
+                    mixed_qkv_to_track.to(conv_states.dtype, copy=False)
+                )
 
         splits = (
             [
@@ -1080,9 +1172,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             kernel_cache_indices = cache_indices
 
         kernel_query_start_loc = (
-            fla_cp_context.local_cu_seqlens
-            if use_fla_cp
-            else query_start_loc
+            fla_cp_context.local_cu_seqlens if use_fla_cp else query_start_loc
         )
 
         core_attn_out, _, h = self.kernel_dispatcher.extend(

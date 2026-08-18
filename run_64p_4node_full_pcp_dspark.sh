@@ -27,7 +27,8 @@ esac
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
-export PYTHONPATH="${REPO_ROOT}/python:${PYTHONPATH:-}"
+KERNEL_CODE_ROOT="${KERNEL_CODE_ROOT:-/home/hanwlax/test-codes/sgl-kernel-npu}"
+export PYTHONPATH="${REPO_ROOT}/python:${KERNEL_CODE_ROOT}/python/sgl_kernel_npu:${PYTHONPATH:-}"
 
 MODEL_PATH="${MODEL_PATH:-/home/weights/Kimi-K3-w4a8-int-moe}"
 DRAFT_MODEL_PATH="${DRAFT_MODEL_PATH:-/home/weights/Kimi-K3-DSpark}"
