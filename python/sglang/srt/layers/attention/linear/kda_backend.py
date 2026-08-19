@@ -294,6 +294,12 @@ class KDAKernelDispatcher:
         return_intermediate_states: bool = False,
         **kwargs,
     ):
+        # The Ascend kernel follows the newer shared-backend cache convention
+        # used by AscendKDAAttnBackend: persistent states are [H, V, K] and
+        # are transposed to [H, K, V] internally.  This branch predates that
+        # backend split and keeps its persistent KDA states as [H, K, V], so
+        # expose a transposed view to preserve the kernel's expected contract.
+        npu_ssm_states = ssm_states.transpose(-1, -2)
         chunk_size = 64
         q = l2norm_fwd(q.contiguous())
         k = l2norm_fwd(k.contiguous())
@@ -337,7 +343,7 @@ class KDAKernelDispatcher:
             w=w,
             u=u,
             gk=g,
-            initial_state=ssm_states,
+            initial_state=npu_ssm_states,
             initial_state_indices=cache_indices,
             cu_seqlens=query_start_loc,
             chunk_indices=chunk_indices,
@@ -357,9 +363,11 @@ class KDAKernelDispatcher:
             chunk_indices=chunk_indices,
         )
         del query_key, new_values
-        if return_intermediate_states:
-            return out, chunk_states.transpose(-1, -2).contiguous()
-        return out
+        # KDAAttnBackend in this branch always consumes the legacy three-value
+        # kernel result.  chunk_states already has this branch's [K, V]
+        # layout, so do not apply the [V, K] transpose used by the newer shared
+        # Ascend backend.
+        return out, None, chunk_states
 
     def extend(
         self,
@@ -374,6 +382,21 @@ class KDAKernelDispatcher:
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
+        # The decomposed Ascend kernel copied from the newer backend has no
+        # affine CP composition support.  Keep FLA PCP on the established
+        # kernel, which consumes cp_context and combines states across ranks.
+        if kwargs.get("cp_context") is not None:
+            return self.extend_kernel.extend(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                **kwargs,
+            )
         return self.extend_recompute(
             q,
             k,
