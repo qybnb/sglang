@@ -4,6 +4,7 @@
 # the following copyright notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -11,7 +12,10 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.attention.fla.chunk_delta_h import chunk_gated_delta_rule_fwd_h
+from sglang.srt.layers.attention.fla.chunk_delta_h import (
+    chunk_gated_delta_rule_fwd_affine,
+    chunk_gated_delta_rule_fwd_h,
+)
 from sglang.srt.layers.attention.fla.cumsum import chunk_local_cumsum
 from sglang.srt.layers.attention.fla.fused_recurrent import (
     fused_recurrent_gated_delta_rule_fwd_kernel,
@@ -1189,59 +1193,65 @@ def chunk_kda_fwd(
         num_segments = len(cu_seqlens) - 1
         _, _, num_heads, key_dim = kg.shape
         value_dim = u.shape[-1]
-        affine_indices = torch.arange(
-            num_segments, dtype=torch.int32, device=k.device
-        )
-        # The recurrence is independent across value columns.  Compute the
-        # additive H and transition M halves separately, then concatenate them
-        # for the existing PR-691-style composition.  Besides being
-        # mathematically identical to running [u | 0] from [0 | I], this keeps
-        # both Ascend Triton specializations at V=128.  The combined V=256
-        # specialization is known to crash bishengir-compile for Kimi-K3's
-        # DP2/CP4 local-head shape (H=12).
-        affine_additive = torch.zeros(
-            num_segments,
-            num_heads,
-            key_dim,
-            value_dim,
-            dtype=torch.float32,
-            device=k.device,
-        )
-        chunk_gated_delta_rule_fwd_h(
-            k=kg,
-            w=w,
-            u=u,
-            gk=g,
-            initial_state=affine_additive,
-            initial_state_indices=affine_indices,
-            save_new_value=False,
-            cu_seqlens=cu_seqlens,
-        )
-
-        affine_transition = torch.zeros(
-            num_segments,
-            num_heads,
-            key_dim,
-            key_dim,
-            dtype=torch.float32,
-            device=k.device,
-        )
-        affine_transition.copy_(
-            torch.eye(key_dim, dtype=torch.float32, device=k.device).view(
-                1, 1, key_dim, key_dim
+        affine_indices = torch.arange(num_segments, dtype=torch.int32, device=k.device)
+        if os.getenv("SGLANG_KDA_CP_LEGACY_AFFINE", "0") == "1":
+            # Correctness fallback used by the first Ascend implementation.
+            # It materializes the chunk states twice and is substantially
+            # slower than PR 691's dedicated affine preprocessing kernels.
+            affine_additive = torch.zeros(
+                num_segments,
+                num_heads,
+                key_dim,
+                value_dim,
+                dtype=torch.float32,
+                device=k.device,
             )
-        )
-        chunk_gated_delta_rule_fwd_h(
-            k=kg,
-            w=w,
-            u=u.new_zeros((*u.shape[:-1], key_dim)),
-            gk=g,
-            initial_state=affine_transition,
-            initial_state_indices=affine_indices,
-            save_new_value=False,
-            cu_seqlens=cu_seqlens,
-        )
-        affine_state = torch.cat((affine_additive, affine_transition), dim=-1)
+            chunk_gated_delta_rule_fwd_h(
+                k=kg,
+                w=w,
+                u=u,
+                gk=g,
+                initial_state=affine_additive,
+                initial_state_indices=affine_indices,
+                save_new_value=False,
+                cu_seqlens=cu_seqlens,
+            )
+
+            affine_transition = torch.zeros(
+                num_segments,
+                num_heads,
+                key_dim,
+                key_dim,
+                dtype=torch.float32,
+                device=k.device,
+            )
+            affine_transition.copy_(
+                torch.eye(key_dim, dtype=torch.float32, device=k.device).view(
+                    1, 1, key_dim, key_dim
+                )
+            )
+            chunk_gated_delta_rule_fwd_h(
+                k=kg,
+                w=w,
+                u=u.new_zeros((*u.shape[:-1], key_dim)),
+                gk=g,
+                initial_state=affine_transition,
+                initial_state_indices=affine_indices,
+                save_new_value=False,
+                cu_seqlens=cu_seqlens,
+            )
+            affine_state = torch.cat((affine_additive, affine_transition), dim=-1)
+        else:
+            # PR 691-style fast path: compute only the final affine transform
+            # of each local zigzag segment.  This avoids two full recurrent
+            # passes and their per-chunk state tensors.
+            affine_state = chunk_gated_delta_rule_fwd_affine(
+                k=kg,
+                w=w,
+                u=u,
+                gk=g,
+                cu_seqlens=cu_seqlens,
+            )
         initial_state = compose_kda_cp_affine_states(
             affine_state,
             initial_state,
@@ -1258,6 +1268,10 @@ def chunk_kda_fwd(
         initial_state=initial_state,
         initial_state_indices=initial_state_indices,
         cu_seqlens=cu_seqlens,
+        # Kimi-K3 CP keeps more local heads and uses V=128.  The Ascend
+        # 64-column tile is both numerically identical and materially faster
+        # for this shape; retain the established 32-column tile for non-CP.
+        block_value=64 if cp_context is not None else 32,
     )
     del w, u, kg
     o = chunk_gla_fwd_o_gk(
