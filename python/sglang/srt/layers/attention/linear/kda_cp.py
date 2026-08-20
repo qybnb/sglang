@@ -479,6 +479,47 @@ def compose_kda_cp_affine_states(
         for request_id, fixed_slot in enumerate(context.track_after_slots)
         if fixed_slot >= 0
     )
+
+    use_fused_merge = bool(
+        os.getenv("SGLANG_KDA_CP_FUSED_MERGE", "1") == "1"
+        and local_affine.device.type in ("npu", "cuda")
+        and bs == 1
+        and expected_segments == 2
+        and context.max_rank_segments == 2
+        and key_dim <= 128
+        and not track_request_ids
+        and len(context.affine_steps) == 2 * context.cp_size
+    )
+    if use_fused_merge:
+        # The serving hot path has exactly two rank-owned zigzag segments and
+        # no radix split.  Compose every natural-order affine transform in one
+        # device kernel, producing both local initial states and the replicated
+        # final cache state.  Complex/radix batches retain the general path
+        # below.
+        from sglang.srt.layers.attention.fla.chunk_delta_h import (
+            merge_kda_cp_affine_states,
+        )
+
+        final_state = _get_scratch_buffer(
+            context,
+            "affine_final",
+            state,
+            tuple(state.shape),
+        )
+        merge_kda_cp_affine_states(
+            gathered,
+            state,
+            local_initial,
+            final_state,
+            cp_rank=context.cp_rank,
+        )
+        _write_state_pool(
+            initial_state_source,
+            initial_state_indices,
+            final_state,
+        )
+        return local_initial
+
     tracked_state = torch.empty_like(state) if track_request_ids else None
     tracked_state_is_set = [False] * bs if track_request_ids else None
     affine_steps = context.affine_steps or _build_affine_steps(
