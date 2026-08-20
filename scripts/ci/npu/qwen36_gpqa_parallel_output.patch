@@ -1,0 +1,25 @@
+diff --git a/python/sglang/test/ascend/e2e/test_npu_accuracy_utils.py b/python/sglang/test/ascend/e2e/test_npu_accuracy_utils.py
+--- a/python/sglang/test/ascend/e2e/test_npu_accuracy_utils.py
++++ b/python/sglang/test/ascend/e2e/test_npu_accuracy_utils.py
+@@ -154,7 +154,9 @@ def run_evalscope(
+     script_content += "task_cfg = TaskConfig(**config)\n"
+     script_content += "run_task(task_cfg=task_cfg)\n"
+ 
+-    script_path = f"/tmp/evalscope_run_{model}_{'_'.join(datasets)}.py"
++    output_suffix = os.getenv("SGLANG_TEST_OUTPUT_SUFFIX", "")
++    script_suffix = f"_{output_suffix}" if output_suffix else ""
++    script_path = f"/tmp/evalscope_run_{model}_{'_'.join(datasets)}{script_suffix}.py"
+     with open(script_path, "w") as f:
+         f.write(script_content)
+ 
+@@ -317,6 +319,9 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
+         suite is executed, each case writes its metrics/plog to a path derived
+         from the case file rather than the suite name.
+         """
+         cls.tc_name = cls._get_tc_name()
++        output_suffix = os.getenv("SGLANG_TEST_OUTPUT_SUFFIX", "")
++        if output_suffix:
++            cls.tc_name = f"{cls.tc_name}_{output_suffix}"
+         current_date = datetime.now().strftime("%Y%m%d")
+         test_type = getattr(cls, "test_type", "accuracy")
+         base_output = f"/root/.cache/tests/output/{test_type}/{current_date}"
