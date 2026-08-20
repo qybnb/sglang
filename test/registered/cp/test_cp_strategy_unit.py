@@ -789,8 +789,16 @@ class TestCPZigzagStrategy(CustomTestCase):
 
             local_x = strategy.shard_hidden_states(x, fb)
             local_positions = strategy.shard_position_ids(positions, fb)
-            with patch(
-                "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=True
+            fb.global_prefill_cp_active = True
+            with (
+                patch(
+                    "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get",
+                    return_value=True,
+                ),
+                patch(
+                    "sglang.srt.layers.cp.utils.get_cp_strategy",
+                    return_value=strategy,
+                ),
             ):
                 helper_x, helper_positions = cp_split_before_forward(
                     x,
@@ -1102,6 +1110,118 @@ class TestCPZigzagStrategy(CustomTestCase):
                 state_pool, torch.tensor([[[6.0, 7.0, 8.0]]])
             )
 
+    def test_kda_fla_cp_handles_multiple_requests(self):
+        # CP2 natural blocks, with two independent requests in every block.
+        # Rank-local segment order follows the zigzag packing order.
+        rank_slots = ((0, 8, 6, 14), (2, 10, 4, 12))
+        fixed_sources = (
+            0,
+            -1,
+            0,
+            -1,
+            2,
+            -1,
+            2,
+            -1,
+            1,
+            -1,
+            1,
+            -1,
+            3,
+            -1,
+            3,
+            -1,
+        )
+        common = dict(
+            cp_size=2,
+            batch_size=2,
+            split_list=(1,) * 8,
+            local_segment_lens=(1, 1, 1, 1),
+            local_cu_seqlens=torch.tensor([0, 1, 2, 3, 4], dtype=torch.int32),
+            rank_segment_slots=rank_slots,
+            fixed_segment_sources=fixed_sources,
+            max_rank_segments=4,
+            fixed_segment_lens=(1, 0) * 8,
+            track_after_slots=(-1, -1),
+            track_state_indices=torch.tensor([-1, -1]),
+        )
+
+        # Each scalar affine entry is [H, M].
+        rank_affine = (
+            torch.tensor([1, 2, 10, 1, 4, 5, 40, 4], dtype=torch.float32).view(
+                4, 1, 1, 2
+            ),
+            torch.tensor([2, 3, 20, 2, 3, 4, 30, 3], dtype=torch.float32).view(
+                4, 1, 1, 2
+            ),
+        )
+        expected_affine_initial = (
+            torch.tensor([7, 1, 191, 156], dtype=torch.float32).view(4, 1, 1, 1),
+            torch.tensor([15, 11, 47, 42], dtype=torch.float32).view(4, 1, 1, 1),
+        )
+
+        rank_x = (
+            torch.tensor([[1.0], [20.0], [4.0], [23.0]]),
+            torch.tensor([[2.0], [21.0], [3.0], [22.0]]),
+        )
+        rank_tails = tuple(
+            torch.nn.functional.pad(x.unsqueeze(1), (0, 0, 2, 0)) for x in rank_x
+        )
+        expected_conv_initial = (
+            torch.tensor(
+                [
+                    [[-2.0, -1.0, 0.0]],
+                    [[10.0, 11.0, 12.0]],
+                    [[1.0, 2.0, 3.0]],
+                    [[20.0, 21.0, 22.0]],
+                ]
+            ),
+            torch.tensor(
+                [
+                    [[-1.0, 0.0, 1.0]],
+                    [[11.0, 12.0, 20.0]],
+                    [[0.0, 1.0, 2.0]],
+                    [[12.0, 20.0, 21.0]],
+                ]
+            ),
+        )
+
+        for rank in range(2):
+            context = KDAFLACPContext(
+                group=_FakeFixedShapeGatherGroup(rank_affine, rank),
+                cp_rank=rank,
+                local_segment_slots=rank_slots[rank],
+                **common,
+            )
+            state_pool = torch.tensor([7.0, 1.0]).view(2, 1, 1, 1)
+            local_initial = compose_kda_cp_affine_states(
+                rank_affine[rank], state_pool, torch.tensor([0, 1]), context
+            )
+            torch.testing.assert_close(
+                local_initial, expected_affine_initial[rank]
+            )
+            torch.testing.assert_close(
+                state_pool, torch.tensor([959.0, 664.0]).view(2, 1, 1, 1)
+            )
+
+            context = KDAFLACPContext(
+                group=_FakeFixedShapeGatherGroup(rank_tails, rank),
+                cp_rank=rank,
+                local_segment_slots=rank_slots[rank],
+                **common,
+            )
+            conv_pool = torch.tensor(
+                [[[-2.0, -1.0, 0.0]], [[10.0, 11.0, 12.0]]]
+            )
+            conv_initial = prepare_kda_cp_conv_states(
+                rank_x[rank], conv_pool, torch.tensor([0, 1]), context
+            )
+            torch.testing.assert_close(conv_initial, expected_conv_initial[rank])
+            torch.testing.assert_close(
+                conv_pool,
+                torch.tensor([[[2.0, 3.0, 4.0]], [[21.0, 22.0, 23.0]]]),
+            )
+
     def test_kda_fla_cp_splits_block_at_radix_checkpoint(self):
         metadata = SimpleNamespace(
             bs=1,
@@ -1134,6 +1254,14 @@ class TestCPZigzagStrategy(CustomTestCase):
         self.assertEqual(context.max_rank_segments, 3)
         self.assertEqual(context.track_after_slots, (14,))
         self.assertEqual(context.track_state_indices.tolist(), [9])
+        self.assertEqual(context.track_request_ids, (0,))
+        self.assertEqual(context.track_request_indices.tolist(), [0])
+        self.assertEqual(context.local_segment_indices.tolist(), [0, 1, 2])
+        self.assertEqual(
+            context.local_segment_has_initial_state.tolist(), [True, True, True]
+        )
+        self.assertEqual(context.local_segment_lens_cpu, [131, 107, 24])
+        self.assertEqual(len(context.affine_steps), 9)
 
     def test_kda_fla_cp_tracks_split_affine_and_conv_states(self):
         local_affine = [

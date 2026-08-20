@@ -2,9 +2,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 
-from sglang.srt.layers.attention.fla.chunk_delta_h import (
-    CHUNK_SIZE as KDA_CHUNK_SIZE,
-)
+from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as KDA_CHUNK_SIZE
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kda_cp import (
     all_gather_cp_heads,
@@ -33,13 +31,14 @@ from sglang.srt.utils.common import rank0_log
 # updated window back into the persistent cache, with PyTorch casting to the
 # cache dtype on assignment.
 if is_npu():
-    from sglang.srt.hardware_backend.npu.kernels.causal_conv1d_verify import (
-        causal_conv1d_linear_verify_npu,
-    )
     from sgl_kernel_npu.mamba.causal_conv1d import (
         causal_conv1d_fn_npu,
         causal_conv1d_update_npu,
         torch_causal_conv1d_update_npu,
+    )
+
+    from sglang.srt.hardware_backend.npu.kernels.causal_conv1d_verify import (
+        causal_conv1d_linear_verify_npu,
     )
 
     causal_conv1d_fn = causal_conv1d_fn_npu
@@ -975,11 +974,25 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
             if use_fla_cp:
                 assert fla_cp_context is not None
-                local_indices = torch.arange(
-                    fla_cp_context.num_local_segments,
-                    device=cache_indices.device,
-                    dtype=cache_indices.dtype,
+                local_indices = fla_cp_context.local_segment_indices
+                if (
+                    local_indices is None
+                    or local_indices.dtype != cache_indices.dtype
+                ):
+                    local_indices = torch.arange(
+                        fla_cp_context.num_local_segments,
+                        device=cache_indices.device,
+                        dtype=cache_indices.dtype,
+                    )
+                local_has_initial_state = (
+                    fla_cp_context.local_segment_has_initial_state
                 )
+                if local_has_initial_state is None:
+                    local_has_initial_state = torch.ones(
+                        fla_cp_context.num_local_segments,
+                        dtype=torch.bool,
+                        device=x.device,
+                    )
                 state_work = state.to(weight.dtype).contiguous()
                 out = causal_conv1d_fn(
                     x.to(weight.dtype),
@@ -987,14 +1000,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     bias,
                     activation="silu",
                     conv_states=state_work,
-                    has_initial_state=torch.ones(
-                        fla_cp_context.num_local_segments,
-                        dtype=torch.bool,
-                        device=x.device,
-                    ),
+                    has_initial_state=local_has_initial_state,
                     cache_indices=local_indices,
                     query_start_loc=fla_cp_context.local_cu_seqlens,
-                    seq_lens_cpu=list(fla_cp_context.local_segment_lens),
+                    seq_lens_cpu=(
+                        fla_cp_context.local_segment_lens_cpu
+                        or list(fla_cp_context.local_segment_lens)
+                    ),
                 )
                 return out.to(x.dtype).transpose(0, 1)
 

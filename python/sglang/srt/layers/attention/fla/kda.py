@@ -1193,7 +1193,11 @@ def chunk_kda_fwd(
         num_segments = len(cu_seqlens) - 1
         _, _, num_heads, key_dim = kg.shape
         value_dim = u.shape[-1]
-        affine_indices = torch.arange(num_segments, dtype=torch.int32, device=k.device)
+        affine_indices = cp_context.local_segment_indices
+        if affine_indices is None or affine_indices.dtype != torch.int32:
+            affine_indices = torch.arange(
+                num_segments, dtype=torch.int32, device=k.device
+            )
         if os.getenv("SGLANG_KDA_CP_LEGACY_AFFINE", "0") == "1":
             # Correctness fallback used by the first Ascend implementation.
             # It materializes the chunk states twice and is substantially

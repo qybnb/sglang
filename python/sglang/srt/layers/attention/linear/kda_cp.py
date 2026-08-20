@@ -11,7 +11,7 @@ Decode never enters these helpers.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import accumulate
 from typing import Any, Optional
 
@@ -41,6 +41,17 @@ class KDAFLACPContext:
     fixed_segment_lens: tuple[int, ...]
     track_after_slots: tuple[int, ...]
     track_state_indices: torch.Tensor
+    track_request_indices: Optional[torch.Tensor] = None
+    track_request_ids: tuple[int, ...] = ()
+    local_segment_indices: Optional[torch.Tensor] = None
+    local_segment_has_initial_state: Optional[torch.Tensor] = None
+    local_segment_lens_cpu: Optional[list[int]] = None
+    affine_steps: tuple[
+        tuple[int, tuple[int, ...], tuple[int, ...], tuple[int, ...]], ...
+    ] = ()
+    scratch_buffers: dict[str, torch.Tensor] = field(
+        default_factory=dict, repr=False, compare=False
+    )
 
     @property
     def num_local_segments(self) -> int:
@@ -113,6 +124,48 @@ def _validate_zigzag_metadata(metadata: Any, cp_size: int) -> None:
             "KDA CP metadata/group size mismatch: "
             f"metadata={len(metadata.per_rank_actual_token)}, cp_size={cp_size}"
         )
+
+
+def _natural_block_owner_rank(block_id: int, cp_size: int) -> int:
+    if block_id < cp_size:
+        return block_id
+    return 2 * cp_size - block_id - 1
+
+
+def _build_affine_steps(
+    *,
+    cp_size: int,
+    batch_size: int,
+    local_segment_slots: tuple[int, ...],
+    fixed_segment_sources: tuple[int, ...],
+) -> tuple[tuple[int, tuple[int, ...], tuple[int, ...], tuple[int, ...]], ...]:
+    """Precompute the natural-order affine/conv execution plan once per batch."""
+    blocks_per_request = 2 * cp_size
+    local_slot_to_index = {
+        fixed_slot: local_index
+        for local_index, fixed_slot in enumerate(local_segment_slots)
+    }
+    steps = []
+    for block_id in range(blocks_per_request):
+        owner_rank = _natural_block_owner_rank(block_id, cp_size)
+        for part_id in range(2):
+            fixed_slots = tuple(
+                ((request_id * blocks_per_request + block_id) * 2 + part_id)
+                for request_id in range(batch_size)
+            )
+            source_segments = tuple(
+                fixed_segment_sources[fixed_slot] for fixed_slot in fixed_slots
+            )
+            if all(source_segment < 0 for source_segment in source_segments):
+                continue
+            local_indices = tuple(
+                local_slot_to_index.get(fixed_slot, -1)
+                for fixed_slot in fixed_slots
+            )
+            steps.append(
+                (owner_rank, fixed_slots, source_segments, local_indices)
+            )
+    return tuple(steps)
 
 
 def build_kda_fla_cp_context(
@@ -237,6 +290,16 @@ def build_kda_fla_cp_context(
         device=device,
     )
     track_state_indices = torch.full((bs,), -1, dtype=torch.int64, device=device)
+    track_request_ids = tuple(
+        request_id
+        for request_id, should_track in enumerate(track_mask)
+        if should_track
+    )
+    track_request_indices = torch.tensor(
+        track_request_ids,
+        dtype=torch.int64,
+        device=device,
+    )
     if any(track_mask):
         track_indices = forward_batch.mamba_track_indices.to(
             device=device, dtype=torch.int64
@@ -246,6 +309,7 @@ def build_kda_fla_cp_context(
             mask_device, track_indices, track_state_indices
         )
 
+    fixed_segment_sources_tuple = tuple(fixed_segment_sources)
     context = KDAFLACPContext(
         group=group or get_attention_cp_group(),
         cp_size=cp_size,
@@ -256,31 +320,93 @@ def build_kda_fla_cp_context(
         local_cu_seqlens=local_cu_seqlens,
         local_segment_slots=local_segment_slots,
         rank_segment_slots=rank_segment_slots,
-        fixed_segment_sources=tuple(fixed_segment_sources),
+        fixed_segment_sources=fixed_segment_sources_tuple,
         max_rank_segments=max(len(rank_slots) for rank_slots in rank_segment_slots),
         fixed_segment_lens=tuple(fixed_segment_lens),
         track_after_slots=tuple(track_after_slots),
         track_state_indices=track_state_indices,
+        track_request_indices=track_request_indices,
+        track_request_ids=track_request_ids,
+        local_segment_indices=torch.arange(
+            len(local_segment_lens), dtype=torch.int32, device=device
+        ),
+        local_segment_has_initial_state=torch.ones(
+            len(local_segment_lens), dtype=torch.bool, device=device
+        ),
+        local_segment_lens_cpu=list(local_segment_lens),
+        affine_steps=_build_affine_steps(
+            cp_size=cp_size,
+            batch_size=bs,
+            local_segment_slots=local_segment_slots,
+            fixed_segment_sources=fixed_segment_sources_tuple,
+        ),
     )
     if group is None:
         forward_batch.kda_fla_cp_context = context
     return context
 
 
-def _all_gather_fixed_shape(
-    local: torch.Tensor, context: KDAFLACPContext
+def _get_scratch_buffer(
+    context: KDAFLACPContext,
+    key: str,
+    like: torch.Tensor,
+    shape: tuple[int, ...],
 ) -> torch.Tensor:
-    gathered = local.new_empty(
-        (context.cp_size * local.shape[0], *local.shape[1:])
+    buffer = context.scratch_buffers.get(key)
+    if (
+        buffer is None
+        or tuple(buffer.shape) != shape
+        or buffer.dtype != like.dtype
+        or buffer.device != like.device
+    ):
+        buffer = like.new_empty(shape)
+        context.scratch_buffers[key] = buffer
+    return buffer
+
+
+def _all_gather_fixed_shape(
+    local: torch.Tensor, context: KDAFLACPContext, *, scratch_key: str
+) -> torch.Tensor:
+    gathered_shape = (context.cp_size * local.shape[0], *local.shape[1:])
+    gathered = _get_scratch_buffer(
+        context, f"{scratch_key}_gathered", local, gathered_shape
     )
     context.group.all_gather_into_tensor(gathered, local.contiguous())
     return gathered.view(context.cp_size, *local.shape)
 
 
-def _natural_block_owner_rank(block_id: int, cp_size: int) -> int:
-    if block_id < cp_size:
-        return block_id
-    return 2 * cp_size - block_id - 1
+def _write_state_pool(
+    state_pool: torch.Tensor,
+    state_indices: torch.Tensor,
+    values: torch.Tensor,
+) -> None:
+    """Write valid recurrent states without boolean indexing for batch one.
+
+    Kimi-K3 PCP currently serves one request per CP batch.  In that hot path,
+    boolean indexing creates an ``aten::index`` synchronization point in every
+    KDA layer.  A masked single-row write is equivalent even for an invalid
+    index because it writes the original sentinel row back unchanged.  Keep
+    the general multi-request implementation as the correctness fallback.
+    """
+    valid = state_indices >= 0
+    safe_indices = state_indices.clamp_min(0).to(torch.int64)
+    if state_indices.numel() == 1:
+        old_values = state_pool.index_select(0, safe_indices)
+        masked_values = torch.where(
+            valid.view(1, *([1] * (values.ndim - 1))),
+            values.to(state_pool.dtype),
+            old_values,
+        )
+        state_pool.index_copy_(0, safe_indices, masked_values)
+        return
+
+    active_indices = state_indices[valid].to(torch.int64)
+    if active_indices.numel() > 0:
+        state_pool.index_copy_(
+            0,
+            active_indices,
+            values[valid].to(state_pool.dtype),
+        )
 
 
 def compose_kda_cp_affine_states(
@@ -320,48 +446,67 @@ def compose_kda_cp_affine_states(
             f"affine={(key_dim, value_dim)}."
         )
 
-    padded_affine = local_affine.new_zeros(
-        context.max_rank_segments, *local_affine.shape[1:]
+    identity_transform = None
+    if expected_segments == context.max_rank_segments:
+        # The common no-checkpoint path owns exactly two segments per rank and
+        # needs no collective padding or identity materialisation.
+        padded_affine = local_affine
+    else:
+        identity_transform = local_affine.new_zeros(*local_affine.shape[1:])
+        identity = torch.eye(
+            key_dim, dtype=local_affine.dtype, device=local_affine.device
+        ).view(1, key_dim, key_dim)
+        identity_transform[..., value_dim:].copy_(identity)
+        padded_affine = identity_transform.expand(
+            context.max_rank_segments, *identity_transform.shape
+        ).clone()
+        padded_affine[:expected_segments].copy_(local_affine)
+    gathered = _all_gather_fixed_shape(
+        padded_affine, context, scratch_key="affine"
     )
-    identity_transform = local_affine.new_zeros(*local_affine.shape[1:])
-    identity = torch.eye(
-        key_dim, dtype=padded_affine.dtype, device=padded_affine.device
-    ).view(1, key_dim, key_dim)
-    identity_transform[..., value_dim:].copy_(identity)
-    padded_affine.copy_(identity_transform)
-    padded_affine[:expected_segments].copy_(local_affine)
-    gathered = _all_gather_fixed_shape(padded_affine, context)
     valid = initial_state_indices >= 0
     safe_indices = initial_state_indices.clamp_min(0).to(torch.int64)
     state = initial_state_source.index_select(0, safe_indices).float()
     state = state * valid.view(bs, 1, 1, 1)
-    local_initial = state.new_empty(expected_segments, *state.shape[1:])
-    local_slot_to_index = {
-        fixed_slot: local_index
-        for local_index, fixed_slot in enumerate(context.local_segment_slots)
-    }
-    tracked_state = torch.empty_like(state)
-    tracked_state_is_set = [False] * bs
-    blocks_per_request = 2 * context.cp_size
+    local_initial = _get_scratch_buffer(
+        context,
+        "affine_initial",
+        state,
+        (expected_segments, *state.shape[1:]),
+    )
+    track_request_ids = context.track_request_ids or tuple(
+        request_id
+        for request_id, fixed_slot in enumerate(context.track_after_slots)
+        if fixed_slot >= 0
+    )
+    tracked_state = torch.empty_like(state) if track_request_ids else None
+    tracked_state_is_set = [False] * bs if track_request_ids else None
+    affine_steps = context.affine_steps or _build_affine_steps(
+        cp_size=context.cp_size,
+        batch_size=bs,
+        local_segment_slots=context.local_segment_slots,
+        fixed_segment_sources=context.fixed_segment_sources,
+    )
 
-    for block_id in range(blocks_per_request):
-        owner_rank = _natural_block_owner_rank(block_id, context.cp_size)
-        for part_id in range(2):
-            fixed_slots = [
-                ((request_id * blocks_per_request + block_id) * 2 + part_id)
-                for request_id in range(bs)
-            ]
-            source_segments = [
-                context.fixed_segment_sources[fixed_slot]
-                for fixed_slot in fixed_slots
-            ]
-            if all(source_segment < 0 for source_segment in source_segments):
-                continue
-            if owner_rank == context.cp_rank:
-                for request_id, fixed_slot in enumerate(fixed_slots):
-                    local_index = local_slot_to_index.get(fixed_slot)
-                    if local_index is not None:
-                        local_initial[local_index].copy_(state[request_id])
+    for owner_rank, fixed_slots, source_segments, local_indices in affine_steps:
+        if owner_rank == context.cp_rank:
+            for request_id, local_index in enumerate(local_indices):
+                if local_index >= 0:
+                    local_initial[local_index].copy_(state[request_id])
+        if bs == 1 and source_segments[0] >= 0:
+            # Avoid stack/index materialisation for the serving hot path.
+            transforms = gathered[owner_rank, source_segments[0]].unsqueeze(0)
+        else:
+            if identity_transform is None:
+                identity_transform = local_affine.new_zeros(
+                    *local_affine.shape[1:]
+                )
+                identity = torch.eye(
+                    key_dim,
+                    dtype=local_affine.dtype,
+                    device=local_affine.device,
+                ).view(1, key_dim, key_dim)
+                identity_transform[..., value_dim:].copy_(identity)
             transforms = torch.stack(
                 [
                     (
@@ -371,33 +516,45 @@ def compose_kda_cp_affine_states(
                     )
                     for source_segment in source_segments
                 ]
-            ).float()
-            additive = transforms[..., :value_dim]
-            transition = transforms[..., value_dim:]
-            state = torch.matmul(transition, state) + additive
-            for request_id, fixed_slot in enumerate(fixed_slots):
-                if context.track_after_slots[request_id] == fixed_slot:
-                    tracked_state[request_id].copy_(state[request_id])
-                    tracked_state_is_set[request_id] = True
+            )
+        transforms = transforms.float()
+        additive = transforms[..., :value_dim]
+        transition = transforms[..., value_dim:]
+        state = torch.matmul(transition, state) + additive
+        for request_id in track_request_ids:
+            fixed_slot = fixed_slots[request_id]
+            if context.track_after_slots[request_id] == fixed_slot:
+                assert tracked_state is not None
+                assert tracked_state_is_set is not None
+                tracked_state[request_id].copy_(state[request_id])
+                tracked_state_is_set[request_id] = True
 
-    active_indices = initial_state_indices[valid].to(torch.int64)
-    if active_indices.numel() > 0:
-        initial_state_source.index_copy_(
-            0,
-            active_indices,
-            state[valid].to(initial_state_source.dtype),
+    _write_state_pool(initial_state_source, initial_state_indices, state)
+
+    track_request_indices = context.track_request_indices
+    if track_request_indices is None:
+        track_request_indices = torch.tensor(
+            track_request_ids,
+            dtype=torch.int64,
+            device=initial_state_source.device,
         )
-    track_valid = context.track_state_indices >= 0
-    if bool(track_valid.any()):
-        for request_id in track_valid.nonzero(as_tuple=True)[0].cpu().tolist():
+    if track_request_indices.numel() > 0:
+        assert tracked_state is not None
+        assert tracked_state_is_set is not None
+        for request_id in track_request_ids:
             if not tracked_state_is_set[request_id]:
                 raise RuntimeError(
                     "KDA FLA CP did not produce a requested radix checkpoint"
                 )
+        track_pool_indices = context.track_state_indices.index_select(
+            0, track_request_indices
+        )
         initial_state_source.index_copy_(
             0,
-            context.track_state_indices[track_valid],
-            tracked_state[track_valid].to(initial_state_source.dtype),
+            track_pool_indices,
+            tracked_state.index_select(0, track_request_indices).to(
+                initial_state_source.dtype
+            ),
         )
     return local_initial
 
@@ -435,14 +592,20 @@ def prepare_kda_cp_conv_states(
         )
 
     segments = torch.split(local_x, context.local_segment_lens, dim=0)
-    padded_tails = local_x.new_zeros(
-        context.max_rank_segments, window, channels
+    padded_tails = _get_scratch_buffer(
+        context,
+        "conv_local_tails",
+        local_x,
+        (context.max_rank_segments, window, channels),
     )
+    padded_tails.zero_()
     for segment_id, segment in enumerate(segments):
         take = min(window, segment.shape[0])
         if take:
             padded_tails[segment_id, -take:].copy_(segment[-take:])
-    gathered_tails = _all_gather_fixed_shape(padded_tails, context)
+    gathered_tails = _all_gather_fixed_shape(
+        padded_tails, context, scratch_key="conv"
+    )
 
     valid = cache_indices >= 0
     use_prefix = valid
@@ -457,62 +620,83 @@ def prepare_kda_cp_conv_states(
     safe_indices = cache_indices.clamp_min(0).to(torch.int64)
     prefix_state = conv_state_source.index_select(0, safe_indices)
     prefix_state = prefix_state * use_prefix.view(bs, 1, 1)
-    local_initial = prefix_state.new_empty(
-        context.num_local_segments, channels, window
+    local_initial = _get_scratch_buffer(
+        context,
+        "conv_initial",
+        prefix_state,
+        (context.num_local_segments, channels, window),
     )
-    local_slot_to_index = {
-        fixed_slot: local_index
-        for local_index, fixed_slot in enumerate(context.local_segment_slots)
-    }
     final_states = []
-    tracked_states = torch.empty_like(prefix_state)
-    tracked_state_is_set = [False] * bs
-    blocks_per_request = 2 * context.cp_size
+    track_request_ids = context.track_request_ids or tuple(
+        request_id
+        for request_id, fixed_slot in enumerate(context.track_after_slots)
+        if fixed_slot >= 0
+    )
+    tracked_states = torch.empty_like(prefix_state) if track_request_ids else None
+    tracked_state_is_set = [False] * bs if track_request_ids else None
+    affine_steps = context.affine_steps or _build_affine_steps(
+        cp_size=context.cp_size,
+        batch_size=bs,
+        local_segment_slots=context.local_segment_slots,
+        fixed_segment_sources=context.fixed_segment_sources,
+    )
 
     for request_id in range(bs):
         rolling = prefix_state[request_id]
-        for block_id in range(blocks_per_request):
-            owner_rank = _natural_block_owner_rank(block_id, context.cp_size)
-            for part_id in range(2):
-                fixed_slot = (
-                    (request_id * blocks_per_request + block_id) * 2 + part_id
-                )
-                local_index = local_slot_to_index.get(fixed_slot)
-                if local_index is not None:
-                    local_initial[local_index].copy_(rolling)
-                take = min(window, context.fixed_segment_lens[fixed_slot])
-                if take:
-                    source_segment = context.fixed_segment_sources[fixed_slot]
-                    if source_segment < 0:
-                        raise RuntimeError(
-                            "KDA FLA CP conv segment has no owning rank source"
-                        )
-                    tail = gathered_tails[
-                        owner_rank, source_segment, -take:
-                    ].transpose(0, 1)
-                    rolling = torch.cat((rolling, tail), dim=-1)[..., -window:]
-                if context.track_after_slots[request_id] == fixed_slot:
-                    tracked_states[request_id].copy_(rolling)
-                    tracked_state_is_set[request_id] = True
+        for owner_rank, fixed_slots, source_segments, local_indices in affine_steps:
+            fixed_slot = fixed_slots[request_id]
+            local_index = local_indices[request_id]
+            if local_index >= 0:
+                local_initial[local_index].copy_(rolling)
+            take = min(window, context.fixed_segment_lens[fixed_slot])
+            if take:
+                source_segment = source_segments[request_id]
+                if source_segment < 0:
+                    raise RuntimeError(
+                        "KDA FLA CP conv segment has no owning rank source"
+                    )
+                tail = gathered_tails[
+                    owner_rank, source_segment, -take:
+                ].transpose(0, 1)
+                rolling = torch.cat((rolling, tail), dim=-1)[..., -window:]
+            if context.track_after_slots[request_id] == fixed_slot:
+                assert tracked_states is not None
+                assert tracked_state_is_set is not None
+                tracked_states[request_id].copy_(rolling)
+                tracked_state_is_set[request_id] = True
         final_states.append(rolling)
-    active_indices = cache_indices[valid].to(torch.int64)
-    if active_indices.numel() > 0:
-        conv_state_source.index_copy_(
-            0,
-            active_indices,
-            torch.stack(final_states)[valid].to(conv_state_source.dtype),
+
+    final_states = (
+        final_states[0].unsqueeze(0)
+        if bs == 1
+        else torch.stack(final_states)
+    )
+    _write_state_pool(conv_state_source, cache_indices, final_states)
+
+    track_request_indices = context.track_request_indices
+    if track_request_indices is None:
+        track_request_indices = torch.tensor(
+            track_request_ids,
+            dtype=torch.int64,
+            device=conv_state_source.device,
         )
-    track_valid = context.track_state_indices >= 0
-    if bool(track_valid.any()):
-        for request_id in track_valid.nonzero(as_tuple=True)[0].cpu().tolist():
+    if track_request_indices.numel() > 0:
+        assert tracked_states is not None
+        assert tracked_state_is_set is not None
+        for request_id in track_request_ids:
             if not tracked_state_is_set[request_id]:
                 raise RuntimeError(
                     "KDA FLA CP did not produce a requested conv checkpoint"
                 )
+        track_pool_indices = context.track_state_indices.index_select(
+            0, track_request_indices
+        )
         conv_state_source.index_copy_(
             0,
-            context.track_state_indices[track_valid],
-            tracked_states[track_valid].to(conv_state_source.dtype),
+            track_pool_indices,
+            tracked_states.index_select(0, track_request_indices).to(
+                conv_state_source.dtype
+            ),
         )
     return local_initial
 
