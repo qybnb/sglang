@@ -53,6 +53,8 @@ class KDAFLACPContext:
     affine_source_segments: Optional[torch.Tensor] = None
     affine_local_indices: Optional[torch.Tensor] = None
     affine_local_steps: tuple[int, ...] = ()
+    affine_local_steps_tensor: Optional[torch.Tensor] = None
+    affine_local_output_indices: Optional[torch.Tensor] = None
     affine_track_step: int = -1
     scratch_buffers: dict[str, torch.Tensor] = field(
         default_factory=dict, repr=False, compare=False
@@ -329,6 +331,8 @@ def build_kda_fla_cp_context(
     affine_source_segments = None
     affine_local_indices = None
     affine_local_steps = ()
+    affine_local_steps_tensor = None
+    affine_local_output_indices = None
     affine_track_step = -1
     if bs == 1:
         affine_owner_ranks = torch.tensor(
@@ -348,6 +352,14 @@ def build_kda_fla_cp_context(
             step_id
             for step_id, step in enumerate(affine_steps)
             if step[3][0] >= 0
+        )
+        affine_local_steps_tensor = torch.tensor(
+            affine_local_steps, dtype=torch.int64, device=device
+        )
+        affine_local_output_indices = torch.tensor(
+            [affine_steps[step_id][3][0] for step_id in affine_local_steps],
+            dtype=torch.int64,
+            device=device,
         )
         if track_request_ids:
             affine_track_step = next(
@@ -393,6 +405,8 @@ def build_kda_fla_cp_context(
         affine_source_segments=affine_source_segments,
         affine_local_indices=affine_local_indices,
         affine_local_steps=affine_local_steps,
+        affine_local_steps_tensor=affine_local_steps_tensor,
+        affine_local_output_indices=affine_local_output_indices,
         affine_track_step=affine_track_step,
     )
     if group is None:
@@ -752,14 +766,66 @@ def prepare_kda_cp_conv_states(
         for request_id, fixed_slot in enumerate(context.track_after_slots)
         if fixed_slot >= 0
     )
-    tracked_states = torch.empty_like(prefix_state) if track_request_ids else None
-    tracked_state_is_set = [False] * bs if track_request_ids else None
     affine_steps = context.affine_steps or _build_affine_steps(
         cp_size=context.cp_size,
         batch_size=bs,
         local_segment_slots=context.local_segment_slots,
         fixed_segment_sources=context.fixed_segment_sources,
     )
+    use_direct_conv_plan = bool(
+        os.getenv("SGLANG_KDA_CP_DIRECT_CONV_PLAN", "1") == "1"
+        and bs == 1
+        and context.affine_owner_ranks is not None
+        and context.affine_source_segments is not None
+        and context.affine_local_steps_tensor is not None
+        and context.affine_local_output_indices is not None
+        and context.affine_local_steps_tensor.numel()
+        == context.num_local_segments
+        and (not track_request_ids or track_request_ids == (0,))
+        and (not track_request_ids or context.affine_track_step >= 0)
+        and all(
+            step[2][0] >= 0
+            and context.fixed_segment_lens[step[1][0]] >= window
+            for step in affine_steps
+        )
+    )
+    if use_direct_conv_plan:
+        # For long-prefill segments the complete conv window after a segment
+        # is exactly that segment's gathered tail. The state before step i is
+        # therefore either the radix-prefix state (i=0) or tail(i-1). Build
+        # every local initial state, final cache state, and optional radix
+        # checkpoint with one plan gather instead of a Python cat/copy loop.
+        ordered_tails = gathered_tails[
+            context.affine_owner_ranks,
+            context.affine_source_segments,
+        ].transpose(1, 2)
+        states_before = torch.cat(
+            (prefix_state, ordered_tails[:-1]), dim=0
+        )
+        local_initial.index_copy_(
+            0,
+            context.affine_local_output_indices,
+            states_before.index_select(
+                0, context.affine_local_steps_tensor
+            ),
+        )
+        _write_state_pool(
+            conv_state_source,
+            cache_indices,
+            ordered_tails[-1:],
+        )
+        if track_request_ids:
+            _write_state_pool(
+                conv_state_source,
+                context.track_state_indices,
+                ordered_tails[
+                    context.affine_track_step : context.affine_track_step + 1
+                ],
+            )
+        return local_initial
+
+    tracked_states = torch.empty_like(prefix_state) if track_request_ids else None
+    tracked_state_is_set = [False] * bs if track_request_ids else None
 
     for request_id in range(bs):
         rolling = prefix_state[request_id]

@@ -525,6 +525,11 @@ class AscendAttnBackend(AttentionBackend):
             )
         self._mla_cp_ring_logged = False
         self._mla_cp_ring_tiled_logged = False
+        # Shared by all MLA layers in this backend. Ring prefill is eager and
+        # layers execute serially, so two ping-pong receive buffers are enough
+        # for every layer and avoid allocator work in each ring step.
+        self._mla_cp_ring_exchange_buffers = None
+        self._mla_cp_ring_seq_lens_cache = {}
 
     def _is_swa_layer(self, layer: RadixAttention) -> bool:
         return (
@@ -1409,13 +1414,55 @@ class AscendAttnBackend(AttentionBackend):
             -1, layer.tp_q_head_num * self.kv_lora_rank
         )
 
-    def _start_mla_cp_ring_kv_exchange(self, packed_kv: torch.Tensor):
+    def _get_mla_cp_ring_exchange_buffer(
+        self, packed_kv: torch.Tensor, slot: int
+    ) -> torch.Tensor:
+        buffers = getattr(self, "_mla_cp_ring_exchange_buffers", None)
+        spec = (packed_kv.shape, packed_kv.dtype, packed_kv.device)
+        if buffers is None or buffers[0] != spec:
+            buffers = (
+                spec,
+                torch.empty_like(packed_kv),
+                torch.empty_like(packed_kv),
+            )
+            self._mla_cp_ring_exchange_buffers = buffers
+        return buffers[1 + slot]
+
+    def _get_mla_cp_ring_seq_lens(
+        self, q_lens: List[int], kv_lens: List[int]
+    ) -> torch.Tensor:
+        """Reuse host length tensors across Kimi-K3's many MLA layers."""
+        key = (tuple(q_lens), tuple(kv_lens))
+        cache = getattr(self, "_mla_cp_ring_seq_lens_cache", None)
+        if cache is None:
+            cache = self._mla_cp_ring_seq_lens_cache = {}
+        seq_lens = cache.get(key)
+        if seq_lens is None:
+            # Bound the cache for serving workloads with highly variable
+            # batches. Clearing is safe because ATB consumes host metadata
+            # synchronously when the operator is launched.
+            if len(cache) >= 64:
+                cache.clear()
+            seq_lens = torch.tensor([q_lens, kv_lens], dtype=torch.int32)
+            cache[key] = seq_lens
+        return seq_lens
+
+    def _start_mla_cp_ring_kv_exchange(
+        self, packed_kv: torch.Tensor, recv_kv: Optional[torch.Tensor] = None
+    ):
         """Start rotating one compact latent-KV shard to the next CP rank."""
         cp_group = get_attention_cp_group()
         cp_rank = cp_group.rank_in_group
         next_global_rank = cp_group.ranks[(cp_rank + 1) % cp_group.world_size]
         prev_global_rank = cp_group.ranks[(cp_rank - 1) % cp_group.world_size]
-        recv_kv = torch.empty_like(packed_kv)
+        if recv_kv is None:
+            recv_kv = torch.empty_like(packed_kv)
+        elif (
+            recv_kv.shape != packed_kv.shape
+            or recv_kv.dtype != packed_kv.dtype
+            or recv_kv.device != packed_kv.device
+        ):
+            raise ValueError("MLA CP ring receive buffer does not match packed KV")
         ops = [
             torch.distributed.P2POp(
                 torch.distributed.irecv,
@@ -1714,8 +1761,8 @@ class AscendAttnBackend(AttentionBackend):
                         k_req[:tile_start].contiguous(),
                         k_rope_req[:tile_start].contiguous(),
                         value_req[:tile_start].contiguous(),
-                        torch.tensor(
-                            [[tile_len], [tile_start]], dtype=torch.int32
+                        self._get_mla_cp_ring_seq_lens(
+                            [tile_len], [tile_start]
                         ),
                         layer,
                         causal=False,
@@ -1730,7 +1777,7 @@ class AscendAttnBackend(AttentionBackend):
                     k_req[tile_start:tile_end].contiguous(),
                     k_rope_req[tile_start:tile_end].contiguous(),
                     value_req[tile_start:tile_end].contiguous(),
-                    torch.tensor([[tile_len], [tile_len]], dtype=torch.int32),
+                    self._get_mla_cp_ring_seq_lens([tile_len], [tile_len]),
                     layer,
                     causal=True,
                     previous_output=tile_output,
@@ -1892,7 +1939,12 @@ class AscendAttnBackend(AttentionBackend):
                 # Launch the next rotation before projection and attention so
                 # HCCL can transfer compact KV while ATB consumes this shard.
                 recv_kv, exchange_requests = (
-                    self._start_mla_cp_ring_kv_exchange(packed_kv)
+                    self._start_mla_cp_ring_kv_exchange(
+                        packed_kv,
+                        self._get_mla_cp_ring_exchange_buffer(
+                            packed_kv, ring_step % 2
+                        ),
+                    )
                 )
 
             source_rank = (cp_rank - ring_step) % cp_size
@@ -2030,11 +2082,11 @@ class AscendAttnBackend(AttentionBackend):
                     prefix_k_rope,
                     prefix_value,
                 ) = prefix_block
-                prefix_prev_seq_lens = torch.tensor(
-                    [block_lens_prev, prefix_block_lens], dtype=torch.int32
+                prefix_prev_seq_lens = self._get_mla_cp_ring_seq_lens(
+                    block_lens_prev, prefix_block_lens
                 )
-                prefix_next_seq_lens = torch.tensor(
-                    [block_lens_next, prefix_block_lens], dtype=torch.int32
+                prefix_next_seq_lens = self._get_mla_cp_ring_seq_lens(
+                    block_lens_next, prefix_block_lens
                 )
                 output_prev, lse_prev = self._run_mla_cp_ring_segment(
                     q_nope_prev,

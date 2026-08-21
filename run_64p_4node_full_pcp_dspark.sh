@@ -97,6 +97,7 @@ if [[ -n "${MLA_CP_BACKEND_OVERRIDE:-}" ]]; then
 fi
 export SGLANG_KDA_CP_INTER_BLOCK_SIZE="${SGLANG_KDA_CP_INTER_BLOCK_SIZE:-32}"
 export SGLANG_KDA_CP_FUSED_MERGE="${SGLANG_KDA_CP_FUSED_MERGE:-1}"
+export SGLANG_KDA_CP_DIRECT_CONV_PLAN="${SGLANG_KDA_CP_DIRECT_CONV_PLAN:-1}"
 case "${MLA_CP_BACKEND}" in
     allgather|ring) ;;
     *)
@@ -290,7 +291,8 @@ echo "  TP=${TP_SIZE}, DP=${DP_SIZE}, CP=${CP_SIZE}, attention-TP=${ATTN_TP_SIZE
 echo "  target=${MODEL_PATH}, draft=${DRAFT_MODEL_PATH}, block=${DSPARK_BLOCK_SIZE}"
 echo "  KDA=${KDA_CP_BACKEND}, MLA=${MLA_CP_BACKEND}, ragged=${SGLANG_RAGGED_VERIFY_MODE}"
 echo "  KDA-inter-BC=${SGLANG_KDA_CP_INTER_BLOCK_SIZE}," \
-     "fused-merge=${SGLANG_KDA_CP_FUSED_MERGE}"
+     "fused-merge=${SGLANG_KDA_CP_FUSED_MERGE}," \
+     "direct-conv=${SGLANG_KDA_CP_DIRECT_CONV_PLAN}"
 echo "  dist=${DIST_INIT_ADDR}, port=${PORT}, interface=${NET_IFACE}"
 echo "  chunk=${CHUNKED_PREFILL_SIZE}, max-tokens=${MAX_TOTAL_TOKENS}, mem=${MEM_FRACTION_STATIC}"
 echo "  HCCL_BUFFSIZE=${HCCL_BUFFSIZE}, DeepEP=${DEEPEP_MODE}, decode-graph=$((1 - DISABLE_CUDA_GRAPH))"

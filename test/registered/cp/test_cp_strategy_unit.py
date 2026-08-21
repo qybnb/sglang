@@ -1,4 +1,6 @@
+import os
 import unittest
+from dataclasses import replace
 from itertools import accumulate
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -1270,6 +1272,69 @@ class TestCPZigzagStrategy(CustomTestCase):
             context.affine_local_indices.tolist(), [0, -1, -1, -1, -1, -1, -1, 1, 2]
         )
         self.assertEqual(context.affine_track_step, 7)
+
+    def test_kda_fla_cp_direct_conv_plan_matches_loop(self):
+        metadata = SimpleNamespace(
+            bs=1,
+            split_list=[131] * 8,
+            cp_reverse_index=list(range(8)),
+            reverse_split_len=[131] * 8,
+            per_rank_actual_token=[262] * 4,
+            max_rank_len=[262] * 4,
+        )
+        forward_batch = SimpleNamespace(
+            attn_cp_metadata=metadata,
+            mamba_track_mask=torch.tensor([True]),
+            mamba_track_seqlens=torch.tensor([1048]),
+            mamba_track_indices=torch.tensor([9]),
+            extend_prefix_lens=torch.tensor([0]),
+            extend_prefix_lens_cpu=[0],
+        )
+        with get_parallel().override(attn_cp_size=4, attn_cp_rank=0), patch(
+            "sglang.srt.layers.attention.linear.kda_cp.get_global_server_args",
+            return_value=SimpleNamespace(mamba_cache_chunk_size=128),
+        ):
+            context = build_kda_fla_cp_context(
+                forward_batch, device=torch.device("cpu"), group=object()
+            )
+
+        torch.manual_seed(29)
+        local_x = torch.randn(sum(context.local_segment_lens), 2)
+        local_tails = torch.zeros(context.max_rank_segments, 3, 2)
+        for segment_id, segment in enumerate(
+            torch.split(local_x, context.local_segment_lens)
+        ):
+            local_tails[segment_id].copy_(segment[-3:])
+        rank_tails = [local_tails]
+        rank_tails.extend(
+            torch.randn(context.max_rank_segments, 3, 2)
+            for _ in range(context.cp_size - 1)
+        )
+        context = replace(
+            context,
+            group=_FakeFixedShapeGatherGroup(rank_tails, rank=0),
+        )
+        initial_pool = torch.randn(10, 2, 3)
+        cache_indices = torch.tensor([0], dtype=torch.int32)
+
+        loop_pool = initial_pool.clone()
+        with patch.dict(
+            os.environ, {"SGLANG_KDA_CP_DIRECT_CONV_PLAN": "0"}
+        ):
+            loop_initial = prepare_kda_cp_conv_states(
+                local_x, loop_pool, cache_indices, context
+            ).clone()
+
+        direct_pool = initial_pool.clone()
+        with patch.dict(
+            os.environ, {"SGLANG_KDA_CP_DIRECT_CONV_PLAN": "1"}
+        ):
+            direct_initial = prepare_kda_cp_conv_states(
+                local_x, direct_pool, cache_indices, context
+            ).clone()
+
+        torch.testing.assert_close(direct_initial, loop_initial)
+        torch.testing.assert_close(direct_pool, loop_pool)
 
     def test_kda_fla_cp_tracks_split_affine_and_conv_states(self):
         local_affine = [

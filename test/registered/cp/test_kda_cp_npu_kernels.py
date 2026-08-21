@@ -86,6 +86,21 @@ class TestKDACPNPUKernels(unittest.TestCase):
         torch.npu.synchronize()
         self.assertTrue(torch.equal(actual, expected))
 
+    def test_mla_ring_exchange_buffers_are_ping_ponged(self):
+        backend = object.__new__(AscendAttnBackend)
+        packed = torch.empty(17, 576, device=self.device, dtype=torch.bfloat16)
+        first = backend._get_mla_cp_ring_exchange_buffer(packed, 0)
+        second = backend._get_mla_cp_ring_exchange_buffer(packed, 1)
+        self.assertNotEqual(first.data_ptr(), second.data_ptr())
+        self.assertEqual(
+            first.data_ptr(),
+            backend._get_mla_cp_ring_exchange_buffer(packed, 0).data_ptr(),
+        )
+
+        resized = torch.empty(19, 576, device=self.device, dtype=torch.bfloat16)
+        resized_first = backend._get_mla_cp_ring_exchange_buffer(resized, 0)
+        self.assertEqual(tuple(resized_first.shape), tuple(resized.shape))
+
     def test_fused_merge_matches_natural_order_reference(self):
         torch.manual_seed(11)
         cp_size = 2
