@@ -468,21 +468,19 @@ def _apply_kda_cp_affine_block(
     gathered,
     h0,
     h1,
-    block_id,
+    owner_rank,
+    source_segment,
     i_h,
     i_v,
     H: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
-    CP_SIZE: tl.constexpr,
+    MAX_SEGMENTS: tl.constexpr,
     BV: tl.constexpr,
 ):
-    """Apply one natural-order zigzag block to a value-column state tile."""
-    first_half = block_id < CP_SIZE
-    owner_rank = tl.where(first_half, block_id, 2 * CP_SIZE - block_id - 1)
-    source_segment = tl.where(first_half, 0, 1)
+    """Apply one execution-plan affine transform to a state tile."""
     affine = gathered + (
-        ((owner_rank * 2 + source_segment) * H + i_h) * K * (V + K)
+        ((owner_rank * MAX_SEGMENTS + source_segment) * H + i_h) * K * (V + K)
     ).to(tl.int64)
 
     add0_ptr = tl.make_block_ptr(
@@ -553,23 +551,65 @@ def _apply_kda_cp_affine_block(
 
 
 @triton.jit
+def _store_kda_cp_state_tile(
+    target,
+    h0,
+    h1,
+    local_index: tl.constexpr,
+    i_h,
+    i_v,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BV: tl.constexpr,
+):
+    target += ((local_index * H + i_h) * K * V).to(tl.int64)
+    target0_ptr = tl.make_block_ptr(
+        target,
+        (K, V),
+        (V, 1),
+        (0, i_v * BV),
+        (64, BV),
+        (1, 0),
+    )
+    tl.store(target0_ptr, h0, boundary_check=(0, 1))
+    if K > 64:
+        target1_ptr = tl.make_block_ptr(
+            target,
+            (K, V),
+            (V, 1),
+            (64, i_v * BV),
+            (64, BV),
+            (1, 0),
+        )
+        tl.store(target1_ptr, h1, boundary_check=(0, 1))
+
+
+@triton.jit
 def merge_kda_cp_affine_states_kernel(
     gathered,
     initial_state,
     local_initial,
     final_state,
+    tracked_state,
+    owner_ranks,
+    source_segments,
     H: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
-    CP_SIZE: tl.constexpr,
-    CP_RANK: tl.constexpr,
+    MAX_SEGMENTS: tl.constexpr,
+    NUM_STEPS: tl.constexpr,
+    TRACK_STEP: tl.constexpr,
+    LOCAL_STEP_0: tl.constexpr,
+    LOCAL_STEP_1: tl.constexpr,
+    LOCAL_STEP_2: tl.constexpr,
     BV: tl.constexpr,
 ):
-    """Fuse natural-order affine composition for the batch-one hot path."""
+    """Fuse plan-driven affine composition for the batch-one hot path."""
     i_v, i_h = tl.program_id(0), tl.program_id(1)
     initial_state += (i_h * K * V).to(tl.int64)
-    local_initial += (i_h * K * V).to(tl.int64)
     final_state += (i_h * K * V).to(tl.int64)
+    tracked_state += (i_h * K * V).to(tl.int64)
 
     h0_ptr = tl.make_block_ptr(
         initial_state,
@@ -593,91 +633,84 @@ def merge_kda_cp_affine_states_kernel(
     else:
         h1 = tl.zeros([64, BV], dtype=tl.float32)
 
-    # The first local zigzag segment is natural block CP_RANK.
-    for block_id in range(0, CP_RANK):
-        h0, h1 = _apply_kda_cp_affine_block(
-            gathered,
-            h0,
-            h1,
-            block_id,
-            i_h,
-            i_v,
-            H=H,
-            K=K,
-            V=V,
-            CP_SIZE=CP_SIZE,
-            BV=BV,
-        )
-    local0_ptr = tl.make_block_ptr(
-        local_initial,
-        (K, V),
-        (V, 1),
-        (0, i_v * BV),
-        (64, BV),
-        (1, 0),
-    )
-    tl.store(local0_ptr, h0, boundary_check=(0, 1))
-    if K > 64:
-        local0_hi_ptr = tl.make_block_ptr(
-            local_initial,
-            (K, V),
-            (V, 1),
-            (64, i_v * BV),
-            (64, BV),
-            (1, 0),
-        )
-        tl.store(local0_hi_ptr, h1, boundary_check=(0, 1))
+    for step_id in range(NUM_STEPS):
+        owner_rank = tl.load(owner_ranks + step_id)
+        source_segment = tl.load(source_segments + step_id)
 
-    second_local_block = 2 * CP_SIZE - CP_RANK - 1
-    for block_id in range(CP_RANK, second_local_block):
-        h0, h1 = _apply_kda_cp_affine_block(
-            gathered,
-            h0,
-            h1,
-            block_id,
-            i_h,
-            i_v,
-            H=H,
-            K=K,
-            V=V,
-            CP_SIZE=CP_SIZE,
-            BV=BV,
-        )
-    local1 = local_initial + H * K * V
-    local1_ptr = tl.make_block_ptr(
-        local1,
-        (K, V),
-        (V, 1),
-        (0, i_v * BV),
-        (64, BV),
-        (1, 0),
-    )
-    tl.store(local1_ptr, h0, boundary_check=(0, 1))
-    if K > 64:
-        local1_hi_ptr = tl.make_block_ptr(
-            local1,
-            (K, V),
-            (V, 1),
-            (64, i_v * BV),
-            (64, BV),
-            (1, 0),
-        )
-        tl.store(local1_hi_ptr, h1, boundary_check=(0, 1))
+        if step_id == LOCAL_STEP_0:
+            _store_kda_cp_state_tile(
+                local_initial,
+                h0,
+                h1,
+                0,
+                i_h,
+                i_v,
+                H=H,
+                K=K,
+                V=V,
+                BV=BV,
+            )
+        if step_id == LOCAL_STEP_1:
+            _store_kda_cp_state_tile(
+                local_initial,
+                h0,
+                h1,
+                1,
+                i_h,
+                i_v,
+                H=H,
+                K=K,
+                V=V,
+                BV=BV,
+            )
+        if step_id == LOCAL_STEP_2:
+            _store_kda_cp_state_tile(
+                local_initial,
+                h0,
+                h1,
+                2,
+                i_h,
+                i_v,
+                H=H,
+                K=K,
+                V=V,
+                BV=BV,
+            )
 
-    for block_id in range(second_local_block, 2 * CP_SIZE):
         h0, h1 = _apply_kda_cp_affine_block(
             gathered,
             h0,
             h1,
-            block_id,
+            owner_rank,
+            source_segment,
             i_h,
             i_v,
             H=H,
             K=K,
             V=V,
-            CP_SIZE=CP_SIZE,
+            MAX_SEGMENTS=MAX_SEGMENTS,
             BV=BV,
         )
+        if step_id == TRACK_STEP:
+            tracked0_ptr = tl.make_block_ptr(
+                tracked_state,
+                (K, V),
+                (V, 1),
+                (0, i_v * BV),
+                (64, BV),
+                (1, 0),
+            )
+            tl.store(tracked0_ptr, h0, boundary_check=(0, 1))
+            if K > 64:
+                tracked1_ptr = tl.make_block_ptr(
+                    tracked_state,
+                    (K, V),
+                    (V, 1),
+                    (64, i_v * BV),
+                    (64, BV),
+                    (1, 0),
+                )
+                tl.store(tracked1_ptr, h1, boundary_check=(0, 1))
     final0_ptr = tl.make_block_ptr(
         final_state,
         (K, V),
@@ -706,29 +739,89 @@ def merge_kda_cp_affine_states(
     final_state: torch.Tensor,
     *,
     cp_rank: int,
+    owner_ranks: torch.Tensor | None = None,
+    source_segments: torch.Tensor | None = None,
+    local_indices: torch.Tensor | None = None,
+    local_steps: tuple[int, ...] | None = None,
+    tracked_state: torch.Tensor | None = None,
+    track_step: int = -1,
 ) -> None:
     """Launch the fused batch-one affine merge used by Kimi-K3 PCP.
 
-    ``gathered`` is ``[cp, 2, H, K, V+K]`` in rank-owned segment order.
-    The specialized implementation deliberately accepts only K <= 128; other
-    model shapes retain the general PyTorch composition path.
+    ``gathered`` is ``[cp, max_segments, H, K, V+K]`` in rank-owned
+    segment order.  The optional device plan supports the extra segment
+    created when a radix checkpoint splits a natural zigzag block.
     """
-    cp_size, num_segments, num_heads, key_dim, affine_dim = gathered.shape
+    cp_size, max_segments, num_heads, key_dim, affine_dim = gathered.shape
     value_dim = affine_dim - key_dim
-    if num_segments != 2 or initial_state.shape[0] != 1:
-        raise ValueError("fused KDA CP merge requires batch one and two segments")
+    if initial_state.shape[0] != 1:
+        raise ValueError("fused KDA CP merge requires batch one")
     if key_dim > 128:
         raise ValueError("fused KDA CP merge currently supports K <= 128")
+    if owner_ranks is None or source_segments is None or local_indices is None:
+        owners = []
+        sources = []
+        locals_ = []
+        local_id = 0
+        for block_id in range(2 * cp_size):
+            owner = (
+                block_id
+                if block_id < cp_size
+                else 2 * cp_size - block_id - 1
+            )
+            source = int(block_id >= cp_size)
+            owners.append(owner)
+            sources.append(source)
+            if owner == cp_rank:
+                locals_.append(local_id)
+                local_id += 1
+            else:
+                locals_.append(-1)
+        owner_ranks = torch.tensor(owners, dtype=torch.int32, device=gathered.device)
+        source_segments = torch.tensor(
+            sources, dtype=torch.int32, device=gathered.device
+        )
+        local_indices = torch.tensor(
+            locals_, dtype=torch.int32, device=gathered.device
+        )
+        local_steps = tuple(
+            step_id for step_id, local_id in enumerate(locals_) if local_id >= 0
+        )
+    if not (
+        owner_ranks.numel()
+        == source_segments.numel()
+        == local_indices.numel()
+    ):
+        raise ValueError("fused KDA CP merge execution-plan sizes do not match")
+    num_steps = owner_ranks.numel()
+    if local_initial.shape[0] <= 0 or local_initial.shape[0] > max_segments:
+        raise ValueError("fused KDA CP merge has an invalid local-state output")
+    if track_step >= num_steps:
+        raise ValueError("fused KDA CP merge checkpoint step is out of range")
+    if tracked_state is None:
+        tracked_state = final_state
+    if local_steps is None:
+        raise ValueError("fused KDA CP merge requires compile-time local steps")
+    if len(local_steps) != local_initial.shape[0] or len(local_steps) > 3:
+        raise ValueError("fused KDA CP merge local steps do not match output")
+    padded_local_steps = (*local_steps, -1, -1, -1)[:3]
     merge_kda_cp_affine_states_kernel[(triton.cdiv(value_dim, 64), num_heads)](
         gathered=gathered,
         initial_state=initial_state,
         local_initial=local_initial,
         final_state=final_state,
+        tracked_state=tracked_state,
+        owner_ranks=owner_ranks,
+        source_segments=source_segments,
         H=num_heads,
         K=key_dim,
         V=value_dim,
-        CP_SIZE=cp_size,
-        CP_RANK=cp_rank,
+        MAX_SEGMENTS=max_segments,
+        NUM_STEPS=num_steps,
+        TRACK_STEP=track_step,
+        LOCAL_STEP_0=padded_local_steps[0],
+        LOCAL_STEP_1=padded_local_steps[1],
+        LOCAL_STEP_2=padded_local_steps[2],
         BV=64,
         num_warps=4,
         num_stages=2,

@@ -28,6 +28,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import (
+    MLA_CP_RING_MAX_CAUSAL_BLOCK_SIZE,
     cp_all_gather_rerange_kv_cache,
     get_prefix_block_slices,
     get_zigzag_cp_rank_block_lengths,
@@ -62,7 +63,6 @@ def _reshape_kv_for_fia_nz(
     """Reshapes a tensor for FIA NZ format."""
     return tensor.view(-1, 1, num_heads * head_dim // 16, page_size, 16)
 
-import math
 
 def next_power_of_2(n):
     if n <= 0:
@@ -524,6 +524,7 @@ class AscendAttnBackend(AttentionBackend):
                 f"{self.mla_cp_ring_prefix_block_size}."
             )
         self._mla_cp_ring_logged = False
+        self._mla_cp_ring_tiled_logged = False
 
     def _is_swa_layer(self, layer: RadixAttention) -> bool:
         return (
@@ -1562,6 +1563,25 @@ class AscendAttnBackend(AttentionBackend):
         previous_lse: Optional[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute and online-merge one visible Q/KV block pair."""
+        if causal:
+            if seq_lens.ndim != 2 or seq_lens.shape[0] != 2:
+                raise ValueError(
+                    "causal MLA CP ring segments require [2, batch] lengths"
+                )
+            q_lens = [int(length) for length in seq_lens[0].tolist()]
+            if max(q_lens, default=0) > MLA_CP_RING_MAX_CAUSAL_BLOCK_SIZE:
+                return self._run_mla_cp_ring_causal_tiled(
+                    q_nope,
+                    q_rope,
+                    k_nope,
+                    k_rope,
+                    value,
+                    q_lens,
+                    [int(length) for length in seq_lens[1].tolist()],
+                    layer,
+                    previous_output,
+                    previous_lse,
+                )
         q_len = q_nope.shape[0]
         first_block = previous_output is None
         if first_block != (previous_lse is None):
@@ -1601,6 +1621,132 @@ class AscendAttnBackend(AttentionBackend):
             softmax_lse=softmax_lse,
         )
         return output, softmax_lse
+
+    def _run_mla_cp_ring_causal_tiled(
+        self,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_rope: torch.Tensor,
+        value: torch.Tensor,
+        q_lens: List[int],
+        kv_lens: List[int],
+        layer: RadixAttention,
+        previous_output: Optional[torch.Tensor],
+        previous_lse: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Tile a large causal diagonal while preserving online softmax.
+
+        ATB fixes the triangular mask at 512x512.  For query tile ``i``, keys
+        from earlier tiles are first merged without a mask and the matching
+        key tile is then merged with the triangular mask.  This is exactly the
+        original causal block, while allowing the real 8K/128K PCP workload
+        to remain on the MLA ring backend instead of silently falling back to
+        absorbed MLA all-gather.
+        """
+        if len(q_lens) != len(kv_lens):
+            raise ValueError("MLA CP ring tiled query/KV batch sizes differ")
+        if any(
+            q_len <= 0 or q_len != kv_len
+            for q_len, kv_len in zip(q_lens, kv_lens)
+        ):
+            raise ValueError(
+                "MLA CP ring causal tiling requires equal, non-empty Q/KV blocks"
+            )
+        if (previous_output is None) != (previous_lse is None):
+            raise ValueError(
+                "MLA CP ring output and LSE must be initialized together"
+            )
+        if not getattr(self, "_mla_cp_ring_tiled_logged", False):
+            logger.info(
+                "MLA prefill CP ring causal tiling active: max_block_len=%d, "
+                "mask_tile=%d",
+                max(q_lens),
+                MLA_CP_RING_MAX_CAUSAL_BLOCK_SIZE,
+            )
+            self._mla_cp_ring_tiled_logged = True
+
+        request_outputs = []
+        request_lses = []
+        q_offset = 0
+        kv_offset = 0
+        tile_size = MLA_CP_RING_MAX_CAUSAL_BLOCK_SIZE
+        for q_len, kv_len in zip(q_lens, kv_lens):
+            q_req = q_nope[q_offset : q_offset + q_len]
+            q_rope_req = q_rope[q_offset : q_offset + q_len]
+            k_req = k_nope[kv_offset : kv_offset + kv_len]
+            k_rope_req = k_rope[kv_offset : kv_offset + kv_len]
+            value_req = value[kv_offset : kv_offset + kv_len]
+            prev_req = (
+                previous_output[q_offset : q_offset + q_len]
+                if previous_output is not None
+                else None
+            )
+            prev_lse_req = (
+                previous_lse[:, q_offset : q_offset + q_len]
+                if previous_lse is not None
+                else None
+            )
+
+            tile_outputs = []
+            tile_lses = []
+            for tile_start in range(0, q_len, tile_size):
+                tile_end = min(tile_start + tile_size, q_len)
+                tile_len = tile_end - tile_start
+                tile_output = (
+                    prev_req[tile_start:tile_end].contiguous()
+                    if prev_req is not None
+                    else None
+                )
+                tile_lse = (
+                    prev_lse_req[:, tile_start:tile_end].contiguous()
+                    if prev_lse_req is not None
+                    else None
+                )
+                q_tile = q_req[tile_start:tile_end].contiguous()
+                q_rope_tile = q_rope_req[tile_start:tile_end].contiguous()
+
+                if tile_start > 0:
+                    # Earlier keys are fully visible to this query tile.
+                    tile_output, tile_lse = self._run_mla_cp_ring_segment(
+                        q_tile,
+                        q_rope_tile,
+                        k_req[:tile_start].contiguous(),
+                        k_rope_req[:tile_start].contiguous(),
+                        value_req[:tile_start].contiguous(),
+                        torch.tensor(
+                            [[tile_len], [tile_start]], dtype=torch.int32
+                        ),
+                        layer,
+                        causal=False,
+                        previous_output=tile_output,
+                        previous_lse=tile_lse,
+                    )
+
+                # Only the matching tile needs the fixed triangular mask.
+                tile_output, tile_lse = self._run_mla_cp_ring_segment(
+                    q_tile,
+                    q_rope_tile,
+                    k_req[tile_start:tile_end].contiguous(),
+                    k_rope_req[tile_start:tile_end].contiguous(),
+                    value_req[tile_start:tile_end].contiguous(),
+                    torch.tensor([[tile_len], [tile_len]], dtype=torch.int32),
+                    layer,
+                    causal=True,
+                    previous_output=tile_output,
+                    previous_lse=tile_lse,
+                )
+                tile_outputs.append(tile_output)
+                tile_lses.append(tile_lse)
+
+            request_outputs.append(torch.cat(tile_outputs, dim=0))
+            request_lses.append(torch.cat(tile_lses, dim=1))
+            q_offset += q_len
+            kv_offset += kv_len
+
+        if q_offset != q_nope.shape[0] or kv_offset != k_nope.shape[0]:
+            raise ValueError("MLA CP ring tiled sequence lengths do not match tensors")
+        return torch.cat(request_outputs, dim=0), torch.cat(request_lses, dim=1)
 
     def do_cp_mla_attn_ring(
         self,

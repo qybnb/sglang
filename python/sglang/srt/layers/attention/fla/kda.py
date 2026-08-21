@@ -703,6 +703,7 @@ def chunk_kda_scaled_dot_kkt_fwd(
     cu_seqlens: torch.LongTensor | None = None,
     chunk_size: int = 64,
     output_dtype: torch.dtype = torch.float32,
+    inter_block_size: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     r"""
     Compute beta * K * K^T.
@@ -733,7 +734,14 @@ def chunk_kda_scaled_dot_kkt_fwd(
     )
     NT = cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
-    BC = min(16, BT)
+    if inter_block_size is None:
+        inter_block_size = 16
+    if inter_block_size not in (16, 32) or inter_block_size > BT:
+        raise ValueError(
+            "KDA inter block size must be 16 or 32 and no larger than the "
+            f"chunk size, got block={inter_block_size}, chunk={BT}."
+        )
+    BC = inter_block_size
     NC = cdiv(BT, BC)
     BK = max(next_power_of_2(K), 16)
     A = torch.zeros(B, T, H, BT, device=k.device, dtype=output_dtype)
@@ -1165,6 +1173,16 @@ def chunk_kda_fwd(
         scale=scale,
         cu_seqlens=cu_seqlens,
         output_dtype=torch.float32,
+        # CP operates on long variable-length local segments.  A 32-token
+        # subchunk cuts the inter/intra program count from 10 to 3 per
+        # 64-token chunk, addressing the dominant KDA inter regression seen in
+        # the CP profile.  Keep a one-line runtime rollback for NPU revisions
+        # whose Triton tiling prefers the established 16-token shape.
+        inter_block_size=(
+            int(os.getenv("SGLANG_KDA_CP_INTER_BLOCK_SIZE", "32"))
+            if cp_context is not None
+            else None
+        ),
     )
     A = solve_tril(A=A, cu_seqlens=cu_seqlens, output_dtype=k.dtype)
     w, u, _, kg = recompute_w_u_fwd(

@@ -49,6 +49,11 @@ class KDAFLACPContext:
     affine_steps: tuple[
         tuple[int, tuple[int, ...], tuple[int, ...], tuple[int, ...]], ...
     ] = ()
+    affine_owner_ranks: Optional[torch.Tensor] = None
+    affine_source_segments: Optional[torch.Tensor] = None
+    affine_local_indices: Optional[torch.Tensor] = None
+    affine_local_steps: tuple[int, ...] = ()
+    affine_track_step: int = -1
     scratch_buffers: dict[str, torch.Tensor] = field(
         default_factory=dict, repr=False, compare=False
     )
@@ -310,6 +315,55 @@ def build_kda_fla_cp_context(
         )
 
     fixed_segment_sources_tuple = tuple(fixed_segment_sources)
+    affine_steps = _build_affine_steps(
+        cp_size=cp_size,
+        batch_size=bs,
+        local_segment_slots=local_segment_slots,
+        fixed_segment_sources=fixed_segment_sources_tuple,
+    )
+    # The fused batch-one merge consumes this compact execution plan directly
+    # on device.  Building it once with the CP context avoids reconstructing
+    # Python indexing tensors in every KDA layer.  Multi-request batches keep
+    # using the general composition path below.
+    affine_owner_ranks = None
+    affine_source_segments = None
+    affine_local_indices = None
+    affine_local_steps = ()
+    affine_track_step = -1
+    if bs == 1:
+        affine_owner_ranks = torch.tensor(
+            [step[0] for step in affine_steps], dtype=torch.int32, device=device
+        )
+        affine_source_segments = torch.tensor(
+            [step[2][0] for step in affine_steps],
+            dtype=torch.int32,
+            device=device,
+        )
+        affine_local_indices = torch.tensor(
+            [step[3][0] for step in affine_steps],
+            dtype=torch.int32,
+            device=device,
+        )
+        affine_local_steps = tuple(
+            step_id
+            for step_id, step in enumerate(affine_steps)
+            if step[3][0] >= 0
+        )
+        if track_request_ids:
+            affine_track_step = next(
+                (
+                    step_id
+                    for step_id, step in enumerate(affine_steps)
+                    if step[1][0] == track_after_slots[0]
+                ),
+                -1,
+            )
+            if affine_track_step < 0:
+                raise RuntimeError(
+                    "KDA FLA CP could not map the radix checkpoint into the "
+                    "affine execution plan"
+                )
+
     context = KDAFLACPContext(
         group=group or get_attention_cp_group(),
         cp_size=cp_size,
@@ -334,12 +388,12 @@ def build_kda_fla_cp_context(
             len(local_segment_lens), dtype=torch.bool, device=device
         ),
         local_segment_lens_cpu=list(local_segment_lens),
-        affine_steps=_build_affine_steps(
-            cp_size=cp_size,
-            batch_size=bs,
-            local_segment_slots=local_segment_slots,
-            fixed_segment_sources=fixed_segment_sources_tuple,
-        ),
+        affine_steps=affine_steps,
+        affine_owner_ranks=affine_owner_ranks,
+        affine_source_segments=affine_source_segments,
+        affine_local_indices=affine_local_indices,
+        affine_local_steps=affine_local_steps,
+        affine_track_step=affine_track_step,
     )
     if group is None:
         forward_batch.kda_fla_cp_context = context
@@ -484,18 +538,20 @@ def compose_kda_cp_affine_states(
         os.getenv("SGLANG_KDA_CP_FUSED_MERGE", "1") == "1"
         and local_affine.device.type in ("npu", "cuda")
         and bs == 1
-        and expected_segments == 2
-        and context.max_rank_segments == 2
         and key_dim <= 128
-        and not track_request_ids
-        and len(context.affine_steps) == 2 * context.cp_size
+        and len(context.affine_steps) <= 2 * context.cp_size + 1
+        and (not track_request_ids or track_request_ids == (0,))
+        and context.affine_owner_ranks is not None
+        and context.affine_source_segments is not None
+        and context.affine_local_indices is not None
+        and (not track_request_ids or context.affine_track_step >= 0)
     )
     if use_fused_merge:
-        # The serving hot path has exactly two rank-owned zigzag segments and
-        # no radix split.  Compose every natural-order affine transform in one
-        # device kernel, producing both local initial states and the replicated
-        # final cache state.  Complex/radix batches retain the general path
-        # below.
+        # Compose the precomputed natural-order plan in one device kernel.  A
+        # radix checkpoint may split one zigzag block, so the plan can contain
+        # one extra transform and a rank can own three local segments.  The
+        # same launch writes local initial states, the final cache state, and
+        # the tracked checkpoint state.
         from sglang.srt.layers.attention.fla.chunk_delta_h import (
             merge_kda_cp_affine_states,
         )
@@ -506,18 +562,41 @@ def compose_kda_cp_affine_states(
             state,
             tuple(state.shape),
         )
+        tracked_state = (
+            _get_scratch_buffer(
+                context,
+                "affine_tracked",
+                state,
+                tuple(state.shape),
+            )
+            if track_request_ids
+            else None
+        )
         merge_kda_cp_affine_states(
             gathered,
             state,
             local_initial,
             final_state,
             cp_rank=context.cp_rank,
+            owner_ranks=context.affine_owner_ranks,
+            source_segments=context.affine_source_segments,
+            local_indices=context.affine_local_indices,
+            local_steps=context.affine_local_steps,
+            tracked_state=tracked_state,
+            track_step=context.affine_track_step,
         )
         _write_state_pool(
             initial_state_source,
             initial_state_indices,
             final_state,
         )
+        if track_request_ids:
+            assert tracked_state is not None
+            _write_state_pool(
+                initial_state_source,
+                context.track_state_indices,
+                tracked_state,
+            )
         return local_initial
 
     tracked_state = torch.empty_like(state) if track_request_ids else None

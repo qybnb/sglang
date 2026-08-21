@@ -250,10 +250,8 @@ class TestCPStrategyUnit(CustomTestCase):
             )
             forward_batch.extend_prefix_lens_cpu = [0, 0]
             metadata.split_list = [513] * 8 + [32] * 8
-            self.assertIn(
-                "512-token",
-                get_npu_mla_cp_ring_fallback_reason(forward_batch),
-            )
+            update_payload_metadata()
+            self.assertIsNone(get_npu_mla_cp_ring_fallback_reason(forward_batch))
 
             metadata.split_list = [65] + [64] * 7 + [33] + [32] * 7
             update_payload_metadata()
@@ -1262,6 +1260,16 @@ class TestCPZigzagStrategy(CustomTestCase):
         )
         self.assertEqual(context.local_segment_lens_cpu, [131, 107, 24])
         self.assertEqual(len(context.affine_steps), 9)
+        self.assertEqual(
+            context.affine_owner_ranks.tolist(), [0, 1, 2, 3, 3, 2, 1, 0, 0]
+        )
+        self.assertEqual(
+            context.affine_source_segments.tolist(), [0, 0, 0, 0, 1, 1, 1, 1, 2]
+        )
+        self.assertEqual(
+            context.affine_local_indices.tolist(), [0, -1, -1, -1, -1, -1, -1, 1, 2]
+        )
+        self.assertEqual(context.affine_track_step, 7)
 
     def test_kda_fla_cp_tracks_split_affine_and_conv_states(self):
         local_affine = [

@@ -19,6 +19,8 @@ from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 
+# ``npu_ring_mla`` has a fixed 512x512 causal mask.  Larger zigzag blocks are
+# query-tiled by the Ascend backend; this is a tile size, not a request limit.
 MLA_CP_RING_MAX_CAUSAL_BLOCK_SIZE = 512
 
 
@@ -137,9 +139,10 @@ def get_npu_mla_cp_ring_fallback_reason(forward_batch, attention=None):
     """Return why the experimental Ascend MLA CP ring path cannot run.
 
     The ring path accepts uneven zigzag blocks and radix prefixes that satisfy
-    the ATB ``kvSeqLen >= qSeqLen`` rule. Every block must also be non-empty
-    and no longer than the 512-token causal mask. Unsupported batches keep
-    using the established absorbed-MLA all-gather path, so selecting
+    the ATB ``kvSeqLen >= qSeqLen`` rule. Every block must also be non-empty.
+    Causal blocks larger than the 512-token ATB mask are tiled and
+    online-merged. Unsupported batches keep using the established absorbed-MLA
+    all-gather path, so selecting
     ``--mla-cp-backend ring`` is safe for mixed workloads.
     """
     server_args = get_global_server_args()
@@ -178,11 +181,6 @@ def get_npu_mla_cp_ring_fallback_reason(forward_batch, attention=None):
         request_blocks = split_list[begin : begin + blocks_per_request]
         if min(request_blocks) <= 0:
             return "each request's zigzag blocks must have non-zero lengths"
-        if max(request_blocks) > MLA_CP_RING_MAX_CAUSAL_BLOCK_SIZE:
-            return (
-                "zigzag block length exceeds the 512-token npu_ring_mla "
-                "causal mask"
-            )
         prefix_len = int(prefix_lens[request_id])
         if prefix_len != 0 and prefix_len < max(request_blocks):
             return (
