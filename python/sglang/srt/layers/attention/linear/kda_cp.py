@@ -467,9 +467,13 @@ def _begin_all_gather_fixed_shape(
     before calling ``wait``.  CPU tests, unsupported process-group wrappers,
     and the runtime rollback use the established synchronous helper.
     """
+    # Keep this opt-in on NPU.  Four-node traces showed that launching these
+    # gathers asynchronously can delay the following DeepEP combine by
+    # 40--50 ms through cross-rank arrival skew, overwhelming the intended
+    # overlap.  The synchronous path remains the stable default.
     use_async = bool(
         local.device.type == "npu"
-        and os.getenv("SGLANG_KDA_CP_ASYNC_GATHER", "1") == "1"
+        and os.getenv("SGLANG_KDA_CP_ASYNC_GATHER", "0") == "1"
         and getattr(context.group, "device_group", None) is not None
         and torch.distributed.is_initialized()
     )
