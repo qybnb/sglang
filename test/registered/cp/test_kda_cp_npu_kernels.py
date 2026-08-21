@@ -22,6 +22,110 @@ HAS_NPU = bool(
 )
 
 
+class TestMLACPRingCausalPlan(unittest.TestCase):
+    def _run_plan(self, batched_diagonal: bool, batch_prefix_max_tokens: int = 16384):
+        backend = object.__new__(AscendAttnBackend)
+        backend._mla_cp_ring_seq_lens_cache = {}
+        backend._mla_cp_ring_tiled_logged = True
+        backend.mla_cp_ring_batch_causal_tiles = batched_diagonal
+        backend.mla_cp_ring_batch_prefix_tiles = True
+        backend.mla_cp_ring_batch_prefix_max_tokens = batch_prefix_max_tokens
+        calls = []
+
+        def fake_segment(
+            q_nope,
+            q_rope,
+            k_nope,
+            k_rope,
+            value,
+            seq_lens,
+            layer,
+            causal,
+            previous_output,
+            previous_lse,
+        ):
+            calls.append(
+                (
+                    causal,
+                    q_nope.shape[0],
+                    k_nope.shape[0],
+                    seq_lens.tolist(),
+                )
+            )
+            output = (
+                torch.zeros_like(q_nope) if previous_output is None else previous_output
+            )
+            lse = (
+                torch.zeros(layer.tp_q_head_num, q_nope.shape[0])
+                if previous_lse is None
+                else previous_lse
+            )
+            return output, lse
+
+        backend._run_mla_cp_ring_segment = fake_segment
+        token_count = 1300
+        q_nope = torch.empty(token_count, 2, 128)
+        q_rope = torch.empty(token_count, 2, 64)
+        k_nope = torch.empty_like(q_nope)
+        k_rope = torch.empty_like(q_rope)
+        value = torch.empty_like(q_nope)
+        output, lse = backend._run_mla_cp_ring_causal_tiled(
+            q_nope,
+            q_rope,
+            k_nope,
+            k_rope,
+            value,
+            [token_count],
+            [token_count],
+            SimpleNamespace(tp_q_head_num=2),
+            previous_output=None,
+            previous_lse=None,
+        )
+        self.assertEqual(tuple(output.shape), tuple(q_nope.shape))
+        self.assertEqual(tuple(lse.shape), (2, token_count))
+        return calls
+
+    def test_batched_diagonal_and_prefix_collapse_large_causal_launches(self):
+        calls = self._run_plan(batched_diagonal=True)
+        self.assertEqual(
+            calls,
+            [
+                (
+                    True,
+                    1300,
+                    1300,
+                    [[512, 512, 276], [512, 512, 276]],
+                ),
+                (
+                    False,
+                    788,
+                    1536,
+                    [[512, 276], [512, 1024]],
+                ),
+            ],
+        )
+
+    def test_per_tile_rollback_keeps_established_launch_order(self):
+        calls = self._run_plan(batched_diagonal=False)
+        self.assertEqual(
+            calls,
+            [
+                (True, 512, 512, [[512], [512]]),
+                (False, 512, 512, [[512], [512]]),
+                (True, 512, 512, [[512], [512]]),
+                (False, 276, 1024, [[276], [1024]]),
+                (True, 276, 276, [[276], [276]]),
+            ],
+        )
+
+    def test_batched_prefix_respects_temporary_token_cap(self):
+        calls = self._run_plan(batched_diagonal=True, batch_prefix_max_tokens=1000)
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(calls[0][0])
+        self.assertFalse(calls[1][0])
+        self.assertFalse(calls[2][0])
+
+
 @unittest.skipUnless(HAS_NPU, "Ascend NPU is required")
 class TestKDACPNPUKernels(unittest.TestCase):
     @classmethod
@@ -72,9 +176,7 @@ class TestKDACPNPUKernels(unittest.TestCase):
                 "SGLANG_KDA_CP_PARALLEL_PREPROCESS": "0",
             },
         ):
-            expected = chunk_gated_delta_rule_fwd_affine(
-                k, w, u, gk, cu_seqlens
-            )
+            expected = chunk_gated_delta_rule_fwd_affine(k, w, u, gk, cu_seqlens)
         with patch.dict(
             os.environ,
             {
@@ -118,9 +220,9 @@ class TestKDACPNPUKernels(unittest.TestCase):
             )
             * 1e-3
         )
-        identity = torch.eye(
-            key_dim, device=self.device, dtype=torch.float32
-        ).view(1, 1, 1, key_dim, key_dim)
+        identity = torch.eye(key_dim, device=self.device, dtype=torch.float32).view(
+            1, 1, 1, key_dim, key_dim
+        )
         transition = identity + (
             torch.randn(
                 cp_size,
@@ -151,9 +253,7 @@ class TestKDACPNPUKernels(unittest.TestCase):
             local_reference = []
             for block_id in range(2 * cp_size):
                 owner_rank = (
-                    block_id
-                    if block_id < cp_size
-                    else 2 * cp_size - block_id - 1
+                    block_id if block_id < cp_size else 2 * cp_size - block_id - 1
                 )
                 source_segment = int(block_id >= cp_size)
                 if owner_rank == cp_rank:
@@ -212,9 +312,9 @@ class TestKDACPNPUKernels(unittest.TestCase):
             )
             * 1e-3
         )
-        identity = torch.eye(
-            key_dim, device=self.device, dtype=torch.float32
-        ).view(1, 1, 1, key_dim, key_dim)
+        identity = torch.eye(key_dim, device=self.device, dtype=torch.float32).view(
+            1, 1, 1, key_dim, key_dim
+        )
         transition = identity + (
             torch.randn(
                 cp_size,
@@ -244,7 +344,9 @@ class TestKDACPNPUKernels(unittest.TestCase):
         # middle transforms and the radix checkpoint follows 2a.
         owners = torch.tensor([0, 1, 1, 1, 0], device=self.device, dtype=torch.int32)
         sources = torch.tensor([0, 0, 1, 2, 1], device=self.device, dtype=torch.int32)
-        local_ids = torch.tensor([-1, 0, 1, 2, -1], device=self.device, dtype=torch.int32)
+        local_ids = torch.tensor(
+            [-1, 0, 1, 2, -1], device=self.device, dtype=torch.int32
+        )
         track_step = 2
 
         state = initial.clone()
@@ -407,9 +509,117 @@ class TestKDACPNPUKernels(unittest.TestCase):
             ).triu(1),
             float("-inf"),
         )
-        expected = torch.einsum(
-            "hts,shd->thd", scores.softmax(dim=-1), value.float()
+        expected = torch.einsum("hts,shd->thd", scores.softmax(dim=-1), value.float())
+        torch.npu.synchronize()
+        torch.testing.assert_close(actual.float(), expected, rtol=5e-3, atol=1e-4)
+
+    def test_large_mla_ring_causal_block_merges_existing_prefix(self):
+        torch.manual_seed(29)
+        token_count = 600
+        prefix_count = 96
+        num_heads = 2
+        scale = 192**-0.5
+        backend = object.__new__(AscendAttnBackend)
+        backend.ringmla_mask = AscendAttnMaskBuilder.generate_attn_mask(
+            512, "norm", torch.bfloat16
+        ).to(self.device)
+        backend._mla_cp_ring_seq_lens_cache = {}
+        backend.mla_cp_ring_batch_causal_tiles = True
+        q_nope = (
+            torch.randn(
+                token_count,
+                num_heads,
+                128,
+                device=self.device,
+                dtype=torch.bfloat16,
+            )
+            * 0.01
         )
+        q_rope = (
+            torch.randn(
+                token_count,
+                num_heads,
+                64,
+                device=self.device,
+                dtype=torch.bfloat16,
+            )
+            * 0.01
+        )
+        prefix_k_nope = (
+            torch.randn(
+                prefix_count,
+                num_heads,
+                128,
+                device=self.device,
+                dtype=torch.bfloat16,
+            )
+            * 0.01
+        )
+        prefix_k_rope = (
+            torch.randn(
+                prefix_count,
+                num_heads,
+                64,
+                device=self.device,
+                dtype=torch.bfloat16,
+            )
+            * 0.01
+        )
+        prefix_value = torch.randn_like(prefix_k_nope) * 0.01
+        k_nope = torch.randn_like(q_nope) * 0.01
+        k_rope = torch.randn_like(q_rope) * 0.01
+        value = torch.randn_like(q_nope) * 0.01
+        layer = SimpleNamespace(
+            tp_q_head_num=num_heads,
+            tp_k_head_num=num_heads,
+            scaling=scale,
+        )
+
+        prefix_output, prefix_lse = backend._run_mla_cp_ring_segment(
+            q_nope,
+            q_rope,
+            prefix_k_nope,
+            prefix_k_rope,
+            prefix_value,
+            torch.tensor([[token_count], [prefix_count]], dtype=torch.int32),
+            layer,
+            causal=False,
+            previous_output=None,
+            previous_lse=None,
+        )
+        actual, _ = backend._run_mla_cp_ring_segment(
+            q_nope,
+            q_rope,
+            k_nope,
+            k_rope,
+            value,
+            torch.tensor([[token_count], [token_count]], dtype=torch.int32),
+            layer,
+            causal=True,
+            previous_output=prefix_output,
+            previous_lse=prefix_lse,
+        )
+
+        q = torch.cat((q_nope, q_rope), dim=-1).float()
+        full_k = torch.cat(
+            (
+                torch.cat((prefix_k_nope, prefix_k_rope), dim=-1),
+                torch.cat((k_nope, k_rope), dim=-1),
+            ),
+            dim=0,
+        ).float()
+        full_value = torch.cat((prefix_value, value), dim=0).float()
+        scores = torch.einsum("thd,shd->hts", q, full_k) * scale
+        scores[:, :, prefix_count:].masked_fill_(
+            torch.ones(
+                token_count,
+                token_count,
+                device=self.device,
+                dtype=torch.bool,
+            ).triu(1),
+            float("-inf"),
+        )
+        expected = torch.einsum("hts,shd->thd", scores.softmax(dim=-1), full_value)
         torch.npu.synchronize()
         torch.testing.assert_close(actual.float(), expected, rtol=5e-3, atol=1e-4)
 
