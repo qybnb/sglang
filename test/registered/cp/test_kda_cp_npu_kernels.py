@@ -14,6 +14,9 @@ from sglang.srt.layers.attention.fla.chunk_delta_h import (
     merge_kda_cp_affine_states,
 )
 from sglang.srt.layers.attention.fla.kda import chunk_kda_scaled_dot_kkt_fwd
+from sglang.srt.layers.attention.linear.kda_cp import (
+    _begin_all_gather_fixed_shape,
+)
 
 HAS_NPU = bool(
     hasattr(torch, "npu")
@@ -187,6 +190,45 @@ class TestKDACPNPUKernels(unittest.TestCase):
             actual = chunk_gated_delta_rule_fwd_affine(k, w, u, gk, cu_seqlens)
         torch.npu.synchronize()
         self.assertTrue(torch.equal(actual, expected))
+
+    def test_fixed_shape_gather_is_deferred_until_wait(self):
+        local = torch.arange(12, device=self.device).view(3, 4)
+        context = SimpleNamespace(
+            cp_size=2,
+            group=SimpleNamespace(device_group=object()),
+            scratch_buffers={},
+        )
+
+        class FakeWork:
+            waited = False
+
+            def wait(self):
+                self.waited = True
+
+        work = FakeWork()
+
+        def fake_all_gather(output, input_, *, group, async_op):
+            self.assertIs(group, context.group.device_group)
+            self.assertTrue(async_op)
+            output[: local.shape[0]].copy_(input_)
+            output[local.shape[0] :].copy_(input_ + 100)
+            return work
+
+        with (
+            patch.dict(os.environ, {"SGLANG_KDA_CP_ASYNC_GATHER": "1"}),
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch(
+                "torch.distributed.all_gather_into_tensor",
+                side_effect=fake_all_gather,
+            ),
+        ):
+            pending = _begin_all_gather_fixed_shape(local, context, scratch_key="unit")
+
+        self.assertFalse(work.waited)
+        gathered = pending.wait()
+        self.assertTrue(work.waited)
+        torch.testing.assert_close(gathered[0], local)
+        torch.testing.assert_close(gathered[1], local + 100)
 
     def test_mla_ring_exchange_buffers_are_ping_ponged(self):
         backend = object.__new__(AscendAttnBackend)
@@ -441,6 +483,62 @@ class TestKDACPNPUKernels(unittest.TestCase):
             cu_seqlens=cu_seqlens,
             inter_block_size=32,
         )
+        torch.npu.synchronize()
+        for expected_tensor, actual_tensor in zip(expected, actual):
+            torch.testing.assert_close(
+                actual_tensor, expected_tensor, rtol=2e-3, atol=2e-3
+            )
+
+    def test_kda_fused_full_chunk_matches_split_kernels(self):
+        torch.manual_seed(19)
+        token_count = 137
+        num_heads = 4
+        key_dim = 128
+        q = torch.randn(
+            1,
+            token_count,
+            num_heads,
+            key_dim,
+            device=self.device,
+            dtype=torch.bfloat16,
+        ).contiguous()
+        k = torch.randn_like(q).contiguous()
+        gk = (-torch.rand_like(q, dtype=torch.float32) * 0.02).contiguous()
+        beta = torch.rand(
+            1,
+            token_count,
+            num_heads,
+            device=self.device,
+            dtype=torch.float32,
+        ).contiguous()
+        cu_seqlens = torch.tensor(
+            [0, 67, token_count], device=self.device, dtype=torch.int32
+        )
+
+        expected = chunk_kda_scaled_dot_kkt_fwd(
+            q,
+            k,
+            gk,
+            beta,
+            scale=key_dim**-0.5,
+            cu_seqlens=cu_seqlens,
+            inter_block_size=32,
+            fused_full_chunk=False,
+        )
+        with patch.dict(
+            os.environ,
+            {"SGLANG_KDA_CP_FUSED_FULL_CHUNK": "1"},
+        ):
+            actual = chunk_kda_scaled_dot_kkt_fwd(
+                q,
+                k,
+                gk,
+                beta,
+                scale=key_dim**-0.5,
+                cu_seqlens=cu_seqlens,
+                inter_block_size=32,
+                fused_full_chunk=True,
+            )
         torch.npu.synchronize()
         for expected_tensor, actual_tensor in zip(expected, actual):
             torch.testing.assert_close(

@@ -694,6 +694,155 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
         p_gk += H * K
 
 
+@triton.jit(do_not_specialize=["T"])
+def chunk_kda_scaled_dot_kkt_fwd_kernel_fused_chunk_128(
+    q,
+    k,
+    g,
+    beta,
+    A,
+    Aqk,
+    scale,
+    cu_seqlens,
+    chunk_indices,
+    T,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    BT: tl.constexpr,
+    BC: tl.constexpr,
+    BK: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+):
+    """Compute one 64-token KDA triangle with block matrix products.
+
+    The established diagonal kernel advances one key row at a time.  For KDA,
+    ``exp(g_i - g_j)`` is separable around a per-key reference gate, so both A
+    and Aqk can use matrix products over the complete chunk.  Two 32-row
+    programs keep the accumulator footprint bounded while replacing the
+    scalar inner loop and the separate inter/diagonal launches.
+    """
+    i_t, i_i, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_b, i_h = i_bh // H, i_bh % H
+    if IS_VARLEN:
+        i_n, i_t = (
+            tl.load(chunk_indices + i_t * 2).to(tl.int32),
+            tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32),
+        )
+        bos, eos = (
+            tl.load(cu_seqlens + i_n).to(tl.int32),
+            tl.load(cu_seqlens + i_n + 1).to(tl.int32),
+        )
+        T = eos - bos
+    else:
+        bos, eos = i_b * T, i_b * T + T
+
+    row_start = i_t * BT + i_i * BC
+    if row_start >= T:
+        return
+
+    rows = i_i * BC + tl.arange(0, BC)
+    cols = tl.arange(0, BT)
+    row_mask = i_t * BT + rows < T
+    col_mask = i_t * BT + cols < T
+    q += (bos * H + i_h) * K
+    k += (bos * H + i_h) * K
+    g += (bos * H + i_h) * K
+
+    # A reference gate keeps both exponential factors numerically balanced:
+    # exp(g_i-g_j) = exp(g_i-g_ref) * exp(g_ref-g_j).
+    key_offsets = tl.arange(0, BK)
+    acc_a = tl.zeros([BC, BT], dtype=tl.float32)
+    acc_q = tl.zeros([BC, BT], dtype=tl.float32)
+    for i_k in range(tl.cdiv(K, BK)):
+        q_ptr = tl.make_block_ptr(
+            q,
+            (T, K),
+            (H * K, 1),
+            (row_start, i_k * BK),
+            (BC, BK),
+            (1, 0),
+        )
+        k_row_ptr = tl.make_block_ptr(
+            k,
+            (T, K),
+            (H * K, 1),
+            (row_start, i_k * BK),
+            (BC, BK),
+            (1, 0),
+        )
+        g_row_ptr = tl.make_block_ptr(
+            g,
+            (T, K),
+            (H * K, 1),
+            (row_start, i_k * BK),
+            (BC, BK),
+            (1, 0),
+        )
+        k_col_ptr = tl.make_block_ptr(
+            k,
+            (K, T),
+            (1, H * K),
+            (i_k * BK, i_t * BT),
+            (BK, BT),
+            (0, 1),
+        )
+        g_col_ptr = tl.make_block_ptr(
+            g,
+            (K, T),
+            (1, H * K),
+            (i_k * BK, i_t * BT),
+            (BK, BT),
+            (0, 1),
+        )
+
+        q_rows = tl.load(q_ptr, boundary_check=(0, 1))
+        k_rows = tl.load(k_row_ptr, boundary_check=(0, 1))
+        g_rows = tl.load(g_row_ptr, boundary_check=(0, 1))
+        k_cols = tl.load(k_col_ptr, boundary_check=(0, 1))
+        g_cols = tl.load(g_col_ptr, boundary_check=(0, 1))
+        ref = tl.load(
+            g + row_start * H * K + i_k * BK + key_offsets,
+            mask=i_k * BK + key_offsets < K,
+            other=0.0,
+        )
+        row_decay = exp(g_rows - ref[None, :])
+        col_decay = exp(ref[:, None] - g_cols)
+        weighted_cols = k_cols * col_decay
+        acc_a += tl.dot(k_rows * row_decay, weighted_cols)
+        acc_q += tl.dot(q_rows * row_decay, weighted_cols)
+
+    beta_rows = tl.load(
+        beta + (bos + row_start + tl.arange(0, BC)) * H + i_h,
+        mask=row_mask,
+        other=0.0,
+    )
+    causal_a = rows[:, None] > cols[None, :]
+    causal_q = rows[:, None] >= cols[None, :]
+    acc_a = tl.where(causal_a & row_mask[:, None] & col_mask[None, :], acc_a, 0.0)
+    acc_q = tl.where(causal_q & row_mask[:, None] & col_mask[None, :], acc_q, 0.0)
+    acc_a *= beta_rows[:, None]
+    acc_q *= scale
+
+    a_ptr = tl.make_block_ptr(
+        A + (bos * H + i_h) * BT,
+        (T, BT),
+        (H * BT, 1),
+        (row_start, 0),
+        (BC, BT),
+        (1, 0),
+    )
+    aqk_ptr = tl.make_block_ptr(
+        Aqk + (bos * H + i_h) * BT,
+        (T, BT),
+        (H * BT, 1),
+        (row_start, 0),
+        (BC, BT),
+        (1, 0),
+    )
+    tl.store(a_ptr, acc_a.to(a_ptr.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(aqk_ptr, acc_q.to(aqk_ptr.dtype.element_ty), boundary_check=(0, 1))
+
+
 def chunk_kda_scaled_dot_kkt_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -704,6 +853,7 @@ def chunk_kda_scaled_dot_kkt_fwd(
     chunk_size: int = 64,
     output_dtype: torch.dtype = torch.float32,
     inter_block_size: int | None = None,
+    fused_full_chunk: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     r"""
     Compute beta * K * K^T.
@@ -746,6 +896,37 @@ def chunk_kda_scaled_dot_kkt_fwd(
     BK = max(next_power_of_2(K), 16)
     A = torch.zeros(B, T, H, BT, device=k.device, dtype=output_dtype)
     Aqk = torch.zeros(B, T, H, BT, device=k.device, dtype=output_dtype)
+    use_fused_full_chunk = bool(
+        fused_full_chunk
+        and q.device.type == "npu"
+        and K == 128
+        and BT == 64
+        and BC == 32
+        and os.getenv("SGLANG_KDA_CP_FUSED_FULL_CHUNK", "1") == "1"
+    )
+    if use_fused_full_chunk:
+        chunk_kda_scaled_dot_kkt_fwd_kernel_fused_chunk_128[(NT, 2, B * H)](
+            q=q,
+            k=k,
+            g=gk,
+            beta=beta,
+            A=A,
+            Aqk=Aqk,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            T=T,
+            H=H,
+            K=K,
+            BT=BT,
+            BC=32,
+            BK=64,
+            IS_VARLEN=cu_seqlens is not None,
+            num_warps=8,
+            num_stages=3,
+        )
+        return A, Aqk
+
     grid = (NT, NC * NC, B * H)
     chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter[grid](
         q=q,
@@ -1183,6 +1364,7 @@ def chunk_kda_fwd(
             if cp_context is not None
             else None
         ),
+        fused_full_chunk=cp_context is not None,
     )
     A = solve_tril(A=A, cu_seqlens=cu_seqlens, output_dtype=k.dtype)
     w, u, _, kg = recompute_w_u_fwd(

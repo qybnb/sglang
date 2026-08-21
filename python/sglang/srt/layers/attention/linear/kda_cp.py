@@ -443,6 +443,59 @@ def _all_gather_fixed_shape(
     return gathered.view(context.cp_size, *local.shape)
 
 
+@dataclass
+class _PendingFixedShapeAllGather:
+    gathered: torch.Tensor
+    work: Any = None
+    input_buffer: Optional[torch.Tensor] = None
+
+    def wait(self) -> torch.Tensor:
+        if self.work is not None:
+            self.work.wait()
+            self.work = None
+            self.input_buffer = None
+        return self.gathered
+
+
+def _begin_all_gather_fixed_shape(
+    local: torch.Tensor, context: KDAFLACPContext, *, scratch_key: str
+) -> _PendingFixedShapeAllGather:
+    """Start a fixed-shape NPU gather and defer its first real dependency.
+
+    HCCL executes an ``async_op`` collective on its communication stream.  The
+    caller can prepare cache indices and output scratch on the compute stream
+    before calling ``wait``.  CPU tests, unsupported process-group wrappers,
+    and the runtime rollback use the established synchronous helper.
+    """
+    use_async = bool(
+        local.device.type == "npu"
+        and os.getenv("SGLANG_KDA_CP_ASYNC_GATHER", "1") == "1"
+        and getattr(context.group, "device_group", None) is not None
+        and torch.distributed.is_initialized()
+    )
+    if not use_async:
+        return _PendingFixedShapeAllGather(
+            _all_gather_fixed_shape(local, context, scratch_key=scratch_key)
+        )
+
+    gathered_shape = (context.cp_size * local.shape[0], *local.shape[1:])
+    gathered_flat = _get_scratch_buffer(
+        context, f"{scratch_key}_gathered", local, gathered_shape
+    )
+    input_buffer = local.contiguous()
+    work = torch.distributed.all_gather_into_tensor(
+        gathered_flat,
+        input_buffer,
+        group=context.group.device_group,
+        async_op=True,
+    )
+    return _PendingFixedShapeAllGather(
+        gathered_flat.view(context.cp_size, *local.shape),
+        work=work,
+        input_buffer=input_buffer,
+    )
+
+
 def _write_state_pool(
     state_pool: torch.Tensor,
     state_indices: torch.Tensor,
@@ -529,7 +582,7 @@ def compose_kda_cp_affine_states(
             context.max_rank_segments, *identity_transform.shape
         ).clone()
         padded_affine[:expected_segments].copy_(local_affine)
-    gathered = _all_gather_fixed_shape(
+    pending_gather = _begin_all_gather_fixed_shape(
         padded_affine, context, scratch_key="affine"
     )
     valid = initial_state_indices >= 0
@@ -547,6 +600,7 @@ def compose_kda_cp_affine_states(
         for request_id, fixed_slot in enumerate(context.track_after_slots)
         if fixed_slot >= 0
     )
+    gathered = pending_gather.wait()
 
     use_fused_merge = bool(
         os.getenv("SGLANG_KDA_CP_FUSED_MERGE", "1") == "1"
@@ -737,7 +791,7 @@ def prepare_kda_cp_conv_states(
         take = min(window, segment.shape[0])
         if take:
             padded_tails[segment_id, -take:].copy_(segment[-take:])
-    gathered_tails = _all_gather_fixed_shape(
+    pending_tails = _begin_all_gather_fixed_shape(
         padded_tails, context, scratch_key="conv"
     )
 
@@ -772,6 +826,7 @@ def prepare_kda_cp_conv_states(
         local_segment_slots=context.local_segment_slots,
         fixed_segment_sources=context.fixed_segment_sources,
     )
+    gathered_tails = pending_tails.wait()
     use_direct_conv_plan = bool(
         os.getenv("SGLANG_KDA_CP_DIRECT_CONV_PLAN", "1") == "1"
         and bs == 1
