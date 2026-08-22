@@ -713,13 +713,18 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_fused_chunk_128(
     BK: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
-    """Compute one 64-token KDA triangle with block matrix products.
+    """Compute one 64-token KDA triangle without unsafe gate factorisation.
 
-    The established diagonal kernel advances one key row at a time.  For KDA,
-    ``exp(g_i - g_j)`` is separable around a per-key reference gate, so both A
-    and Aqk can use matrix products over the complete chunk.  Two 32-row
-    programs keep the accumulator footprint bounded while replacing the
-    scalar inner loop and the separate inter/diagonal launches.
+    Each program owns one 32-token diagonal tile.  The second program also
+    computes the strictly causal 32x32 tile to its left.  A diagonal tile is
+    factorised around the midpoint between its first and last cumulative gate,
+    bounding both exponentials by half of the tile's gate span.  The strictly
+    causal tile is factorised around its first row; both factors are then in
+    ``(0, 1]`` because KDA cumulative gates are non-increasing.
+
+    This keeps one launch/two programs per 64-token chunk while avoiding the
+    overflow in the previous full-matrix factorisation, where masked future
+    columns could make either intermediate factor as large as ``exp(315)``.
     """
     i_t, i_i, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
@@ -740,107 +745,181 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_fused_chunk_128(
     if row_start >= T:
         return
 
-    rows = i_i * BC + tl.arange(0, BC)
-    cols = tl.arange(0, BT)
-    row_mask = i_t * BT + rows < T
-    col_mask = i_t * BT + cols < T
+    rows = tl.arange(0, BC)
+    key_offsets = tl.arange(0, BK)
+    row_mask = row_start + rows < T
+    key_mask = key_offsets < K
     q += (bos * H + i_h) * K
     k += (bos * H + i_h) * K
     g += (bos * H + i_h) * K
 
-    # A reference gate keeps both exponential factors numerically balanced:
-    # exp(g_i-g_j) = exp(g_i-g_ref) * exp(g_ref-g_j).
-    key_offsets = tl.arange(0, BK)
-    acc_a = tl.zeros([BC, BT], dtype=tl.float32)
-    acc_q = tl.zeros([BC, BT], dtype=tl.float32)
-    for i_k in range(tl.cdiv(K, BK)):
-        q_ptr = tl.make_block_ptr(
-            q,
-            (T, K),
-            (H * K, 1),
-            (row_start, i_k * BK),
-            (BC, BK),
-            (1, 0),
-        )
-        k_row_ptr = tl.make_block_ptr(
-            k,
-            (T, K),
-            (H * K, 1),
-            (row_start, i_k * BK),
-            (BC, BK),
-            (1, 0),
-        )
-        g_row_ptr = tl.make_block_ptr(
-            g,
-            (T, K),
-            (H * K, 1),
-            (row_start, i_k * BK),
-            (BC, BK),
-            (1, 0),
-        )
-        k_col_ptr = tl.make_block_ptr(
-            k,
-            (K, T),
-            (1, H * K),
-            (i_k * BK, i_t * BT),
-            (BK, BT),
-            (0, 1),
-        )
-        g_col_ptr = tl.make_block_ptr(
-            g,
-            (K, T),
-            (1, H * K),
-            (i_k * BK, i_t * BT),
-            (BK, BT),
-            (0, 1),
-        )
-
-        q_rows = tl.load(q_ptr, boundary_check=(0, 1))
-        k_rows = tl.load(k_row_ptr, boundary_check=(0, 1))
-        g_rows = tl.load(g_row_ptr, boundary_check=(0, 1))
-        k_cols = tl.load(k_col_ptr, boundary_check=(0, 1))
-        g_cols = tl.load(g_col_ptr, boundary_check=(0, 1))
-        ref = tl.load(
-            g + row_start * H * K + i_k * BK + key_offsets,
-            mask=i_k * BK + key_offsets < K,
-            other=0.0,
-        )
-        row_decay = exp(g_rows - ref[None, :])
-        col_decay = exp(ref[:, None] - g_cols)
-        weighted_cols = k_cols * col_decay
-        acc_a += tl.dot(k_rows * row_decay, weighted_cols)
-        acc_q += tl.dot(q_rows * row_decay, weighted_cols)
-
     beta_rows = tl.load(
-        beta + (bos + row_start + tl.arange(0, BC)) * H + i_h,
+        beta + (bos + row_start + rows) * H + i_h,
         mask=row_mask,
         other=0.0,
     )
-    causal_a = rows[:, None] > cols[None, :]
-    causal_q = rows[:, None] >= cols[None, :]
-    acc_a = tl.where(causal_a & row_mask[:, None] & col_mask[None, :], acc_a, 0.0)
-    acc_q = tl.where(causal_q & row_mask[:, None] & col_mask[None, :], acc_q, 0.0)
-    acc_a *= beta_rows[:, None]
-    acc_q *= scale
+    q_rows_ptr = tl.make_block_ptr(
+        q,
+        (T, K),
+        (H * K, 1),
+        (row_start, 0),
+        (BC, BK),
+        (1, 0),
+    )
+    k_rows_ptr = tl.make_block_ptr(
+        k,
+        (T, K),
+        (H * K, 1),
+        (row_start, 0),
+        (BC, BK),
+        (1, 0),
+    )
+    g_rows_ptr = tl.make_block_ptr(
+        g,
+        (T, K),
+        (H * K, 1),
+        (row_start, 0),
+        (BC, BK),
+        (1, 0),
+    )
+    q_rows = tl.load(q_rows_ptr, boundary_check=(0, 1))
+    k_rows = tl.load(k_rows_ptr, boundary_check=(0, 1))
+    g_rows = tl.load(g_rows_ptr, boundary_check=(0, 1))
 
-    a_ptr = tl.make_block_ptr(
+    # Diagonal 32x32 tile.  With Kimi-K3's gate lower bound of -5, a 32-token
+    # tile spans at most 155.  A midpoint reference keeps both factors below
+    # exp(77.5), safely inside FP32/BF16 range, while retaining the matrix-dot
+    # formulation that made the original fused experiment fast.
+    last_diag_token = min(row_start + BC, T) - 1
+    first_gate = tl.load(
+        g + row_start * H * K + key_offsets,
+        mask=key_mask,
+        other=0.0,
+    ).to(tl.float32)
+    last_gate = tl.load(
+        g + last_diag_token * H * K + key_offsets,
+        mask=key_mask,
+        other=0.0,
+    ).to(tl.float32)
+    diag_ref = 0.5 * (first_gate + last_gate)
+    diag_k_ptr = tl.make_block_ptr(
+        k,
+        (K, T),
+        (1, H * K),
+        (0, row_start),
+        (BK, BC),
+        (0, 1),
+    )
+    diag_g_ptr = tl.make_block_ptr(
+        g,
+        (K, T),
+        (1, H * K),
+        (0, row_start),
+        (BK, BC),
+        (0, 1),
+    )
+    diag_k = tl.load(diag_k_ptr, boundary_check=(0, 1))
+    diag_g = tl.load(diag_g_ptr, boundary_check=(0, 1))
+    col_mask = row_start + rows < T
+    diag_row_decay = exp(g_rows - diag_ref[None, :])
+    diag_col_decay = tl.where(
+        col_mask[None, :], exp(diag_ref[:, None] - diag_g), 0.0
+    )
+    decayed_diag_k = diag_k * diag_col_decay
+    diag_a = tl.dot(k_rows * diag_row_decay, decayed_diag_k)
+    diag_q = tl.dot(q_rows * diag_row_decay, decayed_diag_k)
+    diag_a *= beta_rows[:, None]
+    diag_q *= scale
+    diag_a = tl.where(rows[:, None] > rows[None, :], diag_a, 0.0)
+    diag_q = tl.where(rows[:, None] >= rows[None, :], diag_q, 0.0)
+    diag_a_ptr = tl.make_block_ptr(
         A + (bos * H + i_h) * BT,
         (T, BT),
         (H * BT, 1),
-        (row_start, 0),
-        (BC, BT),
+        (row_start, i_i * BC),
+        (BC, BC),
         (1, 0),
     )
-    aqk_ptr = tl.make_block_ptr(
+    diag_q_ptr = tl.make_block_ptr(
         Aqk + (bos * H + i_h) * BT,
         (T, BT),
         (H * BT, 1),
-        (row_start, 0),
-        (BC, BT),
+        (row_start, i_i * BC),
+        (BC, BC),
         (1, 0),
     )
-    tl.store(a_ptr, acc_a.to(a_ptr.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(aqk_ptr, acc_q.to(aqk_ptr.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(
+        diag_a_ptr,
+        diag_a.to(diag_a_ptr.dtype.element_ty),
+        boundary_check=(0, 1),
+    )
+    tl.store(
+        diag_q_ptr,
+        diag_q.to(diag_q_ptr.dtype.element_ty),
+        boundary_check=(0, 1),
+    )
+
+    if i_i == 1:
+        # The left tile is strictly causal.  With cumulative non-increasing
+        # KDA gates, the first row of this tile lies between every row gate and
+        # every left-column gate.  Both separable factors are therefore <= 1.
+        ref = tl.load(
+            g + row_start * H * K + key_offsets,
+            mask=key_mask,
+            other=0.0,
+        ).to(tl.float32)
+        left_k_ptr = tl.make_block_ptr(
+            k,
+            (K, T),
+            (1, H * K),
+            (0, i_t * BT),
+            (BK, BC),
+            (0, 1),
+        )
+        left_g_ptr = tl.make_block_ptr(
+            g,
+            (K, T),
+            (1, H * K),
+            (0, i_t * BT),
+            (BK, BC),
+            (0, 1),
+        )
+        left_k = tl.load(left_k_ptr, boundary_check=(0, 1))
+        left_g = tl.load(left_g_ptr, boundary_check=(0, 1))
+        row_decay = exp(g_rows - ref[None, :])
+        left_decay = exp(ref[:, None] - left_g)
+        decayed_left_k = left_k * left_decay
+        inter_a = tl.dot(k_rows * row_decay, decayed_left_k)
+        inter_q = tl.dot(q_rows * row_decay, decayed_left_k)
+        inter_a *= beta_rows[:, None]
+        inter_q *= scale
+
+        inter_a_ptr = tl.make_block_ptr(
+            A + (bos * H + i_h) * BT,
+            (T, BT),
+            (H * BT, 1),
+            (row_start, 0),
+            (BC, BC),
+            (1, 0),
+        )
+        inter_q_ptr = tl.make_block_ptr(
+            Aqk + (bos * H + i_h) * BT,
+            (T, BT),
+            (H * BT, 1),
+            (row_start, 0),
+            (BC, BC),
+            (1, 0),
+        )
+        tl.store(
+            inter_a_ptr,
+            inter_a.to(inter_a_ptr.dtype.element_ty),
+            boundary_check=(0, 1),
+        )
+        tl.store(
+            inter_q_ptr,
+            inter_q.to(inter_q_ptr.dtype.element_ty),
+            boundary_check=(0, 1),
+        )
 
 
 def chunk_kda_scaled_dot_kkt_fwd(
@@ -902,11 +981,10 @@ def chunk_kda_scaled_dot_kkt_fwd(
         and K == 128
         and BT == 64
         and BC == 32
-        # Experimental only.  gk is a chunk-local cumulative gate and can
-        # span a much wider range than an individual gate.  Factoring
-        # exp(g_i - g_j) around one reference may overflow either factor even
-        # when the original causal difference is safe.
-        and os.getenv("SGLANG_KDA_CP_FUSED_FULL_CHUNK", "0") == "1"
+        # The fused kernel uses midpoint scaling on each diagonal tile and a
+        # causal boundary reference on the off-diagonal tile.  Keep a runtime
+        # rollback for compiler/runtime regressions on other Ascend stacks.
+        and os.getenv("SGLANG_KDA_CP_FUSED_FULL_CHUNK", "1") == "1"
     )
     if use_fused_full_chunk:
         chunk_kda_scaled_dot_kkt_fwd_kernel_fused_chunk_128[(NT, 2, B * H)](
@@ -924,7 +1002,7 @@ def chunk_kda_scaled_dot_kkt_fwd(
             K=K,
             BT=BT,
             BC=32,
-            BK=64,
+            BK=128,
             IS_VARLEN=cu_seqlens is not None,
             num_warps=8,
             num_stages=3,

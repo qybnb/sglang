@@ -489,7 +489,7 @@ class TestKDACPNPUKernels(unittest.TestCase):
                 actual_tensor, expected_tensor, rtol=2e-3, atol=2e-3
             )
 
-    def test_kda_fused_full_chunk_matches_split_kernels(self):
+    def test_kda_fused_full_chunk_matches_split_kernels_for_cumulative_gate(self):
         torch.manual_seed(19)
         token_count = 137
         num_heads = 4
@@ -503,7 +503,6 @@ class TestKDACPNPUKernels(unittest.TestCase):
             dtype=torch.bfloat16,
         ).contiguous()
         k = torch.randn_like(q).contiguous()
-        gk = (-torch.rand_like(q, dtype=torch.float32) * 0.02).contiguous()
         beta = torch.rand(
             1,
             token_count,
@@ -514,6 +513,19 @@ class TestKDACPNPUKernels(unittest.TestCase):
         cu_seqlens = torch.tensor(
             [0, 67, token_count], device=self.device, dtype=torch.int32
         )
+
+        # Match the real A/Aqk input after chunk_local_cumsum.  A 64-token
+        # chunk can span roughly [-320, 0]; the old small random-gate test did
+        # not expose overflow in the previous full-matrix factorisation.
+        gate_steps = -torch.rand_like(q, dtype=torch.float32) * 5.0
+        gk = torch.empty_like(gate_steps)
+        for segment_start, segment_end in ((0, 67), (67, token_count)):
+            for chunk_start in range(segment_start, segment_end, 64):
+                chunk_end = min(chunk_start + 64, segment_end)
+                gk[:, chunk_start:chunk_end] = gate_steps[
+                    :, chunk_start:chunk_end
+                ].cumsum(dim=1)
+        gk = gk.contiguous()
 
         expected = chunk_kda_scaled_dot_kkt_fwd(
             q,
@@ -541,6 +553,7 @@ class TestKDACPNPUKernels(unittest.TestCase):
             )
         torch.npu.synchronize()
         for expected_tensor, actual_tensor in zip(expected, actual):
+            self.assertTrue(torch.isfinite(actual_tensor).all().item())
             torch.testing.assert_close(
                 actual_tensor, expected_tensor, rtol=2e-3, atol=2e-3
             )
