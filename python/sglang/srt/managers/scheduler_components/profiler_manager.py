@@ -74,6 +74,7 @@ class SchedulerProfilerManager:
         self.profiler_target_decode_ct: Optional[int] = None
 
         self.profile_by_stage: bool = False
+        self.profile_stages = {"prefill", "decode"}
         self.profile_in_progress: bool = False
         self.merge_profiles = False
 
@@ -115,7 +116,25 @@ class SchedulerProfilerManager:
                 message="Profiling is already in progress. Call /stop_profile first.",
             )
 
+        requested_stages = set(profile_stages or ("prefill", "decode"))
+        invalid_stages = requested_stages - {"prefill", "decode"}
+        if invalid_stages:
+            return ProfileReqOutput(
+                success=False,
+                message=(
+                    "Unsupported profile stages: "
+                    + ", ".join(sorted(invalid_stages))
+                    + ". Expected prefill and/or decode."
+                ),
+            )
+        if not requested_stages:
+            return ProfileReqOutput(
+                success=False,
+                message="profile_stages must contain prefill and/or decode.",
+            )
+
         self.profile_by_stage = profile_by_stage
+        self.profile_stages = requested_stages
         self.merge_profiles = merge_profiles
 
         if output_dir is None:
@@ -378,6 +397,8 @@ class SchedulerProfilerManager:
 
         if self.profile_by_stage:
             if batch.forward_mode.is_prefill():
+                if "prefill" not in self.profile_stages:
+                    return
                 if self.profiler_prefill_ct == 0:
                     self._start_profile(batch.forward_mode)
                 self.profiler_prefill_ct += 1
@@ -385,6 +406,13 @@ class SchedulerProfilerManager:
                     if self.profile_in_progress:
                         self._stop_profile(stage=ForwardMode.EXTEND)
             elif batch.forward_mode.is_decode():
+                if "decode" not in self.profile_stages:
+                    if self.profile_in_progress:
+                        # A short prompt can transition to decode before the
+                        # requested number of prefill batches.  Flush that
+                        # partial prefill trace, but never arm a decode trace.
+                        self._stop_profile(stage=ForwardMode.EXTEND)
+                    return
                 if self.profiler_decode_ct == 0:
                     if self.profile_in_progress:
                         # force trace flush
