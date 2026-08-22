@@ -902,7 +902,11 @@ def chunk_kda_scaled_dot_kkt_fwd(
         and K == 128
         and BT == 64
         and BC == 32
-        and os.getenv("SGLANG_KDA_CP_FUSED_FULL_CHUNK", "1") == "1"
+        # Experimental only.  gk is a chunk-local cumulative gate and can
+        # span a much wider range than an individual gate.  Factoring
+        # exp(g_i - g_j) around one reference may overflow either factor even
+        # when the original causal difference is safe.
+        and os.getenv("SGLANG_KDA_CP_FUSED_FULL_CHUNK", "0") == "1"
     )
     if use_fused_full_chunk:
         chunk_kda_scaled_dot_kkt_fwd_kernel_fused_chunk_128[(NT, 2, B * H)](
