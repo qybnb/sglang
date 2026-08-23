@@ -170,6 +170,7 @@ MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-2}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.82}"
 DEEPEP_MODE="${DEEPEP_MODE:-auto}"
 HCCL_BUFFSIZE="${HCCL_BUFFSIZE:-2000}"
+DEEPEP_HCCL_BUFFSIZE="${DEEPEP_HCCL_BUFFSIZE:-${HCCL_BUFFSIZE}}"
 # Avoid importing torch from ATB's set_env.sh during every distributed launch.
 # The current Kimi-K3 image uses the CXX11 ABI; callers using another image can
 # override this with ATB_CXX_ABI=0.
@@ -196,16 +197,34 @@ if [[ "${DISABLE_CUDA_GRAPH}" == "0" && "${DEEPEP_MODE}" == "normal" ]]; then
     exit 2
 fi
 if [[ ! "${HCCL_BUFFSIZE}" =~ ^[1-9][0-9]*$ ]] || \
+   [[ ! "${DEEPEP_HCCL_BUFFSIZE}" =~ ^[1-9][0-9]*$ ]] || \
    [[ ! "${KIMI_K3_DEEPEP_GRAPH_MIN_HCCL_BUFFSIZE}" =~ ^[1-9][0-9]*$ ]]; then
     echo "HCCL buffer sizes must be positive integers in MB." >&2
     exit 2
 fi
 if [[ "${DISABLE_CUDA_GRAPH}" == "0" && "${DEEPEP_MODE}" != "normal" ]] && \
-   (( HCCL_BUFFSIZE < KIMI_K3_DEEPEP_GRAPH_MIN_HCCL_BUFFSIZE )); then
-    echo "HCCL_BUFFSIZE=${HCCL_BUFFSIZE}MB is too small for Kimi-K3 EP64 DeepEP low-latency graph capture." >&2
+   (( DEEPEP_HCCL_BUFFSIZE < KIMI_K3_DEEPEP_GRAPH_MIN_HCCL_BUFFSIZE )); then
+    echo "DEEPEP_HCCL_BUFFSIZE=${DEEPEP_HCCL_BUFFSIZE}MB is too small for Kimi-K3 EP64 DeepEP low-latency graph capture." >&2
     echo "The combine operator reports a 1709MB minimum at maxBs=128; use at least ${KIMI_K3_DEEPEP_GRAPH_MIN_HCCL_BUFFSIZE}MB (default: 2000MB)." >&2
     exit 2
 fi
+
+# MoeLowLatencyDispatchV2/MoeLowLatencyCombineV2 read HCCL_BUFFSIZE directly
+# when creating their device communication window.  DEEPEP_HCCL_BUFFSIZE is
+# also used for the PyTorch MoE process group, but it is not a replacement for
+# the global variable consumed by these custom operators.  Keeping the two
+# values split (for example HCCL_BUFFSIZE=200 and
+# DEEPEP_HCCL_BUFFSIZE=1800) therefore creates a process group with the large
+# window while the graph-captured DeepEP operator still uses the undersized
+# 200 MB window.  The resulting device-side out-of-range access is reported
+# asynchronously by a later op such as aclnnCat.
+if [[ "${DISABLE_CUDA_GRAPH}" == "0" && "${DEEPEP_MODE}" != "normal" ]] && \
+   (( HCCL_BUFFSIZE < DEEPEP_HCCL_BUFFSIZE )); then
+    echo "Raising HCCL_BUFFSIZE from ${HCCL_BUFFSIZE}MB to ${DEEPEP_HCCL_BUFFSIZE}MB: DeepEP low-latency operators consume the global HCCL window." >&2
+    HCCL_BUFFSIZE="${DEEPEP_HCCL_BUFFSIZE}"
+fi
+
+export HCCL_BUFFSIZE DEEPEP_HCCL_BUFFSIZE
 
 if [[ "${DISABLE_CUDA_GRAPH}" == "1" ]]; then
     CUDA_GRAPH_ARGS=(--disable-cuda-graph)
