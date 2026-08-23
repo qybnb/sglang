@@ -167,6 +167,7 @@ PAGE_SIZE="${PAGE_SIZE:-128}"
 CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-8192}"
 MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-131072}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-2}"
+MAX_MAMBA_CACHE_SIZE="${MAX_MAMBA_CACHE_SIZE:-}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.82}"
 DEEPEP_MODE="${DEEPEP_MODE:-auto}"
 HCCL_BUFFSIZE="${HCCL_BUFFSIZE:-2000}"
@@ -210,6 +211,15 @@ if [[ "${DISABLE_CUDA_GRAPH}" == "0" && "${DEEPEP_MODE}" != "normal" ]] && \
 fi
 
 export HCCL_BUFFSIZE DEEPEP_HCCL_BUFFSIZE
+
+MAMBA_CACHE_ARGS=()
+if [[ -n "${MAX_MAMBA_CACHE_SIZE}" ]]; then
+    if [[ ! "${MAX_MAMBA_CACHE_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "MAX_MAMBA_CACHE_SIZE must be a positive integer (got ${MAX_MAMBA_CACHE_SIZE})." >&2
+        exit 2
+    fi
+    MAMBA_CACHE_ARGS=(--max-mamba-cache-size "${MAX_MAMBA_CACHE_SIZE}")
+fi
 
 if [[ "${DISABLE_CUDA_GRAPH}" == "1" ]]; then
     CUDA_GRAPH_ARGS=(--disable-cuda-graph)
@@ -323,6 +333,7 @@ SERVER_ARGS=(
     --chunked-prefill-size "${CHUNKED_PREFILL_SIZE}"
     --max-total-tokens "${MAX_TOTAL_TOKENS}"
     --max-running-requests "${MAX_RUNNING_REQUESTS}"
+    "${MAMBA_CACHE_ARGS[@]}"
     --mamba-ssm-dtype bfloat16
     --reasoning-parser kimi_k3
     --moe-a2a-backend deepep
