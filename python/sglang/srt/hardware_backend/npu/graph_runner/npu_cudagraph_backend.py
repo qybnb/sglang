@@ -93,6 +93,17 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
             if post_warmup_hook is not None:
                 post_warmup_hook()
 
+        # The last warmup may contain graph-recordable collectives (notably
+        # DeepEP low-latency dispatch/combine) that reuse fixed remote windows.
+        # A local stream dependency is not enough here: without a group-wide
+        # boundary, a fast rank can enter the captured forward while another
+        # rank is still using those windows for its final warmup.  Mixing the
+        # two communication epochs can make the NPU DeepEP kernel dereference a
+        # stale remote address.  Finish the last warmup on every TP/EP rank
+        # before any rank starts recording the graph.
+        self._device_module.synchronize()
+        self._tp_group.barrier()
+
         graph = torch.npu.NPUGraph()
 
         if self._enable_torch_compile:
