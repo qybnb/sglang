@@ -27,8 +27,27 @@ esac
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
-KERNEL_CODE_ROOT="${KERNEL_CODE_ROOT:-/home/hanwlax/test-codes/sgl-kernel-npu}"
-export PYTHONPATH="${REPO_ROOT}/python:${KERNEL_CODE_ROOT}/python/sgl_kernel_npu:${PYTHONPATH:-}"
+
+# Prefer a portable sibling checkout on new hosts while retaining the legacy
+# shared checkout used by the established cluster. Callers can always set
+# KERNEL_CODE_ROOT explicitly.
+if [[ -z "${KERNEL_CODE_ROOT:-}" ]]; then
+    sibling_kernel_root="$(dirname "${REPO_ROOT}")/sgl-kernel-npu"
+    legacy_kernel_root="/home/hanwlax/test-codes/sgl-kernel-npu"
+    if [[ -f "${sibling_kernel_root}/python/sgl_kernel_npu/sgl_kernel_npu/__init__.py" ]]; then
+        KERNEL_CODE_ROOT="${sibling_kernel_root}"
+    else
+        KERNEL_CODE_ROOT="${legacy_kernel_root}"
+    fi
+fi
+KERNEL_PYTHON_ROOT="${KERNEL_CODE_ROOT}/python/sgl_kernel_npu"
+if [[ ! -f "${KERNEL_PYTHON_ROOT}/sgl_kernel_npu/__init__.py" ]]; then
+    echo "Invalid KERNEL_CODE_ROOT; sgl_kernel_npu package not found under: ${KERNEL_CODE_ROOT}" >&2
+    echo "Clone sgl-kernel-npu beside this repository or set KERNEL_CODE_ROOT explicitly." >&2
+    exit 2
+fi
+export PYTHONPATH="${REPO_ROOT}/python:${KERNEL_PYTHON_ROOT}:${PYTHONPATH:-}"
+KERNEL_GIT_REVISION="$(git -C "${KERNEL_CODE_ROOT}" rev-parse HEAD 2>/dev/null || echo unknown)"
 
 MODEL_PATH="${MODEL_PATH:-/home/weights/Kimi-K3-w4a8-int-moe}"
 DRAFT_MODEL_PATH="${DRAFT_MODEL_PATH:-/home/weights/Kimi-K3-DSpark}"
@@ -311,6 +330,7 @@ echo "  dist=${DIST_INIT_ADDR}, port=${PORT}, interface=${NET_IFACE}"
 echo "  chunk=${CHUNKED_PREFILL_SIZE}, max-tokens=${MAX_TOTAL_TOKENS}, mem=${MEM_FRACTION_STATIC}"
 echo "  HCCL_BUFFSIZE=${HCCL_BUFFSIZE}, DeepEP=${DEEPEP_MODE}, decode-graph=$((1 - DISABLE_CUDA_GRAPH))"
 echo "  ATB_CXX_ABI=${ATB_CXX_ABI}"
+echo "  kernel-root=${KERNEL_CODE_ROOT}, kernel-revision=${KERNEL_GIT_REVISION}"
 echo "  prefix-cache=${ENABLE_PREFIX_CACHE}"
 echo "  HCCL_NPU_SOCKET_PORT_RANGE=${HCCL_NPU_SOCKET_PORT_RANGE}"
 echo "  HCCL_IF_BASE_PORT=${HCCL_IF_BASE_PORT}"

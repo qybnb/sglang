@@ -100,7 +100,6 @@ NET_IFACE="${NET_IFACE:-enp196s0f0}"
 
 COMMON_ENV=(
     "NODE_IPS=${NODE_IPS}"
-    "KERNEL_CODE_ROOT=${KERNEL_CODE_ROOT:-/home/hanwlax/test-codes/sgl-kernel-npu}"
     "TP_SIZE=${TP_SIZE:-64}"
     "DP_SIZE=${DP_SIZE:-2}"
     "CP_SIZE=${CP_SIZE:-4}"
@@ -143,12 +142,15 @@ for rank in 1 2 3 0; do
     model_var="MODEL_PATH_RANK${rank}"
     draft_var="DRAFT_MODEL_PATH_RANK${rank}"
     net_iface_var="NET_IFACE_RANK${rank}"
+    kernel_var="KERNEL_CODE_ROOT_RANK${rank}"
     rank_model_path="${MODEL_PATH}"
     rank_draft_model_path="${DRAFT_MODEL_PATH}"
     rank_net_iface="${NET_IFACE}"
+    rank_kernel_code_root="${KERNEL_CODE_ROOT:-}"
     [[ -z "${!model_var:-}" ]] || rank_model_path="${!model_var}"
     [[ -z "${!draft_var:-}" ]] || rank_draft_model_path="${!draft_var}"
     [[ -z "${!net_iface_var:-}" ]] || rank_net_iface="${!net_iface_var}"
+    [[ -z "${!kernel_var:-}" ]] || rank_kernel_code_root="${!kernel_var}"
     env_args=(
         "${COMMON_ENV[@]}"
         "MODEL_PATH=${rank_model_path}"
@@ -156,6 +158,8 @@ for rank in 1 2 3 0; do
         "NET_IFACE=${rank_net_iface}"
         "NODE_RANK=${rank}"
     )
+    [[ -z "${rank_kernel_code_root}" ]] || \
+        env_args+=("KERNEL_CODE_ROOT=${rank_kernel_code_root}")
 
     run_on "${host}" "$(cleanup_command)" >/dev/null
 
