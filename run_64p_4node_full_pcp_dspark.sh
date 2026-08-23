@@ -209,21 +209,6 @@ if [[ "${DISABLE_CUDA_GRAPH}" == "0" && "${DEEPEP_MODE}" != "normal" ]] && \
     exit 2
 fi
 
-# MoeLowLatencyDispatchV2/MoeLowLatencyCombineV2 read HCCL_BUFFSIZE directly
-# when creating their device communication window.  DEEPEP_HCCL_BUFFSIZE is
-# also used for the PyTorch MoE process group, but it is not a replacement for
-# the global variable consumed by these custom operators.  Keeping the two
-# values split (for example HCCL_BUFFSIZE=200 and
-# DEEPEP_HCCL_BUFFSIZE=1800) therefore creates a process group with the large
-# window while the graph-captured DeepEP operator still uses the undersized
-# 200 MB window.  The resulting device-side out-of-range access is reported
-# asynchronously by a later op such as aclnnCat.
-if [[ "${DISABLE_CUDA_GRAPH}" == "0" && "${DEEPEP_MODE}" != "normal" ]] && \
-   (( HCCL_BUFFSIZE < DEEPEP_HCCL_BUFFSIZE )); then
-    echo "Raising HCCL_BUFFSIZE from ${HCCL_BUFFSIZE}MB to ${DEEPEP_HCCL_BUFFSIZE}MB: DeepEP low-latency operators consume the global HCCL window." >&2
-    HCCL_BUFFSIZE="${DEEPEP_HCCL_BUFFSIZE}"
-fi
-
 export HCCL_BUFFSIZE DEEPEP_HCCL_BUFFSIZE
 
 if [[ "${DISABLE_CUDA_GRAPH}" == "1" ]]; then

@@ -74,11 +74,12 @@ def _ensure_npu_deepep_hccl_window() -> None:
     """Keep the custom low-latency op and its process group on one window size.
 
     Ascend's MoeLowLatencyDispatchV2/MoeLowLatencyCombineV2 operators consume
-    ``HCCL_BUFFSIZE`` directly.  The NPU process-group setup also supports the
-    more specific ``DEEPEP_HCCL_BUFFSIZE``, but setting only the latter leaves
-    the custom operator on the smaller global window.  That mismatch can turn
-    into a device-side address-out-of-range failure during graph capture and be
-    surfaced asynchronously by an unrelated operator.
+    ``HCCL_BUFFSIZE`` directly.  SGLang uses ``DEEPEP_HCCL_BUFFSIZE`` as a
+    per-group override while distributed groups are created, allowing ordinary
+    groups to keep a smaller window.  This function runs later, immediately
+    before the DeepEP buffer is initialized, so the custom operator sees the
+    same size as its already-created MoE process group without enlarging every
+    process group during distributed initialization.
     """
     if not _is_npu:
         return
