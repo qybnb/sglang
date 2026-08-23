@@ -46,6 +46,30 @@ if [[ ! -f "${KERNEL_PYTHON_ROOT}/sgl_kernel_npu/__init__.py" ]]; then
     echo "Clone sgl-kernel-npu beside this repository or set KERNEL_CODE_ROOT explicitly." >&2
     exit 2
 fi
+KERNEL_SHARED_LIBRARY="${KERNEL_PYTHON_ROOT}/sgl_kernel_npu/lib/libsgl_kernel_npu.so"
+if [[ ! -f "${KERNEL_SHARED_LIBRARY}" ]]; then
+    # Git intentionally excludes generated .so files. Reuse the ABI-matched
+    # library shipped in the active container while loading the updated Python
+    # kernels from KERNEL_CODE_ROOT. No rebuild is needed when this exists.
+    INSTALLED_KERNEL_SHARED_LIBRARY="$("${PYTHON_BIN}" - <<'PY'
+import site
+from pathlib import Path
+
+for root in site.getsitepackages():
+    candidate = Path(root) / "sgl_kernel_npu/lib/libsgl_kernel_npu.so"
+    if candidate.is_file():
+        print(candidate)
+        break
+PY
+)"
+    if [[ -z "${INSTALLED_KERNEL_SHARED_LIBRARY}" ]]; then
+        echo "libsgl_kernel_npu.so is absent from both the source checkout and active Python installation." >&2
+        echo "Build it once with: cd ${KERNEL_CODE_ROOT} && bash build.sh -a kernels" >&2
+        exit 2
+    fi
+    mkdir -p "$(dirname "${KERNEL_SHARED_LIBRARY}")"
+    ln -sfn "${INSTALLED_KERNEL_SHARED_LIBRARY}" "${KERNEL_SHARED_LIBRARY}"
+fi
 export PYTHONPATH="${REPO_ROOT}/python:${KERNEL_PYTHON_ROOT}:${PYTHONPATH:-}"
 KERNEL_GIT_REVISION="$(git -C "${KERNEL_CODE_ROOT}" rev-parse HEAD 2>/dev/null || echo unknown)"
 
@@ -331,6 +355,7 @@ echo "  chunk=${CHUNKED_PREFILL_SIZE}, max-tokens=${MAX_TOTAL_TOKENS}, mem=${MEM
 echo "  HCCL_BUFFSIZE=${HCCL_BUFFSIZE}, DeepEP=${DEEPEP_MODE}, decode-graph=$((1 - DISABLE_CUDA_GRAPH))"
 echo "  ATB_CXX_ABI=${ATB_CXX_ABI}"
 echo "  kernel-root=${KERNEL_CODE_ROOT}, kernel-revision=${KERNEL_GIT_REVISION}"
+echo "  kernel-so=$(readlink -f "${KERNEL_SHARED_LIBRARY}")"
 echo "  prefix-cache=${ENABLE_PREFIX_CACHE}"
 echo "  HCCL_NPU_SOCKET_PORT_RANGE=${HCCL_NPU_SOCKET_PORT_RANGE}"
 echo "  HCCL_IF_BASE_PORT=${HCCL_IF_BASE_PORT}"
