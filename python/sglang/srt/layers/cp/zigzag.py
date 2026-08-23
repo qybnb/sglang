@@ -104,6 +104,38 @@ class ZigzagCPStrategy(ContextParallelStrategy):
     name = "zigzag"
     kind = ContextParallelStrategyKind.ZIGZAG
 
+    def __init__(self, cp_size: int):
+        super().__init__(cp_size)
+        # Keep graph inputs alive across all target-verify graph captures and
+        # replays.  The order only depends on CP size, so one tensor per device
+        # is sufficient for every batch-size bucket.
+        self._uniform_restore_order: dict[torch.device, torch.Tensor] = {}
+
+    @staticmethod
+    def _get_uniform_block_len(lengths: Optional[List[int]]) -> Optional[int]:
+        """Return the common positive block length, or None when ragged."""
+        if not lengths:
+            return None
+        block_len = int(lengths[0])
+        if block_len <= 0 or any(int(length) != block_len for length in lengths):
+            return None
+        return block_len
+
+    def _get_uniform_restore_order(self, device: torch.device) -> torch.Tensor:
+        order = self._uniform_restore_order.get(device)
+        if order is None:
+            # The compact gathered layout is rank-major:
+            #   rank0: early, late | rank1: early, late | ...
+            # Restore natural segment order without concatenating bs * 2 * CP
+            # individual views.  Keeping this tiny tensor on the strategy also
+            # gives NPU graph capture a stable input address.
+            indices = [2 * rank for rank in range(self.cp_size)] + [
+                2 * rank + 1 for rank in reversed(range(self.cp_size))
+            ]
+            order = torch.tensor(indices, dtype=torch.int64, device=device)
+            self._uniform_restore_order[device] = order
+        return order
+
     def can_apply(self, num_tokens: int, forward_batch) -> bool:
         if self.cp_size <= 1 or num_tokens < self.cp_size * 2:
             return False
@@ -146,10 +178,7 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             for rank in range(self.cp_size):
                 mirror_rank = cp_segment_num - 1 - rank
                 per_rank_tokens[rank] += (
-                    base
-                    + int(rank < rem)
-                    + base
-                    + int(mirror_rank < rem)
+                    base + int(rank < rem) + base + int(mirror_rank < rem)
                 )
 
         if len(set(per_rank_tokens)) != 1:
@@ -173,8 +202,7 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         bs = len(extend_seqs_len)
         if seqs_len is not None and len(seqs_len) == bs:
             prefix_offsets = [
-                max(int(seqs_len[i]) - real_extend_seqs_len[i], 0)
-                for i in range(bs)
+                max(int(seqs_len[i]) - real_extend_seqs_len[i], 0) for i in range(bs)
             ]
         else:
             prefix_offsets = [0] * bs
@@ -273,17 +301,14 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             actual_seq_q_prev_list.append(block_sizes[cp_rank])
             actual_seq_q_next_list.append(block_sizes[cp_segment_num - cp_rank - 1])
             real_kv_len_prev_list.append(
-                prefix_offsets[batch_id]
-                + sum(real_block_sizes[: cp_rank + 1])
+                prefix_offsets[batch_id] + sum(real_block_sizes[: cp_rank + 1])
             )
             real_kv_len_next_list.append(
                 prefix_offsets[batch_id]
                 + sum(real_block_sizes[: cp_segment_num - cp_rank])
             )
             real_seq_q_prev_list.append(real_block_sizes[cp_rank])
-            real_seq_q_next_list.append(
-                real_block_sizes[cp_segment_num - cp_rank - 1]
-            )
+            real_seq_q_next_list.append(real_block_sizes[cp_segment_num - cp_rank - 1])
 
         from sglang.srt.server_args import get_global_server_args
 
@@ -348,12 +373,51 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         )
 
     def shard_hidden_states(self, x: Any, forward_batch) -> Any:
+        meta = forward_batch.attn_cp_metadata
+        block_len = self._get_uniform_block_len(meta.split_list)
+        if block_len is not None:
+            # dSparK target verify uses a fixed block per request.  Express the
+            # zigzag selection as two dense views instead of a wide ConcatD
+            # whose input count grows with batch size (32 inputs at bs=16).
+            blocks = x.view(
+                meta.bs,
+                self.cp_size * 2,
+                block_len,
+                *x.shape[1:],
+            )
+            local = torch.cat(
+                (
+                    blocks[:, self.cp_rank],
+                    blocks[:, self.cp_size * 2 - self.cp_rank - 1],
+                ),
+                dim=0,
+            )
+            return local.reshape(-1, *x.shape[1:])
+
         chunks = torch.split(x, forward_batch.attn_cp_metadata.split_list, dim=0)
         return torch.cat(
             [chunks[i] for i in forward_batch.attn_cp_metadata.zigzag_index], dim=0
         )
 
     def shard_position_ids(self, positions: Any, forward_batch) -> Any:
+        meta = forward_batch.attn_cp_metadata
+        block_len = self._get_uniform_block_len(meta.split_list)
+        if block_len is not None:
+            leading_shape = positions.shape[:-1]
+            blocks = positions.view(
+                *leading_shape,
+                meta.bs,
+                self.cp_size * 2,
+                block_len,
+            )
+            return torch.cat(
+                (
+                    blocks[..., :, self.cp_rank, :],
+                    blocks[..., :, self.cp_size * 2 - self.cp_rank - 1, :],
+                ),
+                dim=-2,
+            ).reshape(*leading_shape, -1)
+
         chunks = torch.split(
             positions, forward_batch.attn_cp_metadata.split_list, dim=-1
         )
@@ -365,6 +429,9 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         self, x: Any, forward_batch, stream: Optional[Any] = None
     ) -> Any:
         gathered = self._all_gather_reorganized(x, forward_batch, stream)
+        restored = self._restore_uniform_gathered(gathered, forward_batch)
+        if restored is not None:
+            return restored
         chunks = torch.split(
             gathered, forward_batch.attn_cp_metadata.reverse_split_len, dim=0
         )
@@ -376,12 +443,46 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         self, x: Any, forward_batch, stream: Optional[Any] = None
     ) -> Any:
         gathered = self._all_gather_reorganized(x, forward_batch, stream)
+        restored = self._restore_uniform_gathered(gathered, forward_batch)
+        if restored is not None:
+            return restored
         chunks = torch.split(
             gathered, forward_batch.attn_cp_metadata.reverse_split_len, dim=0
         )
         return torch.cat(
             [chunks[i] for i in forward_batch.attn_cp_metadata.cp_reverse_index], dim=0
         )
+
+    def _restore_uniform_gathered(self, gathered: torch.Tensor, forward_batch):
+        """Restore an equal-block zigzag layout without a wide ConcatD.
+
+        Target verification has a fixed number of tokens per request.  For
+        ``bs=16, cp=2`` the generic split/cat path presents 64 inputs to
+        ConcatD, which trips an Ascend graph-capture MTE address fault.  A
+        rank/half permutation has only ``2 * cp`` indices and is equivalent.
+        """
+        meta = forward_batch.attn_cp_metadata
+        block_len = self._get_uniform_block_len(meta.reverse_split_len)
+        if block_len is None:
+            return None
+
+        expected_tokens = meta.bs * self.cp_size * 2 * block_len
+        if gathered.shape[0] != expected_tokens:
+            return None
+
+        rank_major = gathered.view(
+            self.cp_size * 2,
+            meta.bs,
+            block_len,
+            *gathered.shape[1:],
+        )
+        natural_segment_order = torch.index_select(
+            rank_major,
+            0,
+            self._get_uniform_restore_order(gathered.device),
+        )
+        natural_order = natural_segment_order.movedim(0, 1)
+        return natural_order.reshape(expected_tokens, *gathered.shape[1:])
 
     def get_supported_attention_backend(self):
         return [CPAttentionBackendKind.FLASH_ATTENTION]
@@ -394,9 +495,9 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         attn_fn,
         attention_backend: CPAttentionBackendKind = CPAttentionBackendKind.FLASH_ATTENTION,
     ) -> Any:
-        assert (
-            attention_backend in self.get_supported_attention_backend()
-        ), f"{self.name} CP does not support {attention_backend=}"
+        assert attention_backend in self.get_supported_attention_backend(), (
+            f"{self.name} CP does not support {attention_backend=}"
+        )
 
         meta = forward_batch.attn_cp_metadata
         q_prev = q[: meta.total_q_prev_tokens]
@@ -461,6 +562,13 @@ class ZigzagCPStrategy(ContextParallelStrategy):
                 dtype=x.dtype,
             )
         group.cp_all_gather_into_tensor_async(gathered, x, stream)
+
+        # The fixed-size target-verify layout gives every CP rank exactly
+        # max_len tokens.  In that case the collective output is already the
+        # compact rank-major representation consumed by the graph-safe restore
+        # path; avoid another ConcatD entirely.
+        if all(per_rank_len == max_len for per_rank_len in meta.per_rank_actual_token):
+            return gathered
 
         chunks = torch.split(gathered, meta.max_rank_len, dim=0)
         return torch.cat(

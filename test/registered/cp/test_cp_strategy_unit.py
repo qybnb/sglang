@@ -133,10 +133,9 @@ class TestCPStrategyUnit(CustomTestCase):
         strategy = SimpleNamespace(gather_hidden_states=gather_hidden_states)
         forward_batch = SimpleNamespace()
         stream = object()
-        with patch(
-            "sglang.srt.layers.cp.utils.is_cp_v2_active", return_value=True
-        ), patch(
-            "sglang.srt.layers.cp.utils.get_cp_strategy", return_value=strategy
+        with (
+            patch("sglang.srt.layers.cp.utils.is_cp_v2_active", return_value=True),
+            patch("sglang.srt.layers.cp.utils.get_cp_strategy", return_value=strategy),
         ):
             gathered = cp_gather_aux_hidden_states_after_forward(
                 aux_hidden_states, forward_batch, stream
@@ -157,15 +156,18 @@ class TestCPStrategyUnit(CustomTestCase):
         forward_batch = SimpleNamespace(forward_mode=forward_mode)
         attn = SimpleNamespace(use_dsa=False, mla_enable_prefill_cp=True)
 
-        with patch(
-            "sglang.srt.models.deepseek_common.attention_backend_handler."
-            "mla_use_prefill_cp",
-            return_value=True,
-        ) as use_prefill_cp, patch(
-            "sglang.srt.models.deepseek_common.attention_backend_handler."
-            "use_npu_mla_cp_ring",
-            return_value=False,
-        ) as use_ring:
+        with (
+            patch(
+                "sglang.srt.models.deepseek_common.attention_backend_handler."
+                "mla_use_prefill_cp",
+                return_value=True,
+            ) as use_prefill_cp,
+            patch(
+                "sglang.srt.models.deepseek_common.attention_backend_handler."
+                "use_npu_mla_cp_ring",
+                return_value=False,
+            ) as use_ring,
+        ):
             method = handle_attention_ascend(attn, forward_batch)
 
         self.assertEqual(method, AttnForwardMethod.MLA_NPU)
@@ -187,14 +189,17 @@ class TestCPStrategyUnit(CustomTestCase):
             v_head_dim=128,
         )
 
-        with patch(
-            "sglang.srt.models.deepseek_common.attention_backend_handler."
-            "mla_use_prefill_cp",
-            return_value=True,
-        ), patch(
-            "sglang.srt.models.deepseek_common.attention_backend_handler."
-            "use_npu_mla_cp_ring",
-            return_value=True,
+        with (
+            patch(
+                "sglang.srt.models.deepseek_common.attention_backend_handler."
+                "mla_use_prefill_cp",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.models.deepseek_common.attention_backend_handler."
+                "use_npu_mla_cp_ring",
+                return_value=True,
+            ),
         ):
             method = handle_attention_ascend(attn, forward_batch)
 
@@ -218,12 +223,15 @@ class TestCPStrategyUnit(CustomTestCase):
             metadata.max_rank_len = [max(rank_tokens)] * 4
 
         update_payload_metadata()
-        with patch(
-            "sglang.srt.layers.utils.cp_utils.get_global_server_args",
-            return_value=SimpleNamespace(mla_cp_backend="ring"),
-        ), patch(
-            "sglang.srt.layers.utils.cp_utils.get_parallel",
-            return_value=SimpleNamespace(attn_cp_size=4),
+        with (
+            patch(
+                "sglang.srt.layers.utils.cp_utils.get_global_server_args",
+                return_value=SimpleNamespace(mla_cp_backend="ring"),
+            ),
+            patch(
+                "sglang.srt.layers.utils.cp_utils.get_parallel",
+                return_value=SimpleNamespace(attn_cp_size=4),
+            ),
         ):
             self.assertIsNone(get_npu_mla_cp_ring_fallback_reason(forward_batch))
             self.assertTrue(use_npu_mla_cp_ring(forward_batch))
@@ -275,9 +283,7 @@ class TestCPStrategyUnit(CustomTestCase):
             shard_indices = get_zigzag_cp_rank_chunk_indices(
                 bs=2, cp_size=cp_size, cp_rank=rank
             )
-            shard = torch.cat(
-                [natural_chunks[index] for index in shard_indices], dim=0
-            )
+            shard = torch.cat([natural_chunks[index] for index in shard_indices], dim=0)
             shard_cache_locs = torch.cat(
                 [natural_chunks[index].flatten() for index in shard_indices], dim=0
             )
@@ -306,21 +312,18 @@ class TestCPStrategyUnit(CustomTestCase):
         for total_tokens in range(8, 80):
             base, remainder = divmod(total_tokens, 8)
             blocks = [
-                base + (1 if block_id < remainder else 0)
-                for block_id in range(8)
+                base + (1 if block_id < remainder else 0) for block_id in range(8)
             ]
             for cp_rank in range(4):
                 local_early, local_late = get_zigzag_cp_rank_block_lengths(
                     blocks, 1, 4, cp_rank
                 )
                 for source_rank in range(4):
-                    source_early, source_late = (
-                        get_zigzag_cp_rank_block_lengths(
-                            blocks, 1, 4, source_rank
-                        )
+                    source_early, source_late = get_zigzag_cp_rank_block_lengths(
+                        blocks, 1, 4, source_rank
                     )
-                    early_to_prev, _, late_to_next = (
-                        get_zigzag_mla_cp_ring_visibility(cp_rank, source_rank)
+                    early_to_prev, _, late_to_next = get_zigzag_mla_cp_ring_visibility(
+                        cp_rank, source_rank
                     )
                     if early_to_prev:
                         self.assertGreaterEqual(source_early[0], local_early[0])
@@ -471,9 +474,10 @@ class TestCPZigzagStrategy(CustomTestCase):
             self.assertFalse(enable_cp_v2())
             self.assertFalse(is_cp_v2_active(active_batch))
 
-        with patch(
-            "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=True
-        ), get_parallel().override(attn_tp_size=1):
+        with (
+            patch("sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=True),
+            get_parallel().override(attn_tp_size=1),
+        ):
             self.assertTrue(enable_cp_v2())
             self.assertTrue(is_cp_v2_active(active_batch))
             self.assertFalse(is_cp_v2_active(inactive_batch))
@@ -509,9 +513,10 @@ class TestCPZigzagStrategy(CustomTestCase):
             global_prefill_cp_active=True,
         )
 
-        with patch(
-            "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=True
-        ), get_parallel().override(attn_tp_size=1):
+        with (
+            patch("sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=True),
+            get_parallel().override(attn_tp_size=1),
+        ):
             self.assertTrue(can_cp_v2_apply(eligible_batch_forced_off))
             self.assertFalse(is_cp_v2_active(eligible_batch_forced_off))
             self.assertTrue(is_cp_v2_active(idle_shadow_forced_on, num_tokens=8))
@@ -523,9 +528,10 @@ class TestCPZigzagStrategy(CustomTestCase):
             global_prefill_cp_active=None,
         )
 
-        with patch(
-            "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=True
-        ), get_parallel().override(attn_tp_size=1):
+        with (
+            patch("sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=True),
+            get_parallel().override(attn_tp_size=1),
+        ):
             # Padding the tensor to eight rows must not make a real seven-token
             # request eligible for zigzag CP4.
             self.assertFalse(can_cp_v2_apply(scheduler_batch, num_tokens=8))
@@ -724,7 +730,8 @@ class TestCPZigzagStrategy(CustomTestCase):
             )
             metas.append(metadata)
             fb = self._forward_batch(metadata, extend_seq_lens)
-            local = ZigzagCPStrategy(cp_size=cp_size).shard_hidden_states(x, fb)
+            with get_parallel().override(attn_cp_rank=rank):
+                local = ZigzagCPStrategy(cp_size=cp_size).shard_hidden_states(x, fb)
             pad = metadata.max_rank_len[0] - local.shape[0]
             if pad:
                 local = torch.nn.functional.pad(
@@ -769,7 +776,7 @@ class TestCPZigzagStrategy(CustomTestCase):
         seq_lens = [11, 13]
         extend_seq_lens = [9, 10]
         x = torch.arange(sum(extend_seq_lens) * 2).view(sum(extend_seq_lens), 2)
-        positions = torch.arange(sum(extend_seq_lens))
+        positions = torch.arange(sum(extend_seq_lens) * 3).view(3, sum(extend_seq_lens))
 
         for rank in range(cp_size):
             metadata = self._metadata_for_rank(
@@ -844,6 +851,57 @@ class TestCPZigzagStrategy(CustomTestCase):
                 )
 
             self.assertTrue(torch.equal(gathered, x))
+
+    def test_zigzag_bs16_target_verify_avoids_wide_concat(self):
+        """The dSparK graph bucket must not build a 64-input ConcatD."""
+        cp_size = 2
+        batch_size = 16
+        tokens_per_request = 8
+        extend_seq_lens = [tokens_per_request] * batch_size
+        seq_lens = list(extend_seq_lens)
+        x = torch.arange(sum(extend_seq_lens) * 2, dtype=torch.float32).view(
+            sum(extend_seq_lens), 2
+        )
+        metas, padded_rank_tensors = self._padded_rank_tensors(
+            x,
+            cp_size=cp_size,
+            seq_lens=seq_lens,
+            extend_seq_lens=extend_seq_lens,
+        )
+        positions = torch.arange(sum(extend_seq_lens) * 3).view(3, sum(extend_seq_lens))
+
+        for rank in range(cp_size):
+            strategy = ZigzagCPStrategy(cp_size=cp_size)
+            local_x = padded_rank_tensors[rank][
+                : metas[rank].per_rank_actual_token[rank]
+            ]
+            fb = self._forward_batch(metas[rank], extend_seq_lens)
+            position_chunks = torch.split(positions, metas[rank].split_list, dim=-1)
+            expected_positions = torch.cat(
+                [position_chunks[i] for i in metas[rank].zigzag_index], dim=-1
+            )
+            with get_parallel().override(attn_cp_rank=rank):
+                local_positions = strategy.shard_position_ids(positions, fb)
+            self.assertTrue(torch.equal(local_positions, expected_positions))
+
+            with (
+                patch(
+                    "sglang.srt.layers.cp.zigzag.get_attention_cp_group",
+                    return_value=_FakeCPGroup(padded_rank_tensors),
+                ),
+                patch(
+                    "sglang.srt.distributed.device_communicators.pynccl_allocator.use_symmetric_memory",
+                    return_value=torch.no_grad(),
+                ),
+                patch("torch.cat", wraps=torch.cat) as cat_mock,
+            ):
+                gathered = strategy.gather_hidden_states(local_x, fb, stream=None)
+
+            self.assertTrue(torch.equal(gathered, x))
+            # The fake collective itself concatenates CP rank tensors.  The
+            # production zigzag restore must add no batch-wide concatenation.
+            self.assertEqual(cat_mock.call_count, 1)
+            self.assertEqual(len(cat_mock.call_args.args[0]), cp_size)
 
     def test_zigzag_gathers_kv_cache_to_original_order(self):
         cp_size = 4
@@ -952,9 +1010,7 @@ class TestCPZigzagStrategy(CustomTestCase):
         head_shards = []
         for rank in range(cp_size):
             fb = self._forward_batch(metadata[rank], extend_seq_lens)
-            with get_parallel().override(
-                attn_cp_size=cp_size, attn_cp_rank=rank
-            ):
+            with get_parallel().override(attn_cp_size=cp_size, attn_cp_rank=rank):
                 head_shard = sequence_to_head_a2a(
                     local_inputs[rank],
                     fb,
@@ -988,9 +1044,7 @@ class TestCPZigzagStrategy(CustomTestCase):
 
         for rank in range(cp_size):
             fb = self._forward_batch(metadata[rank], extend_seq_lens)
-            with get_parallel().override(
-                attn_cp_size=cp_size, attn_cp_rank=rank
-            ):
+            with get_parallel().override(attn_cp_size=cp_size, attn_cp_rank=rank):
                 restored = head_to_sequence_a2a(
                     head_shards[rank],
                     fb,
@@ -1007,8 +1061,7 @@ class TestCPZigzagStrategy(CustomTestCase):
     def test_kda_state_head_all_gather(self):
         cp_size = 4
         local_states = [
-            torch.full((2, 3, 5), rank, dtype=torch.float32)
-            for rank in range(cp_size)
+            torch.full((2, 3, 5), rank, dtype=torch.float32) for rank in range(cp_size)
         ]
         group = _FakeHeadGatherGroup(
             [state.movedim(1, 0).contiguous() for state in local_states]
@@ -1016,9 +1069,7 @@ class TestCPZigzagStrategy(CustomTestCase):
         expected = torch.cat(local_states, dim=1)
 
         for rank in range(cp_size):
-            with get_parallel().override(
-                attn_cp_size=cp_size, attn_cp_rank=rank
-            ):
+            with get_parallel().override(attn_cp_size=cp_size, attn_cp_rank=rank):
                 gathered = all_gather_cp_heads(
                     local_states[rank], head_dim=1, group=group
                 )
@@ -1106,9 +1157,7 @@ class TestCPZigzagStrategy(CustomTestCase):
                 context,
             )
             torch.testing.assert_close(local_initial, expected_initial[rank])
-            torch.testing.assert_close(
-                state_pool, torch.tensor([[[6.0, 7.0, 8.0]]])
-            )
+            torch.testing.assert_close(state_pool, torch.tensor([[[6.0, 7.0, 8.0]]]))
 
     def test_kda_fla_cp_handles_multiple_requests(self):
         # CP2 natural blocks, with two independent requests in every block.
@@ -1197,9 +1246,7 @@ class TestCPZigzagStrategy(CustomTestCase):
             local_initial = compose_kda_cp_affine_states(
                 rank_affine[rank], state_pool, torch.tensor([0, 1]), context
             )
-            torch.testing.assert_close(
-                local_initial, expected_affine_initial[rank]
-            )
+            torch.testing.assert_close(local_initial, expected_affine_initial[rank])
             torch.testing.assert_close(
                 state_pool, torch.tensor([959.0, 664.0]).view(2, 1, 1, 1)
             )
@@ -1210,9 +1257,7 @@ class TestCPZigzagStrategy(CustomTestCase):
                 local_segment_slots=rank_slots[rank],
                 **common,
             )
-            conv_pool = torch.tensor(
-                [[[-2.0, -1.0, 0.0]], [[10.0, 11.0, 12.0]]]
-            )
+            conv_pool = torch.tensor([[[-2.0, -1.0, 0.0]], [[10.0, 11.0, 12.0]]])
             conv_initial = prepare_kda_cp_conv_states(
                 rank_x[rank], conv_pool, torch.tensor([0, 1]), context
             )
@@ -1239,9 +1284,12 @@ class TestCPZigzagStrategy(CustomTestCase):
             extend_prefix_lens=torch.tensor([0]),
             extend_prefix_lens_cpu=[0],
         )
-        with get_parallel().override(attn_cp_size=4, attn_cp_rank=0), patch(
-            "sglang.srt.layers.attention.linear.kda_cp.get_global_server_args",
-            return_value=SimpleNamespace(mamba_cache_chunk_size=128),
+        with (
+            get_parallel().override(attn_cp_size=4, attn_cp_rank=0),
+            patch(
+                "sglang.srt.layers.attention.linear.kda_cp.get_global_server_args",
+                return_value=SimpleNamespace(mamba_cache_chunk_size=128),
+            ),
         ):
             context = build_kda_fla_cp_context(
                 forward_batch, device=torch.device("cpu"), group=object()
@@ -1290,9 +1338,12 @@ class TestCPZigzagStrategy(CustomTestCase):
             extend_prefix_lens=torch.tensor([0]),
             extend_prefix_lens_cpu=[0],
         )
-        with get_parallel().override(attn_cp_size=4, attn_cp_rank=0), patch(
-            "sglang.srt.layers.attention.linear.kda_cp.get_global_server_args",
-            return_value=SimpleNamespace(mamba_cache_chunk_size=128),
+        with (
+            get_parallel().override(attn_cp_size=4, attn_cp_rank=0),
+            patch(
+                "sglang.srt.layers.attention.linear.kda_cp.get_global_server_args",
+                return_value=SimpleNamespace(mamba_cache_chunk_size=128),
+            ),
         ):
             context = build_kda_fla_cp_context(
                 forward_batch, device=torch.device("cpu"), group=object()
@@ -1318,17 +1369,13 @@ class TestCPZigzagStrategy(CustomTestCase):
         cache_indices = torch.tensor([0], dtype=torch.int32)
 
         loop_pool = initial_pool.clone()
-        with patch.dict(
-            os.environ, {"SGLANG_KDA_CP_DIRECT_CONV_PLAN": "0"}
-        ):
+        with patch.dict(os.environ, {"SGLANG_KDA_CP_DIRECT_CONV_PLAN": "0"}):
             loop_initial = prepare_kda_cp_conv_states(
                 local_x, loop_pool, cache_indices, context
             ).clone()
 
         direct_pool = initial_pool.clone()
-        with patch.dict(
-            os.environ, {"SGLANG_KDA_CP_DIRECT_CONV_PLAN": "1"}
-        ):
+        with patch.dict(os.environ, {"SGLANG_KDA_CP_DIRECT_CONV_PLAN": "1"}):
             direct_initial = prepare_kda_cp_conv_states(
                 local_x, direct_pool, cache_indices, context
             ).clone()
@@ -1339,9 +1386,7 @@ class TestCPZigzagStrategy(CustomTestCase):
     def test_kda_fla_cp_tracks_split_affine_and_conv_states(self):
         local_affine = [
             torch.tensor([[[[1.0, 2.0]]], [[[5.0, 6.0]]]]),
-            torch.tensor(
-                [[[[2.0, 3.0]]], [[[3.0, 4.0]]], [[[4.0, 5.0]]]]
-            ),
+            torch.tensor([[[[2.0, 3.0]]], [[[3.0, 4.0]]], [[[4.0, 5.0]]]]),
         ]
         local_slots = [(0, 6), (2, 4, 5)]
         local_lens = [(2, 2), (2, 1, 1)]
@@ -1373,9 +1418,7 @@ class TestCPZigzagStrategy(CustomTestCase):
         ]
         expected_conv_initial = [
             torch.tensor([[[-2.0, -1.0, 0.0]], [[4.0, 5.0, 6.0]]]),
-            torch.tensor(
-                [[[0.0, 1.0, 2.0]], [[2.0, 3.0, 4.0]], [[3.0, 4.0, 5.0]]]
-            ),
+            torch.tensor([[[0.0, 1.0, 2.0]], [[2.0, 3.0, 4.0]], [[3.0, 4.0, 5.0]]]),
         ]
 
         for rank in range(2):
@@ -1405,9 +1448,7 @@ class TestCPZigzagStrategy(CustomTestCase):
             affine_initial = compose_kda_cp_affine_states(
                 local_affine[rank], state_pool, torch.tensor([0]), affine_context
             )
-            torch.testing.assert_close(
-                affine_initial, expected_affine_initial[rank]
-            )
+            torch.testing.assert_close(affine_initial, expected_affine_initial[rank])
             torch.testing.assert_close(state_pool[0], torch.tensor([[[5759.0]]]))
             torch.testing.assert_close(state_pool[1], torch.tensor([[[191.0]]]))
 
