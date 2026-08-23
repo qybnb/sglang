@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
@@ -67,6 +68,47 @@ import torch.distributed as dist
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 logger = logging.getLogger(__name__)
+
+
+def _ensure_npu_deepep_hccl_window() -> None:
+    """Keep the custom low-latency op and its process group on one window size.
+
+    Ascend's MoeLowLatencyDispatchV2/MoeLowLatencyCombineV2 operators consume
+    ``HCCL_BUFFSIZE`` directly.  The NPU process-group setup also supports the
+    more specific ``DEEPEP_HCCL_BUFFSIZE``, but setting only the latter leaves
+    the custom operator on the smaller global window.  That mismatch can turn
+    into a device-side address-out-of-range failure during graph capture and be
+    surfaced asynchronously by an unrelated operator.
+    """
+    if not _is_npu:
+        return
+
+    deepep_buffer = os.environ.get("DEEPEP_HCCL_BUFFSIZE")
+    if deepep_buffer is None:
+        return
+
+    try:
+        deepep_buffer_mb = int(deepep_buffer)
+        global_buffer_mb = int(os.environ.get("HCCL_BUFFSIZE", "0"))
+    except ValueError:
+        logger.warning(
+            "Cannot align NPU DeepEP HCCL windows because HCCL_BUFFSIZE=%r "
+            "or DEEPEP_HCCL_BUFFSIZE=%r is not an integer.",
+            os.environ.get("HCCL_BUFFSIZE"),
+            deepep_buffer,
+        )
+        return
+
+    if global_buffer_mb >= deepep_buffer_mb:
+        return
+
+    logger.warning(
+        "Raising HCCL_BUFFSIZE from %sMB to %sMB because Ascend DeepEP "
+        "low-latency operators consume the global HCCL window.",
+        global_buffer_mb,
+        deepep_buffer_mb,
+    )
+    os.environ["HCCL_BUFFSIZE"] = str(deepep_buffer_mb)
 
 
 def _is_mnnvl_fabric_supported() -> bool:
@@ -178,6 +220,8 @@ class DeepEPBuffer:
     ):
         if cls._buffer is not None:
             return cls._buffer
+
+        _ensure_npu_deepep_hccl_window()
 
         cls._hidden_size = hidden_size
         cls._num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
