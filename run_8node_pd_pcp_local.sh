@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
-# Node-local Kimi-K3 PD launcher for eight 16-NPU nodes (4P + 4D).
+# Node-local Kimi-K3 PD launcher. The default is eight 16-NPU nodes (4P +
+# 4D), while wrappers may select asymmetric P/D node counts and TP sizes.
 #
 # This script never uses SSH and never starts or stops a process on another
 # host. Run it manually inside the same container on every node:
@@ -67,49 +68,59 @@ DECODE_IPS="${DECODE_IPS:-}"
 IFS=',' read -r -a PREFILL_IP_ARRAY <<< "${PREFILL_IPS}"
 IFS=',' read -r -a DECODE_IP_ARRAY <<< "${DECODE_IPS}"
 GROUP_NNODES="${GROUP_NNODES:-4}"
-if [[ ! "${GROUP_NNODES}" =~ ^[1-9][0-9]*$ ]]; then
-    echo "GROUP_NNODES must be a positive integer." >&2
+PREFILL_NNODES="${PREFILL_NNODES:-${GROUP_NNODES}}"
+DECODE_NNODES="${DECODE_NNODES:-${GROUP_NNODES}}"
+if [[ ! "${PREFILL_NNODES}" =~ ^[1-9][0-9]*$ ]] \
+    || [[ ! "${DECODE_NNODES}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "PREFILL_NNODES and DECODE_NNODES must be positive integers." >&2
     exit 2
 fi
-if (( ${#PREFILL_IP_ARRAY[@]} != GROUP_NNODES )); then
-    echo "PREFILL_IPS must contain exactly ${GROUP_NNODES} comma-separated IPs." >&2
+if (( ${#PREFILL_IP_ARRAY[@]} != PREFILL_NNODES )); then
+    echo "PREFILL_IPS must contain exactly ${PREFILL_NNODES} comma-separated IPs." >&2
     exit 2
 fi
-if (( ${#DECODE_IP_ARRAY[@]} != GROUP_NNODES )); then
-    echo "DECODE_IPS must contain exactly ${GROUP_NNODES} comma-separated IPs." >&2
+if (( ${#DECODE_IP_ARRAY[@]} != DECODE_NNODES )); then
+    echo "DECODE_IPS must contain exactly ${DECODE_NNODES} comma-separated IPs." >&2
     exit 2
 fi
 
 PREFILL_RANK0_IP="${PREFILL_IP_ARRAY[0]}"
 DECODE_RANK0_IP="${DECODE_IP_ARRAY[0]}"
 
-# P and D are independent distributed groups. The default deployment uses
-# four nodes per group; the 2P2D wrapper sets GROUP_NNODES=2.
-NNODES="${GROUP_NNODES}"
+# P and D are independent distributed groups and may use different node counts
+# and TP sizes. TP_SIZE remains as a backward-compatible default for wrappers
+# that use a symmetric topology.
 DEPLOYMENT_NAME="${DEPLOYMENT_NAME:-eight-node 4P4D}"
-TP_SIZE="${TP_SIZE:-64}"
+TP_SIZE_DEFAULT="${TP_SIZE:-64}"
+PREFILL_TP_SIZE="${PREFILL_TP_SIZE:-${TP_SIZE_DEFAULT}}"
+DECODE_TP_SIZE="${DECODE_TP_SIZE:-${TP_SIZE_DEFAULT}}"
 PP_SIZE="${PP_SIZE:-1}"
 PREFILL_DP_SIZE="${PREFILL_DP_SIZE:-2}"
 PREFILL_CP_SIZE="${PREFILL_CP_SIZE:-2}"
 DECODE_DP_SIZE="${DECODE_DP_SIZE:-4}"
 
-if [[ ! "${TP_SIZE}" =~ ^[1-9][0-9]*$ ]] \
+if [[ ! "${PREFILL_TP_SIZE}" =~ ^[1-9][0-9]*$ ]] \
+    || [[ ! "${DECODE_TP_SIZE}" =~ ^[1-9][0-9]*$ ]] \
     || [[ ! "${PREFILL_DP_SIZE}" =~ ^[1-9][0-9]*$ ]] \
     || [[ ! "${PREFILL_CP_SIZE}" =~ ^[1-9][0-9]*$ ]] \
     || [[ ! "${DECODE_DP_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
     echo "TP/DP/CP sizes must be positive integers." >&2
     exit 2
 fi
-if (( TP_SIZE % NNODES != 0 )); then
-    echo "TP_SIZE=${TP_SIZE} must be divisible by NNODES=${NNODES}." >&2
+if (( PREFILL_TP_SIZE % PREFILL_NNODES != 0 )); then
+    echo "PREFILL_TP_SIZE=${PREFILL_TP_SIZE} must be divisible by PREFILL_NNODES=${PREFILL_NNODES}." >&2
     exit 2
 fi
-if (( TP_SIZE % (PREFILL_DP_SIZE * PREFILL_CP_SIZE) != 0 )); then
-    echo "TP_SIZE must be divisible by PREFILL_DP_SIZE * PREFILL_CP_SIZE." >&2
+if (( DECODE_TP_SIZE % DECODE_NNODES != 0 )); then
+    echo "DECODE_TP_SIZE=${DECODE_TP_SIZE} must be divisible by DECODE_NNODES=${DECODE_NNODES}." >&2
     exit 2
 fi
-if (( TP_SIZE % DECODE_DP_SIZE != 0 )); then
-    echo "TP_SIZE must be divisible by DECODE_DP_SIZE." >&2
+if (( PREFILL_TP_SIZE % (PREFILL_DP_SIZE * PREFILL_CP_SIZE) != 0 )); then
+    echo "PREFILL_TP_SIZE must be divisible by PREFILL_DP_SIZE * PREFILL_CP_SIZE." >&2
+    exit 2
+fi
+if (( DECODE_TP_SIZE % DECODE_DP_SIZE != 0 )); then
+    echo "DECODE_TP_SIZE must be divisible by DECODE_DP_SIZE." >&2
     exit 2
 fi
 if [[ "${PP_SIZE}" != "1" ]]; then
@@ -135,6 +146,10 @@ PREFILL_MEM_FRACTION_STATIC="${PREFILL_MEM_FRACTION_STATIC:-0.82}"
 DECODE_MEM_FRACTION_STATIC="${DECODE_MEM_FRACTION_STATIC:-0.75}"
 PREFILL_DEEPEP_MODE="${PREFILL_DEEPEP_MODE:-normal}"
 DECODE_DEEPEP_MODE="${DECODE_DEEPEP_MODE:-auto}"
+PREFILL_ENABLE_DEEPEP="${PREFILL_ENABLE_DEEPEP:-1}"
+DECODE_ENABLE_DEEPEP="${DECODE_ENABLE_DEEPEP:-1}"
+PREFILL_ENABLE_DP_ATTENTION="${PREFILL_ENABLE_DP_ATTENTION:-1}"
+DECODE_ENABLE_DP_ATTENTION="${DECODE_ENABLE_DP_ATTENTION:-1}"
 PREFILL_HCCL_BUFFSIZE="${PREFILL_HCCL_BUFFSIZE:-2000}"
 DECODE_HCCL_BUFFSIZE="${DECODE_HCCL_BUFFSIZE:-2000}"
 PREFILL_DEEPEP_MAX_DISPATCH="${PREFILL_DEEPEP_MAX_DISPATCH:-128}"
@@ -154,6 +169,10 @@ ENABLE_PREFIX_CACHE="${ENABLE_PREFIX_CACHE:-0}"
 case "${ENABLE_DSPARK}" in 0|1) ;; *) echo "ENABLE_DSPARK must be 0 or 1." >&2; exit 2 ;; esac
 case "${DISABLE_CUDA_GRAPH}" in 0|1) ;; *) echo "DISABLE_CUDA_GRAPH must be 0 or 1." >&2; exit 2 ;; esac
 case "${ENABLE_PREFIX_CACHE}" in 0|1) ;; *) echo "ENABLE_PREFIX_CACHE must be 0 or 1." >&2; exit 2 ;; esac
+case "${PREFILL_ENABLE_DEEPEP}" in 0|1) ;; *) echo "PREFILL_ENABLE_DEEPEP must be 0 or 1." >&2; exit 2 ;; esac
+case "${DECODE_ENABLE_DEEPEP}" in 0|1) ;; *) echo "DECODE_ENABLE_DEEPEP must be 0 or 1." >&2; exit 2 ;; esac
+case "${PREFILL_ENABLE_DP_ATTENTION}" in 0|1) ;; *) echo "PREFILL_ENABLE_DP_ATTENTION must be 0 or 1." >&2; exit 2 ;; esac
+case "${DECODE_ENABLE_DP_ATTENTION}" in 0|1) ;; *) echo "DECODE_ENABLE_DP_ATTENTION must be 0 or 1." >&2; exit 2 ;; esac
 
 DSPARK_BLOCK_SIZE="${DSPARK_BLOCK_SIZE:-7}"
 DSPARK_DRAFT_ATTENTION_BACKEND="${DSPARK_DRAFT_ATTENTION_BACKEND:-ascend}"
@@ -194,6 +213,14 @@ if [[ "${ROLE}" == "router" ]]; then
     exit "${PIPESTATUS[0]}"
 fi
 
+if [[ "${ROLE}" == "prefill" ]]; then
+    NNODES="${PREFILL_NNODES}"
+    TP_SIZE="${PREFILL_TP_SIZE}"
+else
+    NNODES="${DECODE_NNODES}"
+    TP_SIZE="${DECODE_TP_SIZE}"
+fi
+
 NODE_RANK="${NODE_RANK:-}"
 LOCAL_IP="${LOCAL_IP:-}"
 NET_IFACE="${NET_IFACE:-}"
@@ -226,6 +253,8 @@ if [[ "${ROLE}" == "prefill" ]]; then
     MAX_RUNNING_REQUESTS="${PREFILL_MAX_RUNNING_REQUESTS}"
     MEM_FRACTION_STATIC="${PREFILL_MEM_FRACTION_STATIC}"
     DEEPEP_MODE="${PREFILL_DEEPEP_MODE}"
+    ENABLE_DEEPEP="${PREFILL_ENABLE_DEEPEP}"
+    ENABLE_DP_ATTENTION="${PREFILL_ENABLE_DP_ATTENTION}"
     HCCL_BUFFSIZE="${PREFILL_HCCL_BUFFSIZE}"
     DEEPEP_MAX_DISPATCH="${PREFILL_DEEPEP_MAX_DISPATCH}"
 else
@@ -236,6 +265,8 @@ else
     MAX_RUNNING_REQUESTS="${DECODE_MAX_RUNNING_REQUESTS}"
     MEM_FRACTION_STATIC="${DECODE_MEM_FRACTION_STATIC}"
     DEEPEP_MODE="${DECODE_DEEPEP_MODE}"
+    ENABLE_DEEPEP="${DECODE_ENABLE_DEEPEP}"
+    ENABLE_DP_ATTENTION="${DECODE_ENABLE_DP_ATTENTION}"
     HCCL_BUFFSIZE="${DECODE_HCCL_BUFFSIZE}"
     DEEPEP_MAX_DISPATCH="${DECODE_DEEPEP_MAX_DISPATCH}"
 fi
@@ -301,6 +332,16 @@ if [[ -n "${MAX_MAMBA_CACHE_SIZE}" ]]; then
     MAMBA_CACHE_ARGS=(--max-mamba-cache-size "${MAX_MAMBA_CACHE_SIZE}")
 fi
 
+DP_ARGS=(--dp-size "${DP_SIZE}")
+if [[ "${ENABLE_DP_ATTENTION}" == "1" ]]; then
+    DP_ARGS=(--enable-dp-attention --dp-size "${DP_SIZE}" --enable-dp-lm-head)
+fi
+
+MOE_ARGS=()
+if [[ "${ENABLE_DEEPEP}" == "1" ]]; then
+    MOE_ARGS=(--moe-a2a-backend deepep --deepep-mode "${DEEPEP_MODE}")
+fi
+
 COMMON_ARGS=(
     --model-loader-extra-config '{"enable_multithread_load": true}'
     --dist-init-addr "${DIST_INIT_ADDR}"
@@ -315,9 +356,7 @@ COMMON_ARGS=(
     --dtype bfloat16
     --tp-size "${TP_SIZE}"
     --pp-size "${PP_SIZE}"
-    --enable-dp-attention
-    --dp-size "${DP_SIZE}"
-    --enable-dp-lm-head
+    "${DP_ARGS[@]}"
     --base-gpu-id 0
     --page-size "${PAGE_SIZE}"
     --max-total-tokens "${MAX_TOTAL_TOKENS}"
@@ -325,8 +364,7 @@ COMMON_ARGS=(
     "${MAMBA_CACHE_ARGS[@]}"
     --mamba-ssm-dtype bfloat16
     --reasoning-parser kimi_k3
-    --moe-a2a-backend deepep
-    --deepep-mode "${DEEPEP_MODE}"
+    "${MOE_ARGS[@]}"
     "${CACHE_ARGS[@]}"
     --watchdog-timeout 9000
     --host "${HOST}"
@@ -396,6 +434,7 @@ else
         echo "  draft=${DRAFT_MODEL_PATH}"
     fi
 fi
+echo "  DP-attention=${ENABLE_DP_ATTENTION}, DeepEP=${ENABLE_DEEPEP}"
 echo "  MF-store=${ASCEND_MF_STORE_URL}, HCCL-range=${HCCL_NPU_SOCKET_PORT_RANGE}"
 echo "  max-tokens=${MAX_TOTAL_TOKENS}, max-running=${MAX_RUNNING_REQUESTS}, mem=${MEM_FRACTION_STATIC}"
 
