@@ -10,8 +10,8 @@
 # uses SSH. All nodes must receive the same PREFILL_IPS and DECODE_IPS; each
 # node supplies its own NODE_RANK, LOCAL_IP, NET_IFACE and checkpoint path.
 #
-# Decode follows the established two-node recipe: DeepEP off, dSparK on and
-# decode graph on. The full 93-layer checkpoint does not fit TP32/PP1 on the
+# Decode uses the minimal validation profile: DeepEP, dSparK and decode graph
+# are all disabled. The full 93-layer checkpoint does not fit TP32/PP1 on the
 # currently tested 64-GiB NPUs, so P and D must use the same reduced-layer
 # checkpoint unless the target hardware has enough memory.
 #
@@ -21,9 +21,9 @@
 #   P3: NODE_RANK=3 LOCAL_IP=<P3> NET_IFACE=<nic3> MODEL_PATH=<model3> \
 #         ./run_6node_4p2d_pd_pcp_local.sh prefill
 #   D0: NODE_RANK=0 LOCAL_IP=<D0> NET_IFACE=<nic4> MODEL_PATH=<model4> \
-#         DRAFT_MODEL_PATH=<draft4> ./run_6node_4p2d_pd_pcp_local.sh decode
+#         ./run_6node_4p2d_pd_pcp_local.sh decode
 #   D1: NODE_RANK=1 LOCAL_IP=<D1> NET_IFACE=<nic5> MODEL_PATH=<model5> \
-#         DRAFT_MODEL_PATH=<draft5> ./run_6node_4p2d_pd_pcp_local.sh decode
+#         ./run_6node_4p2d_pd_pcp_local.sh decode
 #   P0: ./run_6node_4p2d_pd_pcp_local.sh router
 
 set -euo pipefail
@@ -52,11 +52,10 @@ export DECODE_MAX_RUNNING_REQUESTS="${DECODE_MAX_RUNNING_REQUESTS:-4}"
 export PREFILL_HCCL_BUFFSIZE="${PREFILL_HCCL_BUFFSIZE:-2000}"
 export DECODE_HCCL_BUFFSIZE="${DECODE_HCCL_BUFFSIZE:-512}"
 
-# Prefill never captures decode graphs. Decode always enables dSparK and the
-# two graph batch sizes used by the established two-node recipe.
-export ENABLE_DSPARK=1
-export DISABLE_CUDA_GRAPH=0
-export CUDA_GRAPH_BS="${CUDA_GRAPH_BS:-1 2}"
+# Keep the first 4P2D transfer/accuracy validation independent of speculative
+# decoding and graph capture. They can be enabled later as separate variables.
+export ENABLE_DSPARK="${ENABLE_DSPARK:-0}"
+export DISABLE_CUDA_GRAPH="${DISABLE_CUDA_GRAPH:-1}"
 
 export PREFILL_DIST_PORT="${PREFILL_DIST_PORT:-15301}"
 export DECODE_DIST_PORT="${DECODE_DIST_PORT:-15302}"
