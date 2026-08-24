@@ -160,11 +160,10 @@ MLA_CP_BACKEND="${MLA_CP_BACKEND:-ring}"
 case "${KDA_CP_BACKEND}" in a2a|fla) ;; *) echo "KDA_CP_BACKEND must be a2a or fla." >&2; exit 2 ;; esac
 case "${MLA_CP_BACKEND}" in allgather|ring) ;; *) echo "MLA_CP_BACKEND must be allgather or ring." >&2; exit 2 ;; esac
 
-# The first PD+PCP validation should use ENABLE_DSPARK=0 and
-# DISABLE_CUDA_GRAPH=1. Enable them independently after the transfer and
-# accuracy checks pass.
-ENABLE_DSPARK="${ENABLE_DSPARK:-0}"
-DISABLE_CUDA_GRAPH="${DISABLE_CUDA_GRAPH:-1}"
+# The full 4P4D profile enables dSparK and Decode NPU Graph by default.
+# Wrappers for smaller validation topologies may override both defaults.
+ENABLE_DSPARK="${ENABLE_DSPARK:-1}"
+DISABLE_CUDA_GRAPH="${DISABLE_CUDA_GRAPH:-0}"
 ENABLE_PREFIX_CACHE="${ENABLE_PREFIX_CACHE:-0}"
 case "${ENABLE_DSPARK}" in 0|1) ;; *) echo "ENABLE_DSPARK must be 0 or 1." >&2; exit 2 ;; esac
 case "${DISABLE_CUDA_GRAPH}" in 0|1) ;; *) echo "DISABLE_CUDA_GRAPH must be 0 or 1." >&2; exit 2 ;; esac
