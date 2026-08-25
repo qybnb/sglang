@@ -2,24 +2,36 @@
 
 set -euo pipefail
 
-EVALSCOPE_HOME="${EVALSCOPE_HOME:-/home/wzy/.venvs/evalscope}"
-EVALSCOPE_CLI="${EVALSCOPE_HOME}/bin/evalscope"
-EVALSCOPE_SITE_PACKAGES="${EVALSCOPE_HOME}/lib/python3.11/site-packages"
+EVALSCOPE_CMD=()
+EVALSCOPE_SITE_PACKAGES=""
 
-if [[ -n "${EVALSCOPE_PYTHON:-}" ]]; then
-  PYTHON_BIN="${EVALSCOPE_PYTHON}"
-elif [[ -x /usr/local/python3.11.15/bin/python3.11 ]]; then
-  PYTHON_BIN=/usr/local/python3.11.15/bin/python3.11
-elif command -v python3.11 >/dev/null 2>&1; then
-  PYTHON_BIN="$(command -v python3.11)"
+if [[ -n "${EVALSCOPE_CLI:-}" ]]; then
+  EVALSCOPE_CMD=("${EVALSCOPE_CLI}")
+elif command -v evalscope >/dev/null 2>&1; then
+  EVALSCOPE_CMD=("$(command -v evalscope)")
 else
-  echo "ERROR: Python 3.11 was not found in this container." >&2
-  exit 1
-fi
+  # Backward-compatible fallback for the original validation environment.
+  EVALSCOPE_HOME="${EVALSCOPE_HOME:-/home/wzy/.venvs/evalscope}"
+  LEGACY_EVALSCOPE_CLI="${EVALSCOPE_HOME}/bin/evalscope"
+  EVALSCOPE_SITE_PACKAGES="${EVALSCOPE_HOME}/lib/python3.11/site-packages"
 
-if [[ ! -f "${EVALSCOPE_CLI}" || ! -d "${EVALSCOPE_SITE_PACKAGES}" ]]; then
-  echo "ERROR: EvalScope environment not found under ${EVALSCOPE_HOME}." >&2
-  exit 1
+  if [[ -n "${EVALSCOPE_PYTHON:-}" ]]; then
+    PYTHON_BIN="${EVALSCOPE_PYTHON}"
+  elif [[ -x /usr/local/python3.11.15/bin/python3.11 ]]; then
+    PYTHON_BIN=/usr/local/python3.11.15/bin/python3.11
+  elif command -v python3.11 >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v python3.11)"
+  else
+    PYTHON_BIN=""
+  fi
+
+  if [[ -n "${PYTHON_BIN}" && -f "${LEGACY_EVALSCOPE_CLI}" \
+      && -d "${EVALSCOPE_SITE_PACKAGES}" ]]; then
+    EVALSCOPE_CMD=("${PYTHON_BIN}" "${LEGACY_EVALSCOPE_CLI}")
+  else
+    echo "ERROR: evalscope was not found in PATH. Install EvalScope or set EVALSCOPE_CLI." >&2
+    exit 1
+  fi
 fi
 
 API_URL="${API_URL:-http://127.0.0.1:15010/v1}"
@@ -49,10 +61,12 @@ unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
 export NO_PROXY="127.0.0.1,localhost${NO_PROXY:+,${NO_PROXY}}"
 export no_proxy="${NO_PROXY}"
 export PYTHONUNBUFFERED=1
-export PYTHONPATH="${EVALSCOPE_SITE_PACKAGES}${PYTHONPATH:+:${PYTHONPATH}}"
+if [[ -n "${EVALSCOPE_SITE_PACKAGES}" ]]; then
+  export PYTHONPATH="${EVALSCOPE_SITE_PACKAGES}${PYTHONPATH:+:${PYTHONPATH}}"
+fi
 
 cmd=(
-  "${PYTHON_BIN}" "${EVALSCOPE_CLI}" eval
+  "${EVALSCOPE_CMD[@]}" eval
   --model "${MODEL_PATH}"
   --api-url "${API_URL}"
   --api-key EMPTY
