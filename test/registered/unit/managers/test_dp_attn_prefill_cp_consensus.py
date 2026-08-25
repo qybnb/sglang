@@ -9,6 +9,7 @@ from sglang.srt.layers.utils.cp_utils import get_cp_padding_align_size
 from sglang.srt.managers.scheduler_components.dp_attn import (
     MLPSyncBatchInfo,
     _local_prefill_cp_candidate,
+    _maybe_log_local_prefill_cp_decision,
     _requires_local_prefill_cp_latch,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -116,6 +117,58 @@ class TestDPPrefillCPLocalLatch(unittest.TestCase):
             self.assertEqual(get_cp_padding_align_size(local_off), 1)
             self.assertEqual(get_cp_padding_align_size(local_on), 1)
             self.assertEqual(get_cp_padding_align_size(), 32)
+
+    def test_per_batch_log_is_strictly_opt_in(self):
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            extend_lens=[8, 5],
+            batch_size=lambda: 2,
+        )
+        log_target = "sglang.srt.managers.scheduler_components.dp_attn.logger.info"
+
+        with patch(log_target) as log_info:
+            _maybe_log_local_prefill_cp_decision(
+                enabled=False,
+                local_batch=batch,
+                local_prefill_cp_active=True,
+                num_tokens=16,
+                attn_cp_size=2,
+                attn_dp_rank=1,
+            )
+            log_info.assert_not_called()
+
+            _maybe_log_local_prefill_cp_decision(
+                enabled=True,
+                local_batch=batch,
+                local_prefill_cp_active=True,
+                num_tokens=16,
+                attn_cp_size=2,
+                attn_dp_rank=1,
+            )
+            log_info.assert_called_once()
+            self.assertEqual(log_info.call_args.args[1:7], (1, "EXTEND", 2, 16, [8, 5], True))
+
+    def test_per_batch_log_reports_short_extend_reason(self):
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            extend_lens=[8, 3],
+            batch_size=lambda: 2,
+        )
+        log_target = "sglang.srt.managers.scheduler_components.dp_attn.logger.info"
+
+        with patch(log_target) as log_info:
+            _maybe_log_local_prefill_cp_decision(
+                enabled=True,
+                local_batch=batch,
+                local_prefill_cp_active=False,
+                num_tokens=12,
+                attn_cp_size=2,
+                attn_dp_rank=0,
+            )
+
+        self.assertEqual(
+            log_info.call_args.args[-1], "short_extend_min_3_required_4"
+        )
 
 
 if __name__ == "__main__":

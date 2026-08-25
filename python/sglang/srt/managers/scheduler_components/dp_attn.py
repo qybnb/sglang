@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -24,6 +25,8 @@ from sglang.srt.utils.common import ceil_align, require_mlp_tp_gather
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
 
+
+logger = logging.getLogger(__name__)
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
 
@@ -70,6 +73,70 @@ def _local_prefill_cp_candidate(
     # global token table.
     planned_num_tokens = ceil_align(num_tokens, attn_tp_size)
     return can_cp_v2_apply(local_batch, num_tokens=planned_num_tokens)
+
+
+def _maybe_log_local_prefill_cp_decision(
+    *,
+    enabled: bool,
+    local_batch: Optional[ScheduleBatch],
+    local_prefill_cp_active: Optional[bool],
+    num_tokens: int,
+    attn_cp_size: int,
+    attn_dp_rank: int,
+) -> None:
+    """Emit exactly one PCP decision line for one real local DP batch.
+
+    The caller selects one attention-TP/CP leader per attention-DP replica.
+    Keep all diagnostic list construction behind ``enabled`` so production
+    runs pay no per-batch logging or statistics overhead when the environment
+    variable is unset.
+    """
+    if not enabled:
+        return
+
+    if local_batch is None:
+        mode = "NONE"
+        num_reqs = 0
+        extend_lens = []
+        reason = "no_local_batch"
+    else:
+        forward_mode = getattr(local_batch, "forward_mode", None)
+        mode = getattr(forward_mode, "name", str(forward_mode))
+        num_reqs = local_batch.batch_size()
+        raw_extend_lens = getattr(local_batch, "extend_lens", None)
+        extend_lens = (
+            [int(length) for length in raw_extend_lens]
+            if raw_extend_lens is not None
+            else []
+        )
+
+        if local_prefill_cp_active:
+            reason = "eligible"
+        elif forward_mode is None:
+            reason = "missing_forward_mode"
+        elif not forward_mode.is_context_parallel_extend():
+            reason = f"mode_{mode.lower()}"
+        elif forward_mode.is_mixed():
+            reason = "mixed_batch"
+        elif extend_lens and min(extend_lens) < 2 * attn_cp_size:
+            reason = (
+                f"short_extend_min_{min(extend_lens)}"
+                f"_required_{2 * attn_cp_size}"
+            )
+        else:
+            reason = "cp_strategy_ineligible"
+
+    logger.info(
+        "[KIMI_K3_PCP_BATCH] dp_rank=%d mode=%s num_reqs=%d "
+        "num_tokens=%d extend_lens=%s local_pcp_active=%s reason=%s",
+        attn_dp_rank,
+        mode,
+        num_reqs,
+        num_tokens,
+        extend_lens,
+        local_prefill_cp_active,
+        reason,
+    )
 
 
 @dataclass
@@ -200,6 +267,8 @@ def prepare_mlp_sync_batch_raw(
     disable_overlap_schedule: bool,
     offload_tags: set[str],
     latch_local_prefill_cp: bool = False,
+    log_local_prefill_cp_decision: bool = False,
+    attn_dp_rank: int = -1,
 ):
     # Check if other DP workers have running batches
     if (
@@ -259,6 +328,14 @@ def prepare_mlp_sync_batch_raw(
         _local_prefill_cp_candidate(local_batch, num_tokens, attn_tp_size)
         if latch_local_prefill_cp
         else None
+    )
+    _maybe_log_local_prefill_cp_decision(
+        enabled=log_local_prefill_cp_decision,
+        local_batch=local_batch,
+        local_prefill_cp_active=local_prefill_cp_active,
+        num_tokens=num_tokens,
+        attn_cp_size=attn_cp_size,
+        attn_dp_rank=attn_dp_rank,
     )
 
     mlp_sync_info = MLPSyncBatchInfo(
@@ -341,6 +418,12 @@ class SchedulerDPAttnAdapter:
                     self.server_args, self.model_config
                 )
             ),
+            log_local_prefill_cp_decision=(
+                envs.SGLANG_KIMI_K3_LOG_PCP_EVERY_BATCH.get()
+                and self.ps.attn_tp_rank == 0
+                and self.ps.attn_cp_rank == 0
+            ),
+            attn_dp_rank=self.ps.attn_dp_rank,
         )
 
     def maybe_prepare_mlp_sync_batch(

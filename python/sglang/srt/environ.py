@@ -276,6 +276,7 @@ class Envs:
     IS_H200 = EnvBool(False)
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
     SGLANG_ENABLE_CP_V2 = EnvBool(False)
+    SGLANG_KIMI_K3_LOG_PCP_EVERY_BATCH = EnvBool(False)
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
     SGLANG_PROFILE_RECORD_SHAPES = EnvBool(True)
     SGLANG_PROFILE_V2 = EnvBool(False)
