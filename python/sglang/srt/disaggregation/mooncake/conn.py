@@ -1042,6 +1042,7 @@ class MooncakeKVManager(CommonKVManager):
                 StateType.DSA,
                 StateType.SWA_RING,
                 StateType.C128_STATE,
+                StateType.DRAFT_KV,
             ):
                 if (
                     target_rank_registration_info is not None
@@ -1054,6 +1055,26 @@ class MooncakeKVManager(CommonKVManager):
                     )
                 src_indices = list(indices)
                 dst_indices_local = list(dst_indices)
+                if st == StateType.DRAFT_KV:
+                    if not (
+                        len(src_data_ptrs)
+                        == len(src_item_lens)
+                        == len(dst_data_ptrs)
+                        == len(dst_item_lens)
+                    ):
+                        raise RuntimeError(
+                            "DRAFT_KV buffer metadata mismatch: "
+                            f"src_ptrs={len(src_data_ptrs)}, "
+                            f"src_item_lens={len(src_item_lens)}, "
+                            f"dst_ptrs={len(dst_data_ptrs)}, "
+                            f"dst_item_lens={len(dst_item_lens)}"
+                        )
+                    if list(src_item_lens) != list(dst_item_lens):
+                        raise RuntimeError(
+                            "DRAFT_KV cache layout mismatch between Prefill and "
+                            "Decode; use the same draft checkpoint, attention TP "
+                            "size, page size, dtype, and quantization on both sides."
+                        )
                 if (
                     st == StateType.C128_STATE
                     and len(src_indices) == 0
@@ -1065,7 +1086,11 @@ class MooncakeKVManager(CommonKVManager):
                     # truncating silently misaligns rows and corrupts KV.
                     # Paged SWA/DSA tolerate a 1-page drift -> keep the
                     # lenient truncation below.
-                    if st in (StateType.SWA_RING, StateType.C128_STATE):
+                    if st in (
+                        StateType.SWA_RING,
+                        StateType.C128_STATE,
+                        StateType.DRAFT_KV,
+                    ):
                         raise RuntimeError(
                             f"{st.upper()} state index length mismatch: "
                             f"prefill={len(src_indices)}, dst={len(dst_indices_local)}"

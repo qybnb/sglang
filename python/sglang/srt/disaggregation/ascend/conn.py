@@ -1,7 +1,7 @@
 import concurrent.futures
 import logging
 import threading
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -11,6 +11,7 @@ from sglang.srt.disaggregation.ascend.diagnostics import (
     write_ascend_kv_diag,
 )
 from sglang.srt.disaggregation.ascend.transfer_engine import AscendTransferEngine
+from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
 from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVBootstrapServer,
@@ -136,8 +137,15 @@ class AscendKVManager(MooncakeKVManager):
         self._write_diag("manager_register_complete")
 
     def get_mla_kv_ptrs_with_pp(
-        self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
+        self,
+        src_kv_ptrs: List[int],
+        dst_kv_ptrs: List[int],
+        state_type: Optional[StateType] = None,
     ) -> Tuple[List[int], List[int], int]:
+        if state_type is not None:
+            # State components (including dSparK draft KV) are independent of
+            # the target NPU-MLA latent/K-RoPE grouping below.
+            return super().get_mla_kv_ptrs_with_pp(src_kv_ptrs, dst_kv_ptrs, state_type)
         # src_kv_ptrs: k_data, v_data, index_k_data(optional)
         # dst_kv_ptrs: k_data, v_data, index_k_data(optional)
         start_layer = self.kv_args.prefill_start_layer

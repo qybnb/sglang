@@ -675,6 +675,7 @@ def setup_state_kv_args(
     draft_token_to_kv_pool=None,
     total_kv_layers: int = None,
     req_to_token_pool=None,
+    draft_kv_as_state: bool = False,
 ) -> None:
     """Populate ``kv_args`` state-buffer fields from the given pool.
     Shared by prefill and decode bootstrap paths so the state_type dispatch
@@ -771,8 +772,10 @@ def setup_state_kv_args(
                 )
                 kv_args.total_kv_layers = total_kv_layers
         elif isinstance(token_to_kv_pool, (DSATokenToKVPool, NPUMLATokenToKVPool)):
-            if draft_token_to_kv_pool is not None and isinstance(
-                draft_token_to_kv_pool, DSATokenToKVPool
+            if (
+                not draft_kv_as_state
+                and draft_token_to_kv_pool is not None
+                and isinstance(draft_token_to_kv_pool, DSATokenToKVPool)
             ):
                 (
                     draft_data_ptrs,
@@ -807,6 +810,34 @@ def setup_state_kv_args(
             append_state_component(
                 kv_args, StateType.MAMBA, data_ptrs, data_lens, item_lens, dim
             )
+
+    if draft_kv_as_state:
+        if draft_token_to_kv_pool is None:
+            raise ValueError(
+                "Draft KV state transfer requires a draft token-to-KV pool."
+            )
+        target_page_size = getattr(token_to_kv_pool, "page_size", None)
+        draft_page_size = getattr(draft_token_to_kv_pool, "page_size", None)
+        if (
+            target_page_size is not None
+            and draft_page_size is not None
+            and target_page_size != draft_page_size
+        ):
+            raise ValueError(
+                "Target and draft KV pools must use the same page size for "
+                "PD dSparK transfer, got target="
+                f"{target_page_size}, draft={draft_page_size}."
+            )
+        draft_ptrs, draft_lens, draft_item_lens = (
+            draft_token_to_kv_pool.get_contiguous_buf_infos()
+        )
+        append_state_component(
+            kv_args,
+            StateType.DRAFT_KV,
+            draft_ptrs,
+            draft_lens,
+            draft_item_lens,
+        )
 
 
 def prepare_abort(req: Req, error_message: str, status_code=None):

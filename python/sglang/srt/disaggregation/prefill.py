@@ -161,7 +161,12 @@ class PrefillBootstrapQueue:
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
 
-        if self.draft_token_to_kv_pool is not None:
+        draft_kv_as_state = self.scheduler.spec_algorithm.is_dspark()
+        if draft_kv_as_state and self.draft_token_to_kv_pool is None:
+            raise RuntimeError(
+                "PD dSparK Prefill requires an allocated draft KV pool."
+            )
+        if self.draft_token_to_kv_pool is not None and not draft_kv_as_state:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
@@ -194,6 +199,7 @@ class PrefillBootstrapQueue:
             self.draft_token_to_kv_pool,
             self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=req_to_token_pool,
+            draft_kv_as_state=draft_kv_as_state,
         )
 
         if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
@@ -1095,6 +1101,11 @@ class SchedulerDisaggregationPrefillMixin:
                     state_indices.append(_swa_ring_payload())
                 elif st == StateType.C128_STATE:
                     state_indices.append(_c128_state_payload())
+                elif st == StateType.DRAFT_KV:
+                    # dSparK prefill writes draft KV at the target cache
+                    # locations. Transfer the complete draft prompt cache once
+                    # the last target chunk has been materialized.
+                    state_indices.append(_dsa_payload())
                 else:
                     state_indices.append(None)
 

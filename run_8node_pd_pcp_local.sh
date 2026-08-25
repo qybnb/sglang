@@ -16,7 +16,7 @@
 #         ./run_8node_pd_pcp_local.sh prefill
 #
 #   D0-D3 use the same NODE_RANK=0-3 convention with the decode role. When
-#   ENABLE_DSPARK=1, each decode node must also set its local
+#   ENABLE_DSPARK=1, every prefill and decode node must also set its local
 #   DRAFT_MODEL_PATH. Start the router in a second shell on P0 after both
 #   rank-0 /health endpoints are ready.
 #
@@ -173,6 +173,16 @@ case "${DECODE_ENABLE_DEEPEP}" in 0|1) ;; *) echo "DECODE_ENABLE_DEEPEP must be 
 case "${PREFILL_ENABLE_DP_ATTENTION}" in 0|1) ;; *) echo "PREFILL_ENABLE_DP_ATTENTION must be 0 or 1." >&2; exit 2 ;; esac
 case "${DECODE_ENABLE_DP_ATTENTION}" in 0|1) ;; *) echo "DECODE_ENABLE_DP_ATTENTION must be 0 or 1." >&2; exit 2 ;; esac
 
+if [[ "${ENABLE_DSPARK}" == "1" ]]; then
+    PREFILL_ATTN_TP_SIZE=$((PREFILL_TP_SIZE / PREFILL_DP_SIZE / PREFILL_CP_SIZE))
+    DECODE_ATTN_TP_SIZE=$((DECODE_TP_SIZE / DECODE_DP_SIZE))
+    if (( PREFILL_ATTN_TP_SIZE != DECODE_ATTN_TP_SIZE )); then
+        echo "PD dSparK requires matching Prefill/Decode attention TP sizes so draft KV layouts match." >&2
+        echo "  Prefill attention TP=${PREFILL_ATTN_TP_SIZE}, Decode attention TP=${DECODE_ATTN_TP_SIZE}." >&2
+        exit 2
+    fi
+fi
+
 DSPARK_BLOCK_SIZE="${DSPARK_BLOCK_SIZE:-7}"
 DSPARK_DRAFT_ATTENTION_BACKEND="${DSPARK_DRAFT_ATTENTION_BACKEND:-ascend}"
 DSPARK_DRAFT_QUANTIZATION="${DSPARK_DRAFT_QUANTIZATION:-unquant}"
@@ -238,8 +248,7 @@ if [[ -z "${MODEL_PATH}" ]]; then
     echo "Set MODEL_PATH to this node's complete Kimi-K3 checkpoint directory." >&2
     exit 2
 fi
-if [[ "${ROLE}" == "decode" && "${ENABLE_DSPARK}" == "1" \
-    && -z "${DRAFT_MODEL_PATH}" ]]; then
+if [[ "${ENABLE_DSPARK}" == "1" && -z "${DRAFT_MODEL_PATH}" ]]; then
     echo "ENABLE_DSPARK=1 requires this node's DRAFT_MODEL_PATH." >&2
     exit 2
 fi
@@ -286,7 +295,7 @@ if [[ "${CONFIG_ONLY}" != "1" ]]; then
             exit 2
         fi
     done
-    if [[ "${ROLE}" == "decode" && "${ENABLE_DSPARK}" == "1" \
+    if [[ "${ENABLE_DSPARK}" == "1" \
         && ! -f "${DRAFT_MODEL_PATH:-}/config.json" ]]; then
         echo "ENABLE_DSPARK=1 requires a local DRAFT_MODEL_PATH containing config.json." >&2
         exit 2
@@ -401,18 +410,23 @@ else
         read -r -a CUDA_GRAPH_BS_ARRAY <<< "${CUDA_GRAPH_BS:-1 4}"
         ROLE_ARGS+=(--cuda-graph-bs-decode "${CUDA_GRAPH_BS_ARRAY[@]}")
     fi
-    if [[ "${ENABLE_DSPARK}" == "1" ]]; then
-        export SGLANG_ENABLE_SPEC_V2=1
-        export SGLANG_RAGGED_VERIFY_MODE="${SGLANG_RAGGED_VERIFY_MODE:-static}"
-        ROLE_ARGS+=(
-            --speculative-algorithm DSPARK
-            --speculative-draft-model-path "${DRAFT_MODEL_PATH}"
-            --speculative-dspark-block-size "${DSPARK_BLOCK_SIZE}"
-            --speculative-draft-attention-backend "${DSPARK_DRAFT_ATTENTION_BACKEND}"
-            --speculative-eagle-topk 1
-            --speculative-draft-model-quantization "${DSPARK_DRAFT_QUANTIZATION}"
-        )
-    fi
+fi
+
+# PD dSparK needs the draft model on both sides. Prefill projects the captured
+# target hidden states into compact draft KV, then transfers that cache as a
+# separate component. Decode can therefore enter graph replay without a second
+# prompt forward or an uninitialized draft cache.
+if [[ "${ENABLE_DSPARK}" == "1" ]]; then
+    export SGLANG_ENABLE_SPEC_V2=1
+    export SGLANG_RAGGED_VERIFY_MODE="${SGLANG_RAGGED_VERIFY_MODE:-static}"
+    ROLE_ARGS+=(
+        --speculative-algorithm DSPARK
+        --speculative-draft-model-path "${DRAFT_MODEL_PATH}"
+        --speculative-dspark-block-size "${DSPARK_BLOCK_SIZE}"
+        --speculative-draft-attention-backend "${DSPARK_DRAFT_ATTENTION_BACKEND}"
+        --speculative-eagle-topk 1
+        --speculative-draft-model-quantization "${DSPARK_DRAFT_QUANTIZATION}"
+    )
 fi
 
 if [[ "${ROLE}" == "prefill" ]]; then
@@ -426,7 +440,10 @@ echo "  node-rank=${NODE_RANK}/${NNODES}, local-ip=${LOCAL_IP}, interface=${NET_
 echo "  dist=${DIST_INIT_ADDR}, http=${HOST}:${PORT}, model=${MODEL_PATH}"
 echo "  TP=${TP_SIZE}, PP=${PP_SIZE}, DP=${DP_SIZE}, attention-TP=${ATTN_TP_SIZE}"
 if [[ "${ROLE}" == "prefill" ]]; then
-    echo "  PCP=1, CP=${PREFILL_CP_SIZE}, KDA=${KDA_CP_BACKEND}, MLA=${MLA_CP_BACKEND}"
+    echo "  PCP=1, CP=${PREFILL_CP_SIZE}, KDA=${KDA_CP_BACKEND}, MLA=${MLA_CP_BACKEND}, dSparK=${ENABLE_DSPARK}"
+    if [[ "${ENABLE_DSPARK}" == "1" ]]; then
+        echo "  draft=${DRAFT_MODEL_PATH} (prefill initializes transferable draft KV)"
+    fi
 else
     echo "  PCP=0, CP=1, dSparK=${ENABLE_DSPARK}, decode-graph=$((1 - DISABLE_CUDA_GRAPH))"
     if [[ "${ENABLE_DSPARK}" == "1" ]]; then
