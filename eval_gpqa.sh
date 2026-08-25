@@ -22,5 +22,5 @@ evalscope eval \
         "reasoning_effort": "max"
       }
     }' \
-    --eval-batch-size 32 \
+    --eval-batch-size 8 \
     --seed 42
