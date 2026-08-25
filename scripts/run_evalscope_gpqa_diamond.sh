@@ -49,6 +49,11 @@ if [[ -n "${LIMIT}" && ! "${LIMIT}" =~ ^[1-9][0-9]*$ ]]; then
   exit 2
 fi
 
+if [[ ! "${SEED}" =~ ^-?[0-9]+$ ]]; then
+  echo "ERROR: SEED must be an integer, got: ${SEED}" >&2
+  exit 2
+fi
+
 if [[ ! -d "${GPQA_DATASET_PATH}" ]]; then
   echo "ERROR: GPQA dataset directory does not exist: ${GPQA_DATASET_PATH}" >&2
   exit 1
@@ -75,7 +80,7 @@ cmd=(
   --eval-type openai_api
   --datasets gpqa_diamond
   --dataset-args "{\"gpqa_diamond\":{\"local_path\":\"${GPQA_DATASET_PATH}\",\"subset_list\":[\"gpqa_diamond\"],\"default_subset\":\"gpqa_diamond\"}}"
-  --generation-config '{"max_tokens":131072,"timeout":10000,"temperature":1.0,"top_p":0.95,"extra_body":{"reasoning_effort":"max"}}'
+  --generation-config "{\"max_tokens\":131072,\"timeout\":10000,\"temperature\":1.0,\"top_p\":0.95,\"seed\":${SEED},\"extra_body\":{\"reasoning_effort\":\"max\"}}"
   --eval-batch-size "${EVAL_BATCH_SIZE}"
   --seed "${SEED}"
 )
