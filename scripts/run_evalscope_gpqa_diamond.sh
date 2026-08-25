@@ -30,6 +30,12 @@ RUN_TAG="${RUN_TAG:-gpqa_$(date +%Y-%m-%d_%H-%M-%S)}"
 WORK_DIR="${WORK_DIR:-${WORK_ROOT}/${RUN_TAG}}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-8}"
 SEED="${SEED:-42}"
+LIMIT="${LIMIT:-}"
+
+if [[ -n "${LIMIT}" && ! "${LIMIT}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: LIMIT must be a positive integer when set, got: ${LIMIT}" >&2
+  exit 2
+fi
 
 if [[ ! -d "${GPQA_DATASET_PATH}" ]]; then
   echo "ERROR: GPQA dataset directory does not exist: ${GPQA_DATASET_PATH}" >&2
@@ -60,6 +66,10 @@ cmd=(
   --seed "${SEED}"
 )
 
+if [[ -n "${LIMIT}" ]]; then
+  cmd+=(--limit "${LIMIT}")
+fi
+
 if [[ -n "${USE_CACHE:-}" ]]; then
   cmd+=(--use-cache "${USE_CACHE}")
 fi
@@ -68,6 +78,7 @@ echo "EvalScope GPQA starting"
 echo "  API:       ${API_URL}"
 echo "  work dir:  ${WORK_DIR}"
 echo "  batch:     ${EVAL_BATCH_SIZE}"
+echo "  limit:     ${LIMIT:-all}"
 echo "  seed:      ${SEED}"
 echo "  live log:  ${WORK_DIR}/evalscope.log"
 
