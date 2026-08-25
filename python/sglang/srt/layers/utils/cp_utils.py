@@ -85,21 +85,18 @@ def get_cp_padding_align_size(forward_batch=None) -> int:
     """Token-count alignment for CP padding of ``global_num_tokens``.
 
     Zigzag uses ``2 * cp_size`` sequence segments; other CP modes use
-    ``cp_size``.  CP-v2 subsequently reduce-scatters each CP-local shard over
-    attention TP, so the *local* shard must also be divisible by
-    ``attn_tp_size``.  Aligning globally first to attention TP and then only
-    to the segment count is insufficient (e.g. 709 -> 712 gives CP4 zigzag
-    shards of 178, which are not divisible by TP4).  Use their product for
-    CP-v2 so candidate planning and materialized padding both produce a safe
-    layout.  CP-off remains 1; extra padding there breaks EAGLE/MTP draft
+    ``cp_size``. Static CP-v2 sizing reserves the segment/attention-TP product
+    for its maximum shape. Runtime Kimi batches carrying a local PCP latch are
+    different: ragged CP-v2 aligns each CP rank's physical rows independently,
+    so their shared DP token table must not receive CP-only padding. CP-off
+    also remains unpadded because extra dummy rows break EAGLE/MTP draft
     prefill (see #23269).
 
     Keep prepare_mlp_sync_batch and cal_padded_tokens consistent through this
     helper.
 
-    When Kimi-K3's phase-1 global decision is present, a disabled PCP round
-    must not retain CP-only padding. Static buffer sizing calls this without a
-    batch and therefore continues to reserve for the maximum CP alignment.
+    Returning one for both active and inactive local Kimi batches prevents one
+    attention-DP replica from changing the DP padding planned by another.
     """
     from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
     from sglang.srt.layers.cp.utils import enable_cp_v2
@@ -107,7 +104,7 @@ def get_cp_padding_align_size(forward_batch=None) -> int:
     attn_cp_size = get_parallel().attn_cp_size
     if (
         forward_batch is not None
-        and getattr(forward_batch, "global_prefill_cp_active", None) is False
+        and getattr(forward_batch, "local_prefill_cp_active", None) is not None
     ):
         return 1
     cp_segment_align = (

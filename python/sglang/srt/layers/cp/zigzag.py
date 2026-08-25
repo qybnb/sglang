@@ -158,32 +158,50 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         if any(length < cp_segment_num for length in extend_lens):
             return False
 
-        # DP/attention-TP padding is appended to the final request. Mirror
-        # build_metadata here so planning and eager execution make the same CP
-        # decision from the prospective and materialized token counts.
+        # Each physical CP-rank buffer is padded independently to its own
+        # attention-TP-aligned capacity. Collectives trim it back to the
+        # per-rank counts recorded in metadata, so a ragged multi-request batch
+        # no longer needs equal aggregate token counts across CP ranks.
+        return int(num_tokens) >= sum(extend_lens)
+
+    def _get_padded_extend_lens(self, num_tokens: int, forward_batch) -> List[int]:
+        extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        if extend_lens is None:
+            extend_lens = getattr(forward_batch, "extend_lens", None)
+        if extend_lens is None:
+            extend_lens = [num_tokens]
+        else:
+            extend_lens = [int(length) for length in extend_lens]
+
         pad_len = int(num_tokens) - sum(extend_lens)
         if pad_len < 0:
-            return False
+            raise ValueError(
+                "Zigzag CP prospective token count is smaller than the real "
+                f"batch: tokens={num_tokens}, extend_lens={extend_lens}."
+            )
         if pad_len > 0:
             extend_lens[-1] += pad_len
+        return extend_lens
 
-        # Kimi scatters each CP-local token shard across attention TP between
-        # attention and MoE/MLP. The current fixed-size buffers require all CP
-        # ranks to own the same number of tokens, and reduce-scatter requires
-        # that local count to divide attention TP. Ragged batches that do not
-        # meet these invariants safely fall back to the non-CP path.
+    def _get_per_rank_token_counts(self, extend_lens: List[int]) -> List[int]:
+        cp_segment_num = self.cp_size * 2
         per_rank_tokens = [0] * self.cp_size
         for length in extend_lens:
-            base, rem = divmod(length, cp_segment_num)
+            base, rem = divmod(int(length), cp_segment_num)
             for rank in range(self.cp_size):
                 mirror_rank = cp_segment_num - 1 - rank
                 per_rank_tokens[rank] += (
                     base + int(rank < rem) + base + int(mirror_rank < rem)
                 )
+        return per_rank_tokens
 
-        if len(set(per_rank_tokens)) != 1:
-            return False
-        return per_rank_tokens[0] % get_parallel().attn_tp_size == 0
+    def get_local_token_capacity(self, num_tokens: int, forward_batch) -> int:
+        per_rank_tokens = self._get_per_rank_token_counts(
+            self._get_padded_extend_lens(num_tokens, forward_batch)
+        )
+        attn_tp_size = max(int(get_parallel().attn_tp_size), 1)
+        local_rank_tokens = per_rank_tokens[self.cp_rank]
+        return (local_rank_tokens + attn_tp_size - 1) // attn_tp_size * attn_tp_size
 
     def build_metadata(
         self,
@@ -428,6 +446,14 @@ class ZigzagCPStrategy(ContextParallelStrategy):
     def gather_hidden_states(
         self, x: Any, forward_batch, stream: Optional[Any] = None
     ) -> Any:
+        # Kimi's attention-TP token scatter pads each CP rank independently.
+        # CP collectives use the compact zigzag counts and add their own common
+        # communication padding, so discard the rank-local alignment tail here.
+        if x.shape[0] > forward_batch.attn_cp_metadata.max_rank_len[0]:
+            actual_local_tokens = forward_batch.attn_cp_metadata.per_rank_actual_token[
+                self.cp_rank
+            ]
+            x = x[:actual_local_tokens]
         gathered = self._all_gather_reorganized(x, forward_batch, stream)
         restored = self._restore_uniform_gathered(gathered, forward_batch)
         if restored is not None:
@@ -442,6 +468,11 @@ class ZigzagCPStrategy(ContextParallelStrategy):
     def gather_kv_cache(
         self, x: Any, forward_batch, stream: Optional[Any] = None
     ) -> Any:
+        if x.shape[0] > forward_batch.attn_cp_metadata.max_rank_len[0]:
+            actual_local_tokens = forward_batch.attn_cp_metadata.per_rank_actual_token[
+                self.cp_rank
+            ]
+            x = x[:actual_local_tokens]
         gathered = self._all_gather_reorganized(x, forward_batch, stream)
         restored = self._restore_uniform_gathered(gathered, forward_batch)
         if restored is not None:

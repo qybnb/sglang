@@ -16,6 +16,8 @@
 
 from typing import Any, Optional, Tuple
 
+import torch.nn.functional as F
+
 from sglang.srt.layers.cp.base import (
     BaseContextParallelMetadata,
     ContextParallelStrategy,
@@ -55,10 +57,10 @@ def can_cp_v2_apply(forward_batch, num_tokens: Optional[int] = None) -> bool:
     before ``forward_batch.input_ids`` is resized. The eager path omits it and
     evaluates the already-padded input.
 
-    This helper deliberately ignores ``global_prefill_cp_active``. The DP
-    scheduler uses it to compute the local candidate before reaching global
-    consensus, while :func:`is_cp_v2_active` consumes that consensus during
-    buffer planning and execution.
+    This helper deliberately ignores ``local_prefill_cp_active``. The Kimi
+    scheduler uses it to evaluate the real local batch once, while
+    :func:`is_cp_v2_active` consumes the latched value during both buffer
+    planning and execution.
     """
     if not enable_cp_v2():
         return False
@@ -84,14 +86,15 @@ def can_cp_v2_apply(forward_batch, num_tokens: Optional[int] = None) -> bool:
 def is_cp_v2_active(forward_batch, num_tokens: Optional[int] = None) -> bool:
     """Return whether this forward must execute through CP-v2.
 
-    Kimi-K3 with DP-attention synchronizes this decision before idle batches
-    are fabricated. Reuse the synchronized value in every later stage so an
-    idle rank cannot plan non-CP buffers and then switch to CP after its
-    ``IDLE`` batch is converted to a shadow ``EXTEND`` batch.
+    Kimi-K3 with DP-attention latches this decision before idle batches are
+    fabricated. Reuse the local value in every later stage so an idle rank
+    cannot plan non-CP buffers and then switch to CP after its ``IDLE`` batch
+    is converted to a shadow ``EXTEND`` batch. Other attention-DP replicas do
+    not participate in this decision.
     """
-    forced = getattr(forward_batch, "global_prefill_cp_active", None)
-    if forced is not None:
-        if not forced or not enable_cp_v2() or get_cp_strategy() is None:
+    latched = getattr(forward_batch, "local_prefill_cp_active", None)
+    if latched is not None:
+        if not latched or not enable_cp_v2() or get_cp_strategy() is None:
             return False
 
         forward_mode = getattr(forward_batch, "forward_mode", None)
@@ -99,14 +102,7 @@ def is_cp_v2_active(forward_batch, num_tokens: Optional[int] = None) -> bool:
             return False
         if forward_mode.is_context_parallel_extend():
             return not getattr(forward_mode, "is_mixed", lambda: False)()
-
-        # During DP buffer planning an idle rank has not yet been converted to
-        # the fabricated EXTEND batch that shadows active ranks. It must still
-        # reserve the CP-local buffer selected by the synchronized decision.
-        return bool(
-            getattr(forward_mode, "is_idle", lambda: False)()
-            and getattr(forward_batch, "is_extend_in_batch", False)
-        )
+        return False
 
     return can_cp_v2_apply(forward_batch, num_tokens=num_tokens)
 
@@ -124,6 +120,75 @@ def prepare_cp_forward(forward_batch) -> None:
         num_tokens=num_tokens,
         seqs_len=seq_lens_cpu,
         extend_seqs_len=extend_lens_cpu,
+    )
+
+
+def get_cp_local_token_capacity(forward_batch, num_tokens: int) -> int:
+    """Return the CP-local physical row count used by layer collectives."""
+    strategy = get_cp_strategy()
+    if strategy is None:
+        raise RuntimeError("CP local token capacity requested without a CP strategy")
+    return strategy.get_local_token_capacity(int(num_tokens), forward_batch)
+
+
+def _pad_cp_tensor_to_capacity(x: Any, capacity: int, dim: int) -> Any:
+    dim = dim % x.ndim
+    pad_rows = int(capacity) - int(x.shape[dim])
+    if pad_rows < 0:
+        raise ValueError(
+            "CP-local tensor exceeds its planned capacity: "
+            f"shape={tuple(x.shape)}, dim={dim}, capacity={capacity}."
+        )
+    if pad_rows == 0:
+        return x
+    padding = [0, 0] * x.ndim
+    reverse_dim = x.ndim - 1 - dim
+    padding[2 * reverse_dim + 1] = pad_rows
+    return F.pad(x, padding, mode="constant", value=0)
+
+
+def get_cp_rank_actual_tokens(forward_batch) -> int:
+    """Return this CP rank's real model rows before rank-local alignment."""
+    from sglang.srt.runtime_context import get_parallel
+
+    metadata = getattr(forward_batch, "attn_cp_metadata", None)
+    if metadata is None:
+        raise RuntimeError("CP rank token count requested without CP metadata")
+    return int(metadata.per_rank_actual_token[get_parallel().attn_cp_rank])
+
+
+def trim_cp_attention_inputs(hidden_states: Any, positions: Any, forward_batch):
+    """Remove rank-local alignment rows before attention/KV-state updates."""
+    actual_tokens = get_cp_rank_actual_tokens(forward_batch)
+    if hidden_states.shape[0] < actual_tokens or positions.shape[-1] < actual_tokens:
+        raise ValueError(
+            "CP attention input is smaller than its real token count: "
+            f"hidden={hidden_states.shape[0]}, positions={positions.shape[-1]}, "
+            f"actual={actual_tokens}."
+        )
+    return (
+        hidden_states[:actual_tokens],
+        positions[..., :actual_tokens],
+        int(hidden_states.shape[0]),
+    )
+
+
+def pad_cp_attention_output(hidden_states: Any, capacity: int) -> Any:
+    """Restore physical rows after attention for attention-TP collectives."""
+    return _pad_cp_tensor_to_capacity(hidden_states, capacity, dim=0)
+
+
+def pad_cp_model_inputs(hidden_states: Any, positions: Any, forward_batch):
+    """Pad one CP rank for Kimi's layer-internal attention-TP token scatter."""
+    strategy = get_cp_strategy()
+    if strategy is None:
+        raise RuntimeError("CP model input padding requested without a CP strategy")
+    capacity = strategy.get_local_token_capacity(
+        len(forward_batch.input_ids), forward_batch
+    )
+    return (
+        _pad_cp_tensor_to_capacity(hidden_states, capacity, dim=0),
+        _pad_cp_tensor_to_capacity(positions, capacity, dim=-1),
     )
 
 
@@ -205,10 +270,15 @@ __all__ = [
     "CP_V2_DEFAULT_MODEL_CLASSES",
     "can_cp_v2_apply",
     "enable_cp_v2",
+    "get_cp_local_token_capacity",
+    "get_cp_rank_actual_tokens",
     "get_cp_strategy",
     "is_cp_v2_active",
+    "pad_cp_attention_output",
+    "pad_cp_model_inputs",
     "cp_gather_after_forward",
     "cp_gather_aux_hidden_states_after_forward",
     "cp_split_before_forward",
     "prepare_cp_forward",
+    "trim_cp_attention_inputs",
 ]

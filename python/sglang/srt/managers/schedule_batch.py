@@ -1794,9 +1794,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # For DP attention
     is_extend_in_batch: bool = False
     all_extend_in_batch: bool = False  # plumbing for downstream forks (PR #19639)
-    # Kimi-K3 phase-1 PCP policy. None preserves the normal per-local-batch
-    # decision; a bool is the synchronized decision for this global EP round.
-    global_prefill_cp_active: Optional[bool] = None
+    # Kimi-K3 CP-v2 decision latched from this scheduler's real local batch.
+    # It is intentionally not synchronized across attention-DP replicas.
+    # False also keeps fabricated idle/shadow work out of the CP path.
+    local_prefill_cp_active: Optional[bool] = None
     can_run_dp_cuda_graph: bool = False
     can_run_dp_breakable_cuda_graph: bool = False
     tbo_split_seq_index: Optional[int] = None
@@ -2873,7 +2874,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             can_run_dp_breakable_cuda_graph=self.can_run_dp_breakable_cuda_graph,
             is_extend_in_batch=self.is_extend_in_batch,
             all_extend_in_batch=self.all_extend_in_batch,
-            global_prefill_cp_active=self.global_prefill_cp_active,
+            local_prefill_cp_active=self.local_prefill_cp_active,
             is_prefill_only=self.is_prefill_only,
             seq_lens_cpu=self.seq_lens_cpu,
             enable_overlap=self.enable_overlap,

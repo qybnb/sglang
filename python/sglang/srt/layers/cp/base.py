@@ -106,6 +106,23 @@ class ContextParallelStrategy(ABC):
     def can_apply(self, num_tokens: int, forward_batch: ForwardBatch) -> bool:
         """Return True if this strategy can shard the current forward."""
 
+    def get_local_token_capacity(
+        self, num_tokens: int, forward_batch: ForwardBatch
+    ) -> int:
+        """Return the physical token rows reserved by each CP rank.
+
+        Strategies with an uneven per-rank layout override this method.  The
+        default matches the historical equal-shard contract.
+        """
+        del forward_batch
+        if num_tokens % self.cp_size != 0:
+            raise ValueError(
+                "Context parallel requires the padded token count to be "
+                f"divisible by CP size, got tokens={num_tokens}, "
+                f"cp_size={self.cp_size}."
+            )
+        return num_tokens // self.cp_size
+
     @abstractmethod
     def build_metadata(
         self,

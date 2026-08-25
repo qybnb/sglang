@@ -31,7 +31,12 @@ from sglang.srt.layers.communicator import (
     ScatterMode,
     get_attn_tp_context,
 )
-from sglang.srt.layers.cp.utils import enable_cp_v2
+from sglang.srt.layers.cp.utils import (
+    enable_cp_v2,
+    pad_cp_attention_output,
+    pad_cp_model_inputs,
+    trim_cp_attention_inputs,
+)
 from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
@@ -133,10 +138,10 @@ def _log_kimi_k3_npu_prefill_cp_input(
         full_extend_tokens = sum(int(length) for length in extend_seq_lens_cpu)
 
     has_cp_metadata = forward_batch.attn_cp_metadata is not None
-    global_pcp_active = bool(
-        getattr(forward_batch, "global_prefill_cp_active", False)
+    local_pcp_active = bool(
+        getattr(forward_batch, "local_prefill_cp_active", False)
     )
-    log_key = (attention_type, has_cp_metadata, global_pcp_active)
+    log_key = (attention_type, has_cp_metadata, local_pcp_active)
     if log_key in _kimi_k3_npu_pcp_log_keys:
         return
     _kimi_k3_npu_pcp_log_keys.add(log_key)
@@ -145,7 +150,7 @@ def _log_kimi_k3_npu_prefill_cp_input(
         "[KIMI_K3_NPU_PCP_INPUT] attention=%s layer=%d "
         "cp_rank=%d cp_size=%d attn_tp_rank=%d attn_tp_size=%d "
         "local_tokens=%d full_extend_tokens=%s has_cp_metadata=%s "
-        "global_pcp_active=%s",
+        "local_pcp_active=%s",
         attention_type,
         layer_id,
         parallel.attn_cp_rank,
@@ -155,7 +160,7 @@ def _log_kimi_k3_npu_prefill_cp_input(
         hidden_states.shape[0],
         full_extend_tokens,
         has_cp_metadata,
-        global_pcp_active,
+        local_pcp_active,
     )
 
 
@@ -988,12 +993,22 @@ class KimiDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
+        attn_capacity = hidden_states.shape[0]
+        attn_hidden_states = hidden_states
+        attn_positions = positions
+        if forward_batch.attn_cp_metadata is not None:
+            attn_hidden_states, attn_positions, attn_capacity = (
+                trim_cp_attention_inputs(hidden_states, positions, forward_batch)
+            )
+
         hidden_states = self.self_attn(
-            hidden_states=hidden_states,
-            positions=positions,
+            hidden_states=attn_hidden_states,
+            positions=attn_positions,
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
         )
+        if forward_batch.attn_cp_metadata is not None:
+            hidden_states = pad_cp_attention_output(hidden_states, attn_capacity)
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
@@ -1040,12 +1055,22 @@ class KimiDecoderLayer(nn.Module):
             hidden_states, None, forward_batch
         )
 
+        attn_capacity = hidden_states.shape[0]
+        attn_hidden_states = hidden_states
+        attn_positions = positions
+        if forward_batch.attn_cp_metadata is not None:
+            attn_hidden_states, attn_positions, attn_capacity = (
+                trim_cp_attention_inputs(hidden_states, positions, forward_batch)
+            )
+
         hidden_states = self.self_attn(
-            hidden_states=hidden_states,
-            positions=positions,
+            hidden_states=attn_hidden_states,
+            positions=attn_positions,
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
         )
+        if forward_batch.attn_cp_metadata is not None:
+            hidden_states = pad_cp_attention_output(hidden_states, attn_capacity)
 
         # Reuse framework: prepare_mlp (reduce_scatter TP_ATTN_FULL->SCATTERED, skip layernorm)
         if _use_kimi_attn_tp_token_scatter():
@@ -1216,6 +1241,10 @@ class KimiLinearModel(nn.Module):
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_tokens(input_ids)
+            if forward_batch.attn_cp_metadata is not None:
+                hidden_states, positions = pad_cp_model_inputs(
+                    hidden_states, positions, forward_batch
+                )
             residual = None
             if self.use_attn_residuals:
                 residual = hidden_states.new_empty(

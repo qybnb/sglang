@@ -31,6 +31,9 @@ from sglang.srt.layers.cp.utils import (
     cp_split_before_forward,
     enable_cp_v2,
     is_cp_v2_active,
+    pad_cp_attention_output,
+    pad_cp_model_inputs,
+    trim_cp_attention_inputs,
 )
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
 from sglang.srt.layers.utils.cp_utils import (
@@ -482,7 +485,7 @@ class TestCPZigzagStrategy(CustomTestCase):
             self.assertTrue(is_cp_v2_active(active_batch))
             self.assertFalse(is_cp_v2_active(inactive_batch))
 
-    def test_cp_v2_uses_prospective_padded_token_count(self):
+    def test_cp_v2_accepts_rank_local_padding_without_global_repadding(self):
         batch = SimpleNamespace(
             input_ids=torch.arange(9),
             forward_mode=_ExtendMode(),
@@ -494,38 +497,45 @@ class TestCPZigzagStrategy(CustomTestCase):
                 "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get",
                 return_value=True,
             ),
-            get_parallel().override(attn_tp_size=2),
+            get_parallel().override(attn_tp_size=2, attn_cp_rank=0),
         ):
-            self.assertFalse(is_cp_v2_active(batch))
+            self.assertTrue(is_cp_v2_active(batch))
             self.assertTrue(is_cp_v2_active(batch, num_tokens=16))
 
-    def test_cp_v2_global_decision_overrides_local_recomputation(self):
-        eligible_batch_forced_off = SimpleNamespace(
+    def test_cp_v2_local_latch_overrides_recomputation_and_keeps_idle_off(self):
+        eligible_batch_latched_off = SimpleNamespace(
             input_ids=torch.arange(8),
             forward_mode=_ExtendMode(),
             extend_seq_lens_cpu=[8],
-            global_prefill_cp_active=False,
+            local_prefill_cp_active=False,
         )
-        idle_shadow_forced_on = SimpleNamespace(
+        eligible_batch_latched_on = SimpleNamespace(
+            input_ids=torch.arange(8),
+            forward_mode=_ExtendMode(),
+            extend_seq_lens_cpu=[8],
+            local_prefill_cp_active=True,
+        )
+        idle_shadow_latched_off = SimpleNamespace(
             input_ids=torch.empty(0, dtype=torch.int64),
             forward_mode=_IdleMode(),
             is_extend_in_batch=True,
-            global_prefill_cp_active=True,
+            local_prefill_cp_active=False,
         )
 
         with (
             patch("sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=True),
             get_parallel().override(attn_tp_size=1),
         ):
-            self.assertTrue(can_cp_v2_apply(eligible_batch_forced_off))
-            self.assertFalse(is_cp_v2_active(eligible_batch_forced_off))
-            self.assertTrue(is_cp_v2_active(idle_shadow_forced_on, num_tokens=8))
+            self.assertTrue(can_cp_v2_apply(eligible_batch_latched_off))
+            self.assertFalse(is_cp_v2_active(eligible_batch_latched_off))
+            self.assertTrue(is_cp_v2_active(eligible_batch_latched_on))
+            self.assertFalse(is_cp_v2_active(idle_shadow_latched_off, num_tokens=8))
 
     def test_cp_v2_scheduler_batch_uses_unpadded_extend_lens(self):
         scheduler_batch = SimpleNamespace(
             forward_mode=_ExtendMode(),
             extend_lens=[7],
-            global_prefill_cp_active=None,
+            local_prefill_cp_active=None,
         )
 
         with (
@@ -536,7 +546,7 @@ class TestCPZigzagStrategy(CustomTestCase):
             # request eligible for zigzag CP4.
             self.assertFalse(can_cp_v2_apply(scheduler_batch, num_tokens=8))
 
-    def test_cp_v2_rejects_mixed_and_unbalanced_ragged_batches(self):
+    def test_cp_v2_allows_unbalanced_ragged_batches_but_rejects_mixed(self):
         mixed_batch = SimpleNamespace(
             input_ids=torch.arange(16),
             forward_mode=_MixedMode(),
@@ -558,11 +568,58 @@ class TestCPZigzagStrategy(CustomTestCase):
                 "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get",
                 return_value=True,
             ),
-            get_parallel().override(attn_tp_size=2),
+            get_parallel().override(attn_tp_size=2, attn_cp_rank=0),
         ):
             self.assertFalse(is_cp_v2_active(mixed_batch))
-            self.assertFalse(is_cp_v2_active(unsafe_ragged_batch))
+            self.assertTrue(is_cp_v2_active(unsafe_ragged_batch))
             self.assertTrue(is_cp_v2_active(safe_ragged_batch))
+
+            strategy = get_cp_strategy()
+            self.assertEqual(
+                strategy.get_local_token_capacity(40, unsafe_ragged_batch), 10
+            )
+
+    def test_ragged_cp_model_padding_is_trimmed_at_attention_boundary(self):
+        strategy = ZigzagCPStrategy(cp_size=4)
+        extend_lens = [14, 14, 10]
+        with get_parallel().override(
+            attn_cp_rank=0,
+            attn_cp_size=4,
+            attn_tp_size=16,
+        ):
+            metadata = strategy.build_metadata(
+                num_tokens=40,
+                seqs_len=extend_lens,
+                extend_seqs_len=extend_lens,
+            )
+            batch = SimpleNamespace(
+                input_ids=torch.arange(40),
+                forward_mode=_ExtendMode(),
+                extend_seq_lens_cpu=extend_lens,
+                attn_cp_metadata=metadata,
+            )
+            full_hidden = torch.arange(80, dtype=torch.float32).view(40, 2)
+            full_positions = torch.arange(40)
+            local_hidden = strategy.shard_hidden_states(full_hidden, batch)
+            local_positions = strategy.shard_position_ids(full_positions, batch)
+            self.assertEqual(local_hidden.shape[0], 9)
+
+            padded_hidden, padded_positions = pad_cp_model_inputs(
+                local_hidden, local_positions, batch
+            )
+            self.assertEqual(padded_hidden.shape[0], 16)
+            self.assertEqual(padded_positions.shape[-1], 16)
+
+            trimmed_hidden, trimmed_positions, capacity = trim_cp_attention_inputs(
+                padded_hidden, padded_positions, batch
+            )
+            self.assertEqual(capacity, 16)
+            self.assertTrue(torch.equal(trimmed_hidden, local_hidden))
+            self.assertTrue(torch.equal(trimmed_positions, local_positions))
+            restored_output = pad_cp_attention_output(trimmed_hidden, capacity)
+            self.assertEqual(restored_output.shape[0], 16)
+            self.assertTrue(torch.equal(restored_output[:9], local_hidden))
+            self.assertTrue(torch.equal(restored_output[9:], torch.zeros(7, 2)))
 
     def test_paged_mla_metadata_excludes_cp_alignment_padding(self):
         strategy = ZigzagCPStrategy(cp_size=4)
@@ -796,7 +853,7 @@ class TestCPZigzagStrategy(CustomTestCase):
 
             local_x = strategy.shard_hidden_states(x, fb)
             local_positions = strategy.shard_position_ids(positions, fb)
-            fb.global_prefill_cp_active = True
+            fb.local_prefill_cp_active = True
             with (
                 patch(
                     "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get",

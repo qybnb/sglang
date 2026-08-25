@@ -388,9 +388,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     is_extend_in_batch: bool = False
     # Mirrors ScheduleBatch.all_extend_in_batch; kept for downstream forks.
     all_extend_in_batch: bool = False
-    # Synchronized Kimi-K3 PCP decision for the current global EP round.
-    # None keeps the standard per-local-batch CP policy.
-    global_prefill_cp_active: Optional[bool] = None
+    # Kimi-K3 CP-v2 decision latched from the real local scheduler batch.
+    # None keeps the standard model-local CP policy used by other models.
+    local_prefill_cp_active: Optional[bool] = None
     # True for a shape-compatible speculative target pass executed only so an
     # otherwise idle DP-attention rank joins the global collectives.  Keep this
     # as a dataclass field (instead of a dynamic attribute): eager/graph batch
@@ -708,7 +708,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             return_logprob=batch.return_logprob,
             is_extend_in_batch=batch.is_extend_in_batch,
             all_extend_in_batch=batch.all_extend_in_batch,
-            global_prefill_cp_active=batch.global_prefill_cp_active,
+            local_prefill_cp_active=batch.local_prefill_cp_active,
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             can_run_dp_breakable_cuda_graph=batch.can_run_dp_breakable_cuda_graph,
             global_forward_mode=batch.global_forward_mode,
@@ -1137,7 +1137,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
 
         # Local import: a module-level cp_utils import here is circular (#27014).
-        from sglang.srt.layers.cp.utils import is_cp_v2_active
+        from sglang.srt.layers.cp.utils import (
+            get_cp_local_token_capacity,
+            is_cp_v2_active,
+        )
         from sglang.srt.layers.utils.cp_utils import get_cp_padding_align_size
 
         assert self.global_num_tokens_cpu is not None
@@ -1185,16 +1188,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         local_buffer_len = num_tokens
         if is_cp_v2_active(self, num_tokens=num_tokens):
-            cp_size = get_parallel().attn_cp_size
-            if num_tokens % cp_size != 0:
-                raise ValueError(
-                    "CP-v2 requires the padded token count to be divisible by "
-                    f"CP size, got tokens={num_tokens}, cp_size={cp_size}."
-                )
             # The attention-TP all-gather is performed independently inside
-            # each CP rank, so its output buffer contains only that CP rank's
-            # token shard rather than the complete prefill sequence.
-            local_buffer_len = num_tokens // cp_size
+            # each CP rank. Ragged zigzag batches reserve this rank's shard,
+            # aligned to attention TP, and trim the physical padding at the
+            # attention and CP-gather boundaries.
+            local_buffer_len = get_cp_local_token_capacity(self, num_tokens)
 
         self.global_dp_buffer_len = buffer_len
         set_dp_buffer_len(
