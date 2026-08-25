@@ -91,40 +91,39 @@ def _maybe_log_local_prefill_cp_decision(
     runs pay no per-batch logging or statistics overhead when the environment
     variable is unset.
     """
-    if not enabled:
+    if not enabled or local_batch is None:
         return
 
-    if local_batch is None:
-        mode = "NONE"
-        num_reqs = 0
-        extend_lens = []
-        reason = "no_local_batch"
-    else:
-        forward_mode = getattr(local_batch, "forward_mode", None)
-        mode = getattr(forward_mode, "name", str(forward_mode))
-        num_reqs = local_batch.batch_size()
-        raw_extend_lens = getattr(local_batch, "extend_lens", None)
-        extend_lens = (
-            [int(length) for length in raw_extend_lens]
-            if raw_extend_lens is not None
-            else []
-        )
+    forward_mode = getattr(local_batch, "forward_mode", None)
+    num_reqs = local_batch.batch_size()
+    if num_reqs <= 0 or (
+        forward_mode is not None and forward_mode.is_idle()
+    ):
+        return
 
-        if local_prefill_cp_active:
-            reason = "eligible"
-        elif forward_mode is None:
-            reason = "missing_forward_mode"
-        elif not forward_mode.is_context_parallel_extend():
-            reason = f"mode_{mode.lower()}"
-        elif forward_mode.is_mixed():
-            reason = "mixed_batch"
-        elif extend_lens and min(extend_lens) < 2 * attn_cp_size:
-            reason = (
-                f"short_extend_min_{min(extend_lens)}"
-                f"_required_{2 * attn_cp_size}"
-            )
-        else:
-            reason = "cp_strategy_ineligible"
+    mode = getattr(forward_mode, "name", str(forward_mode))
+    raw_extend_lens = getattr(local_batch, "extend_lens", None)
+    extend_lens = (
+        [int(length) for length in raw_extend_lens]
+        if raw_extend_lens is not None
+        else []
+    )
+
+    if local_prefill_cp_active:
+        reason = "eligible"
+    elif forward_mode is None:
+        reason = "missing_forward_mode"
+    elif not forward_mode.is_context_parallel_extend():
+        reason = f"mode_{mode.lower()}"
+    elif forward_mode.is_mixed():
+        reason = "mixed_batch"
+    elif extend_lens and min(extend_lens) < 2 * attn_cp_size:
+        reason = (
+            f"short_extend_min_{min(extend_lens)}"
+            f"_required_{2 * attn_cp_size}"
+        )
+    else:
+        reason = "cp_strategy_ineligible"
 
     logger.info(
         "[KIMI_K3_PCP_BATCH] dp_rank=%d mode=%s num_reqs=%d "

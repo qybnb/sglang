@@ -170,6 +170,32 @@ class TestDPPrefillCPLocalLatch(unittest.TestCase):
             log_info.call_args.args[-1], "short_extend_min_3_required_4"
         )
 
+    def test_per_batch_log_skips_empty_scheduler_polls(self):
+        log_target = "sglang.srt.managers.scheduler_components.dp_attn.logger.info"
+
+        with patch(log_target) as log_info:
+            _maybe_log_local_prefill_cp_decision(
+                enabled=True,
+                local_batch=None,
+                local_prefill_cp_active=False,
+                num_tokens=0,
+                attn_cp_size=2,
+                attn_dp_rank=0,
+            )
+            _maybe_log_local_prefill_cp_decision(
+                enabled=True,
+                local_batch=SimpleNamespace(
+                    forward_mode=ForwardMode.IDLE,
+                    batch_size=lambda: 0,
+                ),
+                local_prefill_cp_active=False,
+                num_tokens=0,
+                attn_cp_size=2,
+                attn_dp_rank=0,
+            )
+
+        log_info.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
