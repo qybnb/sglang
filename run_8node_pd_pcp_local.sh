@@ -165,9 +165,14 @@ case "${MLA_CP_BACKEND}" in allgather|ring) ;; *) echo "MLA_CP_BACKEND must be a
 ENABLE_DSPARK="${ENABLE_DSPARK:-1}"
 DISABLE_CUDA_GRAPH="${DISABLE_CUDA_GRAPH:-0}"
 ENABLE_PREFIX_CACHE="${ENABLE_PREFIX_CACHE:-0}"
+ALLOW_DSPARK_HETERO_ATTN_TP="${ALLOW_DSPARK_HETERO_ATTN_TP:-0}"
 case "${ENABLE_DSPARK}" in 0|1) ;; *) echo "ENABLE_DSPARK must be 0 or 1." >&2; exit 2 ;; esac
 case "${DISABLE_CUDA_GRAPH}" in 0|1) ;; *) echo "DISABLE_CUDA_GRAPH must be 0 or 1." >&2; exit 2 ;; esac
 case "${ENABLE_PREFIX_CACHE}" in 0|1) ;; *) echo "ENABLE_PREFIX_CACHE must be 0 or 1." >&2; exit 2 ;; esac
+case "${ALLOW_DSPARK_HETERO_ATTN_TP}" in
+    0|1) ;;
+    *) echo "ALLOW_DSPARK_HETERO_ATTN_TP must be 0 or 1." >&2; exit 2 ;;
+esac
 case "${PREFILL_ENABLE_DEEPEP}" in 0|1) ;; *) echo "PREFILL_ENABLE_DEEPEP must be 0 or 1." >&2; exit 2 ;; esac
 case "${DECODE_ENABLE_DEEPEP}" in 0|1) ;; *) echo "DECODE_ENABLE_DEEPEP must be 0 or 1." >&2; exit 2 ;; esac
 case "${PREFILL_ENABLE_DP_ATTENTION}" in 0|1) ;; *) echo "PREFILL_ENABLE_DP_ATTENTION must be 0 or 1." >&2; exit 2 ;; esac
@@ -177,9 +182,16 @@ if [[ "${ENABLE_DSPARK}" == "1" ]]; then
     PREFILL_ATTN_TP_SIZE=$((PREFILL_TP_SIZE / PREFILL_DP_SIZE / PREFILL_CP_SIZE))
     DECODE_ATTN_TP_SIZE=$((DECODE_TP_SIZE / DECODE_DP_SIZE))
     if (( PREFILL_ATTN_TP_SIZE != DECODE_ATTN_TP_SIZE )); then
-        echo "PD dSparK requires matching Prefill/Decode attention TP sizes so draft KV layouts match." >&2
-        echo "  Prefill attention TP=${PREFILL_ATTN_TP_SIZE}, Decode attention TP=${DECODE_ATTN_TP_SIZE}." >&2
-        exit 2
+        if [[ "${ALLOW_DSPARK_HETERO_ATTN_TP}" == "1" ]]; then
+            echo "Warning: allowing heterogeneous PD dSparK attention TP: " \
+                 "Prefill=${PREFILL_ATTN_TP_SIZE}, Decode=${DECODE_ATTN_TP_SIZE}." >&2
+            echo "Runtime draft-KV buffer metadata validation remains enabled." >&2
+        else
+            echo "PD dSparK requires matching Prefill/Decode attention TP sizes by default." >&2
+            echo "  Prefill attention TP=${PREFILL_ATTN_TP_SIZE}, Decode attention TP=${DECODE_ATTN_TP_SIZE}." >&2
+            echo "Set ALLOW_DSPARK_HETERO_ATTN_TP=1 only when the draft KV layouts are compatible." >&2
+            exit 2
+        fi
     fi
 fi
 
