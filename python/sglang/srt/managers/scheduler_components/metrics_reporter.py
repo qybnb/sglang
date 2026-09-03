@@ -82,6 +82,25 @@ def _format_int_counts(values) -> str:
     return "[" + ",".join(str(int(v)) for v in values.reshape(-1).tolist()) + "]"
 
 
+def _summarize_counts(values, top_k: int = 5) -> str:
+    ints = [int(v) for v in values]
+    n = len(ints)
+    if n == 0:
+        return "n=0"
+    nonzero = [(i, v) for i, v in enumerate(ints) if v > 0]
+    if not nonzero:
+        return f"n={n} all_zero"
+    counts = [v for _, v in nonzero]
+    top = sorted(nonzero, key=lambda x: -x[1])[:top_k]
+    top_s = ",".join(f"{i}:{v}" for i, v in top)
+    return (
+        f"n={n} nonzero={len(nonzero)} zero={n - len(nonzero)} "
+        f"min={min(counts)} max={max(counts)} "
+        f"mean={sum(counts) / len(counts):.1f} "
+        f"top=[{top_s}]"
+    )
+
+
 def _log_per_layer_expert_balancedness(
     forward_pass_id: int,
     gpu_physical_count,
@@ -94,15 +113,14 @@ def _log_per_layer_expert_balancedness(
     for layer_idx, (gpu_counts, expert_counts) in enumerate(
         zip(gpu_by_layer, expert_by_layer)
     ):
-        layer_sum = sum(gpu_counts)
-        if layer_sum <= 0:
+        if layer_idx % 10 != 0 or sum(gpu_counts) <= 0:
             continue
         logger.info(
             f"[Expert Balancedness] "
             f"forward_pass_id={forward_pass_id} "
             f"layer={layer_idx} "
-            f"gpu_physical_count=[{','.join(str(int(v)) for v in gpu_counts)}] "
-            f"expert_physical_count=[{','.join(str(int(v)) for v in expert_counts)}]"
+            f"gpu={_summarize_counts(gpu_counts)} "
+            f"expert={_summarize_counts(expert_counts)}"
         )
 
 
