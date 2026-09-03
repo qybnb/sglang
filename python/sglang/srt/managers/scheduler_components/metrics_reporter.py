@@ -1043,6 +1043,10 @@ class SchedulerMetricsReporter:
                 if m.reset_server_log_history:
                     for history in self._eplb_balancedness_history:
                         history.clear()
+                # No expert was observed in this forward.  This is not a
+                # perfectly balanced sample and must not enter the windows.
+                if not math.isfinite(balancedness):
+                    return
                 for history in self._eplb_balancedness_history:
                     history.append(balancedness)
                 balancedness_history_means = {
@@ -1072,7 +1076,11 @@ class SchedulerMetricsReporter:
                     expert_physical_count=m.expert_physical_count,
                 )
 
-            if self.enable_metrics and exports_expert_balancedness_to_prometheus():
+            if (
+                math.isfinite(balancedness)
+                and self.enable_metrics
+                and exports_expert_balancedness_to_prometheus()
+            ):
                 assert self.metrics_collector is not None
                 self.metrics_collector.increment_eplb_balancedness(
                     forward_mode=batch.forward_mode.name.lower(),

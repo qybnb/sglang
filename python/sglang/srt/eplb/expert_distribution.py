@@ -39,7 +39,6 @@ import torch
 import torch.distributed
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_EXPERT_DISPATCH,
@@ -356,11 +355,11 @@ class _SinglePassGatherer(ABC):
                     elastic_ep_enabled=get_exec().moe.elastic_ep_backend is not None,
                 )
             elif get_exec().moe.deepep_mode == "auto":
-                return _DeepEPAutoSinglePassGatherer(
-                    expert_location_metadata,
-                    rank,
-                    elastic_ep_enabled=get_exec().moe.elastic_ep_backend is not None,
-                )
+                # AUTO switches between normal and low-latency dispatch per
+                # forward.  Count the post-routing TopK ids in both cases so
+                # graph replay does not depend on a Python-side hook after the
+                # NPU DeepEP low-latency dispatch.
+                return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
             else:
                 raise NotImplementedError
 
@@ -624,74 +623,6 @@ class _DeepepLowLatencySinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
         self._data[layer_idx, :] += local_physical_count_of_layer
 
 
-class _DeepEPAutoSinglePassGatherer(_SinglePassGatherer):
-    """Select the gatherer used by DeepEP's per-forward auto mode."""
-
-    def __init__(
-        self,
-        expert_location_metadata: ExpertLocationMetadata,
-        rank: int,
-        elastic_ep_enabled: bool = False,
-    ):
-        super().__init__(expert_location_metadata, rank)
-        self._normal = _SelectExpertsSinglePassGatherer(
-            expert_location_metadata, rank
-        )
-        self._low_latency = _DeepepLowLatencySinglePassGatherer(
-            expert_location_metadata,
-            rank,
-            elastic_ep_enabled=elastic_ep_enabled,
-        )
-
-    def _current(self) -> _SinglePassGatherer:
-        # Keep this in sync with DeepEPMode.resolve(): an extend-containing
-        # batch uses normal dispatch, while decode uses low-latency dispatch.
-        return self._normal if get_is_extend_in_batch() else self._low_latency
-
-    def on_forward_pass_start(self, forward_batch: ForwardBatch):
-        self._current().on_forward_pass_start(forward_batch)
-
-    def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
-        # Always write into the select-experts gatherer. Decode auto mode
-        # previously delegated this to the low-latency gatherer (a no-op), so
-        # the scatter_add_ never entered the CUDA/NPU graph and replay left
-        # global_physical_count at zero (balancedness=1, gpu_physical_count_sum=0).
-        self._normal.on_select_experts(layer_idx, topk_ids)
-
-    def on_deepep_dispatch_normal(
-        self,
-        layer_idx: int,
-        local_physical_count_of_layer: List[int],
-        num_tokens_per_rank,
-        num_tokens_per_rdma_rank,
-        num_tokens_per_expert,
-    ):
-        self._current().on_deepep_dispatch_normal(
-            layer_idx,
-            local_physical_count_of_layer,
-            num_tokens_per_rank,
-            num_tokens_per_rdma_rank,
-            num_tokens_per_expert,
-        )
-
-    def on_deepep_dispatch_low_latency(
-        self, layer_idx: int, local_physical_count_of_layer: torch.Tensor
-    ):
-        self._current().on_deepep_dispatch_low_latency(
-            layer_idx, local_physical_count_of_layer
-        )
-
-    def reset(self):
-        self._normal.reset()
-        self._low_latency.reset()
-
-    def collect(self) -> Dict:
-        # Always read the select-experts buffer. Decode auto used to collect
-        # from the low-latency gatherer, whose _data was never written by
-        # on_select_experts and stayed zero under NPU/CUDA graph replay.
-        return self._normal.collect()
-
-
 def _convert_per_token_to_global_physical_count(
     num_tokens: int,
     num_layers: int,
@@ -841,9 +772,8 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             )
             self._handle_metric_eplb_heatmap(gpu_physical_count)
 
-            utilization_rate_gpu = torch.mean(
-                compute_utilization_rate(gpu_physical_count)
-            )
+            gpu_physical_count_sum = gpu_physical_count.sum()
+            utilization_rate_gpu = compute_average_utilization_rate(gpu_physical_count)
             should_track_history = not math.isclose(
                 get_exec().moe.eplb_min_rebalancing_utilization_threshold, 1.0
             )
@@ -852,9 +782,7 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             outputs["metrics"] = ExpertDistributionMetrics(
                 forward_pass_id=forward_pass_id,
                 eplb_balancedness=utilization_rate_gpu,
-                gpu_physical_count_sum=(
-                    gpu_physical_count.sum() if should_log else None
-                ),
+                gpu_physical_count_sum=(gpu_physical_count_sum if should_log else None),
                 gpu_physical_count=gpu_physical_count if should_log else None,
                 expert_physical_count=physical_count if should_log else None,
                 reset_server_log_history=self._reset_server_log_history,
@@ -862,7 +790,9 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             self._reset_server_log_history = False
 
             if should_track_history:
-                self._history.append(utilization_rate_gpu.item())
+                utilization_rate = utilization_rate_gpu.item()
+                if math.isfinite(utilization_rate):
+                    self._history.append(utilization_rate)
 
     # TODO refactor
     def _handle_metric_eplb_heatmap(self, gpu_physical_count: torch.Tensor):
@@ -1172,3 +1102,18 @@ def compute_utilization_rate(
         "mean",
     )
     return (avg_gpu_physical_count + 1e-5) / (max_gpu_physical_count + 1e-5)
+
+
+def compute_average_utilization_rate(gpu_physical_count: torch.Tensor):
+    """Average balancedness over layers that routed at least one token."""
+    utilization_rate = compute_utilization_rate(gpu_physical_count)
+    active_layers = gpu_physical_count.sum(dim=-1) > 0
+    num_active_layers = active_layers.sum()
+    average = (utilization_rate * active_layers).sum() / num_active_layers.clamp_min(1)
+    # An all-zero pass has no expert-distribution sample.  Without this marker,
+    # (0 + eps) / (0 + eps) reports a false 1.0.
+    return torch.where(
+        num_active_layers > 0,
+        average,
+        torch.full_like(average, float("nan")),
+    )

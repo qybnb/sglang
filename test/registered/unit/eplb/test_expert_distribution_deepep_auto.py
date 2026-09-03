@@ -31,28 +31,40 @@ def _make_auto_gatherer():
         return expert_distribution._SinglePassGatherer.init_new(_metadata(), rank=1)
 
 
-def test_deepep_auto_uses_normal_gatherer_for_extend():
+def test_deepep_auto_counts_selected_experts_for_extend():
     gatherer = _make_auto_gatherer()
 
-    with patch.object(expert_distribution, "get_is_extend_in_batch", return_value=True):
-        gatherer.reset()
-        gatherer.on_select_experts(0, torch.tensor([[0, 3], [3, -1]]))
-        result = gatherer.collect()["global_physical_count"]
+    gatherer.reset()
+    gatherer.on_select_experts(0, torch.tensor([[0, 3], [3, -1]]))
+    result = gatherer.collect()["global_physical_count"]
 
     assert torch.equal(result, torch.tensor([[1, 0, 0, 2], [0, 0, 0, 0]]))
 
 
-def test_deepep_auto_uses_low_latency_gatherer_for_decode():
+def test_deepep_auto_counts_selected_experts_for_decode():
     gatherer = _make_auto_gatherer()
 
-    with patch.object(
-        expert_distribution, "get_is_extend_in_batch", return_value=False
-    ):
-        gatherer.reset()
-        # AUTO decode must ignore the select-experts hook and use the local
-        # physical counts emitted by the low-latency dispatcher.
-        gatherer.on_select_experts(0, torch.tensor([[0, 3]]))
-        gatherer.on_deepep_dispatch_low_latency(0, torch.tensor([2, 4]))
-        result = gatherer.collect()["global_physical_count"]
+    gatherer.reset()
+    gatherer.on_select_experts(0, torch.tensor([[0, 3]]))
+    # AUTO decode deliberately ignores this Python-side DeepEP hook: it is not
+    # replayed by the NPU graph used by Kimi-K3.
+    gatherer.on_deepep_dispatch_low_latency(0, torch.tensor([2, 4]))
+    result = gatherer.collect()["global_physical_count"]
 
-    assert torch.equal(result, torch.tensor([[0, 0, 2, 4], [0, 0, 0, 0]]))
+    assert torch.equal(result, torch.tensor([[1, 0, 0, 1], [0, 0, 0, 0]]))
+
+
+def test_balancedness_ignores_layers_without_routed_tokens():
+    counts = torch.tensor([[1, 3], [0, 0]])
+
+    result = expert_distribution.compute_average_utilization_rate(counts)
+
+    assert torch.isclose(result, torch.tensor(2 / 3), atol=1e-5)
+
+
+def test_balancedness_marks_pass_without_routed_tokens_invalid():
+    result = expert_distribution.compute_average_utilization_rate(
+        torch.zeros((2, 4), dtype=torch.int32)
+    )
+
+    assert torch.isnan(result)
