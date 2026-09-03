@@ -78,6 +78,34 @@ def _decode_total_seq_lens(batch: ScheduleBatch) -> int:
     return sum(req.seqlen for req in batch.reqs)
 
 
+def _format_int_counts(values) -> str:
+    return "[" + ",".join(str(int(v)) for v in values.reshape(-1).tolist()) + "]"
+
+
+def _log_per_layer_expert_balancedness(
+    forward_pass_id: int,
+    gpu_physical_count,
+    expert_physical_count,
+) -> None:
+    if gpu_physical_count is None or expert_physical_count is None:
+        return
+    gpu_by_layer = gpu_physical_count.tolist()
+    expert_by_layer = expert_physical_count.tolist()
+    for layer_idx, (gpu_counts, expert_counts) in enumerate(
+        zip(gpu_by_layer, expert_by_layer)
+    ):
+        layer_sum = sum(gpu_counts)
+        if layer_sum <= 0:
+            continue
+        logger.info(
+            f"[Expert Balancedness] "
+            f"forward_pass_id={forward_pass_id} "
+            f"layer={layer_idx} "
+            f"gpu_physical_count=[{','.join(str(int(v)) for v in gpu_counts)}] "
+            f"expert_physical_count=[{','.join(str(int(v)) for v in expert_counts)}]"
+        )
+
+
 @dataclasses.dataclass
 class PrefillStats:
     """Stats for logging prefill batch metrics."""
@@ -1024,13 +1052,24 @@ class SchedulerMetricsReporter:
                 }
                 assert m.gpu_physical_count_sum is not None
                 gpu_physical_count_sum = m.gpu_physical_count_sum.item()
+                gpu_totals = (
+                    _format_int_counts(m.gpu_physical_count.sum(dim=0))
+                    if m.gpu_physical_count is not None
+                    else "[]"
+                )
 
                 logger.info(
                     f"[Expert Balancedness] "
                     f"forward_pass_id={m.forward_pass_id} "
                     f"current_pass_balancedness={balancedness:.03f} "
                     f"{''.join(f'last_{size}_average_balancedness={value:.03f} ' for size, value in balancedness_history_means.items())} "
-                    f"gpu_physical_count_sum={gpu_physical_count_sum}"
+                    f"gpu_physical_count_sum={gpu_physical_count_sum} "
+                    f"gpu_physical_count={gpu_totals}"
+                )
+                _log_per_layer_expert_balancedness(
+                    forward_pass_id=m.forward_pass_id,
+                    gpu_physical_count=m.gpu_physical_count,
+                    expert_physical_count=m.expert_physical_count,
                 )
 
             if self.enable_metrics and exports_expert_balancedness_to_prometheus():

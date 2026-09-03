@@ -71,6 +71,8 @@ class ExpertDistributionMetrics:
     forward_pass_id: int
     eplb_balancedness: torch.Tensor
     gpu_physical_count_sum: Optional[torch.Tensor]
+    gpu_physical_count: Optional[torch.Tensor]
+    expert_physical_count: Optional[torch.Tensor]
     reset_server_log_history: bool
 
     def map_device_tensors(self, fn):
@@ -79,6 +81,10 @@ class ExpertDistributionMetrics:
         self.eplb_balancedness = fn(self.eplb_balancedness)
         if self.gpu_physical_count_sum is not None:
             self.gpu_physical_count_sum = fn(self.gpu_physical_count_sum)
+        if self.gpu_physical_count is not None:
+            self.gpu_physical_count = fn(self.gpu_physical_count)
+        if self.expert_physical_count is not None:
+            self.expert_physical_count = fn(self.expert_physical_count)
 
 
 class ExpertDistributionRecorder(ABC):
@@ -646,7 +652,11 @@ class _DeepEPAutoSinglePassGatherer(_SinglePassGatherer):
         self._current().on_forward_pass_start(forward_batch)
 
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
-        self._current().on_select_experts(layer_idx, topk_ids)
+        # Always write into the select-experts gatherer. Decode auto mode
+        # previously delegated this to the low-latency gatherer (a no-op), so
+        # the scatter_add_ never entered the CUDA/NPU graph and replay left
+        # global_physical_count at zero (balancedness=1, gpu_physical_count_sum=0).
+        self._normal.on_select_experts(layer_idx, topk_ids)
 
     def on_deepep_dispatch_normal(
         self,
@@ -676,7 +686,10 @@ class _DeepEPAutoSinglePassGatherer(_SinglePassGatherer):
         self._low_latency.reset()
 
     def collect(self) -> Dict:
-        return self._current().collect()
+        # Always read the select-experts buffer. Decode auto used to collect
+        # from the low-latency gatherer, whose _data was never written by
+        # on_select_experts and stayed zero under NPU/CUDA graph replay.
+        return self._normal.collect()
 
 
 def _convert_per_token_to_global_physical_count(
@@ -814,16 +827,18 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         single_pass_global_physical_count: torch.Tensor,
         outputs: Dict[str, Any],
     ):
-        gpu_physical_count = compute_gpu_physical_count(
-            single_pass_global_physical_count,
-            num_gpu=self._expert_location_metadata.ep_size,
-        )
-        gpu_physical_count = gpu_physical_count.to(get_device_namespace().device)
+        device = get_device_namespace().device
+        # Clone so a later gatherer.reset() cannot zero the tensor we reduce.
+        physical_count = single_pass_global_physical_count.to(device).clone()
         torch.distributed.reduce(
-            gpu_physical_count, dst=0, op=torch.distributed.ReduceOp.SUM
+            physical_count, dst=0, op=torch.distributed.ReduceOp.SUM
         )
 
         if self._rank == 0:
+            gpu_physical_count = compute_gpu_physical_count(
+                physical_count,
+                num_gpu=self._expert_location_metadata.ep_size,
+            )
             self._handle_metric_eplb_heatmap(gpu_physical_count)
 
             utilization_rate_gpu = torch.mean(
@@ -840,6 +855,8 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
                 gpu_physical_count_sum=(
                     gpu_physical_count.sum() if should_log else None
                 ),
+                gpu_physical_count=gpu_physical_count if should_log else None,
+                expert_physical_count=physical_count if should_log else None,
                 reset_server_log_history=self._reset_server_log_history,
             )
             self._reset_server_log_history = False
