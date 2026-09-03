@@ -39,6 +39,7 @@ import torch
 import torch.distributed
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_EXPERT_DISPATCH,
@@ -348,6 +349,12 @@ class _SinglePassGatherer(ABC):
                     rank,
                     elastic_ep_enabled=get_exec().moe.elastic_ep_backend is not None,
                 )
+            elif get_exec().moe.deepep_mode == "auto":
+                return _DeepEPAutoSinglePassGatherer(
+                    expert_location_metadata,
+                    rank,
+                    elastic_ep_enabled=get_exec().moe.elastic_ep_backend is not None,
+                )
             else:
                 raise NotImplementedError
 
@@ -609,6 +616,67 @@ class _DeepepLowLatencySinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
                     (0, n - local_physical_count_of_layer.shape[0]),
                 )
         self._data[layer_idx, :] += local_physical_count_of_layer
+
+
+class _DeepEPAutoSinglePassGatherer(_SinglePassGatherer):
+    """Select the gatherer used by DeepEP's per-forward auto mode."""
+
+    def __init__(
+        self,
+        expert_location_metadata: ExpertLocationMetadata,
+        rank: int,
+        elastic_ep_enabled: bool = False,
+    ):
+        super().__init__(expert_location_metadata, rank)
+        self._normal = _SelectExpertsSinglePassGatherer(
+            expert_location_metadata, rank
+        )
+        self._low_latency = _DeepepLowLatencySinglePassGatherer(
+            expert_location_metadata,
+            rank,
+            elastic_ep_enabled=elastic_ep_enabled,
+        )
+
+    def _current(self) -> _SinglePassGatherer:
+        # Keep this in sync with DeepEPMode.resolve(): an extend-containing
+        # batch uses normal dispatch, while decode uses low-latency dispatch.
+        return self._normal if get_is_extend_in_batch() else self._low_latency
+
+    def on_forward_pass_start(self, forward_batch: ForwardBatch):
+        self._current().on_forward_pass_start(forward_batch)
+
+    def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
+        self._current().on_select_experts(layer_idx, topk_ids)
+
+    def on_deepep_dispatch_normal(
+        self,
+        layer_idx: int,
+        local_physical_count_of_layer: List[int],
+        num_tokens_per_rank,
+        num_tokens_per_rdma_rank,
+        num_tokens_per_expert,
+    ):
+        self._current().on_deepep_dispatch_normal(
+            layer_idx,
+            local_physical_count_of_layer,
+            num_tokens_per_rank,
+            num_tokens_per_rdma_rank,
+            num_tokens_per_expert,
+        )
+
+    def on_deepep_dispatch_low_latency(
+        self, layer_idx: int, local_physical_count_of_layer: torch.Tensor
+    ):
+        self._current().on_deepep_dispatch_low_latency(
+            layer_idx, local_physical_count_of_layer
+        )
+
+    def reset(self):
+        self._normal.reset()
+        self._low_latency.reset()
+
+    def collect(self) -> Dict:
+        return self._current().collect()
 
 
 def _convert_per_token_to_global_physical_count(
