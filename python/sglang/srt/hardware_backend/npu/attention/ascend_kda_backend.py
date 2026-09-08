@@ -370,6 +370,22 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         query_start_loc = metadata.query_start_loc
         cache_indices = metadata.mamba_cache_indices
 
+        draft_token_num = forward_batch.spec_info.draft_token_num
+        batch_size = query_start_loc.shape[0] - 1
+        if batch_size == 0:
+            if seq_len != 0:
+                raise RuntimeError(
+                    "Ascend KDA target verify received tokens for an empty batch: "
+                    f"seq_len={seq_len}."
+                )
+            # DP-attention idle ranks must still walk the model so they can join
+            # the busy ranks' MoE collectives.  No recurrent/conv state belongs
+            # to this rank, so avoid submitting zero-size KDA kernels and return
+            # the normal attention shape with an empty token dimension.
+            return mixed_qkv.new_empty(
+                (1, 0, layer.num_v_heads, layer.head_v_dim)
+            )
+
         cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         intermediate_state = cache.intermediate_ssm
         if intermediate_state is None:
@@ -377,8 +393,6 @@ class AscendKDAAttnBackend(KDAAttnBackend):
                 "Ascend KDA target verify requires speculative Mamba scratch."
             )
 
-        draft_token_num = forward_batch.spec_info.draft_token_num
-        batch_size = query_start_loc.shape[0] - 1
         num_dense_tokens = batch_size * draft_token_num
         ragged_layout = forward_batch.spec_info.ragged_verify_layout
         if ragged_layout is None and seq_len == num_dense_tokens:

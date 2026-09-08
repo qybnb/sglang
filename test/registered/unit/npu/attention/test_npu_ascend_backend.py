@@ -688,6 +688,113 @@ class TestGetCudaGraphSeqLenFillValue(unittest.TestCase):
         self.assertEqual(backend.get_cuda_graph_seq_len_fill_value(), 0)
 
 
+class TestIdleDpTargetVerify(unittest.TestCase):
+    def test_dspark_ge_fia_uses_bsnd_device_lengths(self):
+        backend = object.__new__(AscendAttnBackend)
+        backend.use_mla = False
+        backend.graph_mode = True
+        backend.use_dspark_torchair_fia = True
+        backend.page_size = 4
+        backend.mtp_mask = torch.zeros((8, 8), dtype=torch.bool)
+        backend.forward_metadata = ForwardMetadata(
+            seq_lens=torch.tensor([5, 0], dtype=torch.int64),
+            block_tables=torch.tensor([[0, 1], [0, 0]], dtype=torch.int32),
+        )
+        backend.token_to_kv_pool = SimpleNamespace(
+            get_key_buffer=lambda _layer_id: torch.zeros((16, 1, 4)),
+            get_value_buffer=lambda _layer_id: torch.zeros((16, 1, 4)),
+        )
+        ge_fia = MagicMock(
+            side_effect=lambda query, *_args, **_kwargs: (torch.zeros_like(query), None)
+        )
+        backend._dspark_torchair_fia_op = ge_fia
+
+        mode = MagicMock()
+        mode.is_target_verify.return_value = True
+        forward_batch = SimpleNamespace(
+            num_token_non_padded_cpu=6,
+            forward_mode=mode,
+            spec_info=SimpleNamespace(draft_token_num=3),
+        )
+        layer = SimpleNamespace(
+            layer_id=0,
+            tp_q_head_num=2,
+            tp_k_head_num=1,
+            tp_v_head_num=1,
+            qk_head_dim=4,
+            v_head_dim=4,
+            scaling=0.5,
+        )
+
+        output = backend.forward_mtp(
+            q=torch.randn((6, 8)),
+            k=None,
+            v=None,
+            layer=layer,
+            forward_batch=forward_batch,
+            save_kv_cache=False,
+        )
+
+        self.assertEqual(output.shape, (6, 8))
+        call = ge_fia.call_args
+        self.assertEqual(call.args[0].shape, (2, 3, 2, 4))
+        self.assertEqual(call.kwargs["input_layout"], "BSND")
+        self.assertEqual(call.kwargs["actual_seq_lengths"].tolist(), [3, 0])
+        self.assertEqual(call.kwargs["actual_seq_lengths_kv"].tolist(), [8, 0])
+
+    def test_empty_target_verify_metadata(self):
+        backend = object.__new__(AscendAttnBackend)
+        backend.device = torch.device("cpu")
+        backend.page_size = 128
+        backend.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.zeros((1, 128), dtype=torch.int64)
+        )
+        backend.is_hybrid_swa = False
+        backend.use_mla = False
+        backend.use_sliding_window_kv_pool = False
+
+        mode = MagicMock()
+        mode.is_target_verify.return_value = True
+        mode.is_decode_or_idle.return_value = False
+        mode.is_draft_extend_v2.return_value = False
+        spec_algorithm = MagicMock()
+        spec_algorithm.is_dspark.return_value = True
+        forward_batch = SimpleNamespace(
+            seq_lens=torch.empty((0,), dtype=torch.int64),
+            seq_lens_cpu=torch.empty((0,), dtype=torch.int64),
+            req_pool_indices=torch.empty((0,), dtype=torch.int64),
+            out_cache_loc=torch.empty((0,), dtype=torch.int64),
+            forward_mode=mode,
+            spec_info=SimpleNamespace(draft_token_num=8),
+            spec_algorithm=spec_algorithm,
+            extend_seq_lens=None,
+        )
+
+        backend.init_forward_metadata(forward_batch)
+
+        self.assertEqual(backend.forward_metadata.block_tables.shape, (0, 0))
+        self.assertEqual(backend.forward_metadata.seq_lens_cpu_int.numel(), 0)
+        self.assertEqual(backend.forward_metadata.actual_seq_lengths_q.numel(), 0)
+
+    def test_idle_forward_mtp_skips_zero_token_attention(self):
+        backend = object.__new__(AscendAttnBackend)
+        q = torch.randn((4, 64), dtype=torch.float32)
+        layer = SimpleNamespace(tp_q_head_num=2, v_head_dim=32)
+        forward_batch = SimpleNamespace(num_token_non_padded_cpu=0)
+
+        output = backend.forward_mtp(
+            q=q,
+            k=None,
+            v=None,
+            layer=layer,
+            forward_batch=forward_batch,
+            save_kv_cache=True,
+        )
+
+        self.assertEqual(output.shape, (4, 64))
+        self.assertTrue(torch.equal(output, torch.zeros_like(output)))
+
+
 class TestGetVerifyBuffers(unittest.TestCase):
     def test_no_verify_mask(self):
         backend = object.__new__(AscendAttnBackend)

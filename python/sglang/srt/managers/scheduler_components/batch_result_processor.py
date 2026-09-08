@@ -15,6 +15,7 @@ import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.speculative.dspark_components.dspark_diagnostics import diagnostic_stage
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -854,6 +855,7 @@ class SchedulerBatchResultProcessor:
         result.grammar_retained_tokens = retained
         result.grammar_advanced = True
 
+    @diagnostic_stage("result_idle")
     def process_batch_result_idle(
         self,
         batch: ScheduleBatch,
@@ -866,6 +868,7 @@ class SchedulerBatchResultProcessor:
             batch.reqs, batch.return_logprob, is_idle_batch=True
         )
 
+    @diagnostic_stage("result_decode")
     def process_batch_result_decode(
         self,
         batch: ScheduleBatch,

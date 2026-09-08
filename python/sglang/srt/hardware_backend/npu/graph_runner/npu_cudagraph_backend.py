@@ -28,6 +28,7 @@ from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
 )
 from sglang.srt.utils import empty_context, get_bool_env_var
+from sglang.srt.speculative.dspark_components.dspark_diagnostics import get_diagnostics
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -168,8 +169,15 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         graph = self._graphs[shape_key]
 
         self._device_module.set_device(self._device_id)
+        diag = get_diagnostics()
+        token = diag.begin("npugraph_update", key=str(shape_key)) if diag is not None else None
         graph.update(cpu_update_input=cpu_update_input)
+        if diag is not None:
+            diag.end(token)
+            token = diag.begin("npugraph_replay", key=str(shape_key))
         graph.replay()
+        if diag is not None:
+            diag.end(token)
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:
