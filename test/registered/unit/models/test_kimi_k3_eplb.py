@@ -1,6 +1,8 @@
+import sys
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import pytest
 import torch
 
 import sglang.srt.models.kimi_k3 as kimi_k3
@@ -37,3 +39,7 @@ def test_kimi_k3_topk_receives_expert_location_dispatch_info():
         router_logits,
         expert_location_dispatch_info=dispatch_info,
     )
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

@@ -1022,9 +1022,7 @@ def get_compiler_backend(mode=None) -> str:
             # Device-tensor actual_seq_lengths are exposed by torchair.ops FIA
             # only in a max-autotune GE graph.  The fixed-width DSPark path uses
             # BSND page attention, which supports device-side tiling.
-            compiler_config.experimental_config.keep_inference_input_mutations = (
-                True
-            )
+            compiler_config.experimental_config.keep_inference_input_mutations = True
             compiler_config.experimental_config.frozen_parameter = True
             compiler_config.experimental_config.tiling_schedule_optimize = True
         npu_backend = torchair.get_npu_backend(compiler_config=compiler_config)

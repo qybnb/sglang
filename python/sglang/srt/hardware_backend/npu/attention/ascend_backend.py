@@ -404,12 +404,8 @@ class AscendAttnBackend(AttentionBackend):
                     "Set SGLANG_DSPARK_TORCHAIR_FIA=0 to use the host-metadata "
                     "fallback."
                 ) from exc
-            self._dspark_torchair_fia_op = (
-                torchair.ops.npu_fused_infer_attention_score
-            )
-            logger.info(
-                "DSPark draft uses TorchAir GE BSND FIA with device seq_lens."
-            )
+            self._dspark_torchair_fia_op = torchair.ops.npu_fused_infer_attention_score
+            logger.info("DSPark draft uses TorchAir GE BSND FIA with device seq_lens.")
         else:
             self._dspark_torchair_fia_op = None
         # Compatibility alias for the already-migrated prefetch plumbing.
@@ -2002,9 +1998,7 @@ class AscendAttnBackend(AttentionBackend):
                     actual_seq_lengths_kv=actual_seq_lengths_kv,
                     sparse_mode=3,
                 )
-                return attn_output.view(
-                    -1, layer.tp_q_head_num * layer.v_head_dim
-                )
+                return attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
             if (
                 self.use_dspark_torchair_fia
@@ -2014,8 +2008,10 @@ class AscendAttnBackend(AttentionBackend):
                 # Pay the exact D2H only on that uncommon eager fallback.
                 block_q = int(forward_batch.spec_info.draft_token_num)
                 actual_seq_lengths_kv = (
-                    self.forward_metadata.seq_lens.to(torch.int64) + block_q
-                ).cpu().tolist()
+                    (self.forward_metadata.seq_lens.to(torch.int64) + block_q)
+                    .cpu()
+                    .tolist()
+                )
             elif self.forward_metadata.seq_lens_cpu_int is None:
                 actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list
             else:
@@ -2191,9 +2187,9 @@ class AscendAttnBackend(AttentionBackend):
                 # V2 consumes it with BNSD queries; keep the cache unchanged.
                 batch_size = len(actual_seq_lengths_kv)
                 query_seq_len = self.speculative_num_draft_tokens
-                assert q_nope.shape[0] == batch_size * query_seq_len, (
-                    "FIAS V2 target verify requires one fixed draft block per request"
-                )
+                assert (
+                    q_nope.shape[0] == batch_size * query_seq_len
+                ), "FIAS V2 target verify requires one fixed draft block per request"
                 if batch_size == 0:
                     attn_output = torch.empty_like(q_nope)
                 else:

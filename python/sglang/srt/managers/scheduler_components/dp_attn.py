@@ -36,11 +36,11 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
 )
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.dspark_components.dspark_diagnostics import (
     diagnostic_stage,
     get_diagnostics,
 )
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import require_mlp_tp_gather
 
 if TYPE_CHECKING:
@@ -162,10 +162,14 @@ class MLPSyncBatchInfo:
         info_width = local_info_tensor.numel()
         diag = get_diagnostics()
         if diag is not None:
-            diag.emit("mlp_collective", device=str(device),
-                      collective="all_reduce" if use_all_reduce else "all_gather",
-                      local_info=local_info_tensor.tolist() if str(device) == "cpu" else None,
-                      dp_size=self.dp_size, attn_tp_size=self.tp_size)
+            diag.emit(
+                "mlp_collective",
+                device=str(device),
+                collective="all_reduce" if use_all_reduce else "all_gather",
+                local_info=local_info_tensor.tolist() if str(device) == "cpu" else None,
+                dp_size=self.dp_size,
+                attn_tp_size=self.tp_size,
+            )
         # Inactive max_world_size slots must decode as IDLE. repeat() (not
         # expand().contiguous()) so the buffer never aliases fallback_tensor:
         # at world size 1 the expanded view is already contiguous, contiguous()

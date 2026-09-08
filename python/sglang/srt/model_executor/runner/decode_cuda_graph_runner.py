@@ -44,7 +44,6 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
-from sglang.srt.speculative.dspark_components.dspark_diagnostics import diagnostic_stage
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     SharedReadEnds,
@@ -110,6 +109,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
 )
+from sglang.srt.speculative.dspark_components.dspark_diagnostics import diagnostic_stage
 from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import (
     empty_context,
@@ -229,9 +229,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.in_graph_metadata_prep_done: Optional[torch.cuda.Event] = None
 
         # --- core state ------------------------------------------------
-        self.enable_torch_compile = (
-            get_flags().capture.enable_torch_compile
-            or getattr(self, "force_npu_ge_compile", False)
+        self.enable_torch_compile = get_flags().capture.enable_torch_compile or getattr(
+            self, "force_npu_ge_compile", False
         )
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
@@ -1475,12 +1474,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # Replace only that tiny CPU head; all pointer-stable GPU copies
             # and attention-prep kernels remain queued exactly once.
             if self.buffer_registry.has_slot("seq_lens_cpu"):
-                seq_lens_cpu_buf = self.buffer_registry.get_slot(
-                    "seq_lens_cpu"
-                ).buffer
-                seq_lens_cpu_buf[:raw_bs].copy_(
-                    forward_batch.seq_lens_cpu[:raw_bs]
-                )
+                seq_lens_cpu_buf = self.buffer_registry.get_slot("seq_lens_cpu").buffer
+                seq_lens_cpu_buf[:raw_bs].copy_(forward_batch.seq_lens_cpu[:raw_bs])
             fb_view.seq_lens_sum = forward_batch.seq_lens_sum
 
             if not bound_was_sufficient:
@@ -1496,9 +1491,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     seq_lens_cpu_buf = self.buffer_registry.get_slot(
                         "seq_lens_cpu"
                     ).buffer
-                    seq_lens_cpu_buf[:raw_bs].copy_(
-                        forward_batch.seq_lens_cpu[:raw_bs]
-                    )
+                    seq_lens_cpu_buf[:raw_bs].copy_(forward_batch.seq_lens_cpu[:raw_bs])
                 fb_view.seq_lens_sum = forward_batch.seq_lens_sum
             init_replay_metadata()
 

@@ -1,5 +1,6 @@
 """Exercise the actual NPU execute override without launching device work."""
 
+import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -10,18 +11,30 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-@pytest.mark.parametrize("use_ge,mode,raw_bs", [
-    (True, ForwardMode.TARGET_VERIFY, 1),
-    (True, ForwardMode.TARGET_VERIFY, 4),
-    (False, ForwardMode.TARGET_VERIFY, 1),
-    (False, ForwardMode.IDLE, 0),
-])
+@pytest.mark.parametrize(
+    "use_ge,mode,raw_bs",
+    [
+        (True, ForwardMode.TARGET_VERIFY, 1),
+        (True, ForwardMode.TARGET_VERIFY, 4),
+        (False, ForwardMode.TARGET_VERIFY, 1),
+        (False, ForwardMode.IDLE, 0),
+    ],
+)
 @pytest.mark.parametrize("war_enabled", [False, True])
-def test_actual_npu_execute_records_only_after_replay(use_ge, mode, raw_bs, war_enabled):
+def test_actual_npu_execute_records_only_after_replay(
+    use_ge, mode, raw_bs, war_enabled
+):
     order = []
     runner = NPUGraphRunner.__new__(NPUGraphRunner)
+    # This fixture isolates the scheduler WAR event, not the independent
+    # Target graph reuse guard normally initialized by the runner constructor.
+    runner.target_graph_reuse_guard = False
+    runner._target_graph_reuse_done = None
     old_event = object()
     runner.model_runner = SimpleNamespace(
         shared_read_done_event=old_event,
@@ -50,7 +63,8 @@ def test_actual_npu_execute_records_only_after_replay(use_ge, mode, raw_bs, war_
     event = SimpleNamespace(record=lambda: order.append("record"))
     runner.device_module = SimpleNamespace(Event=lambda: event)
     runner.backend = SimpleNamespace(
-        replay=Mock(side_effect=replay), replay_with_input_update=Mock(side_effect=replay)
+        replay=Mock(side_effect=replay),
+        replay_with_input_update=Mock(side_effect=replay),
     )
     batch = SimpleNamespace(
         needs_forward_metadata_init=lambda: True,
@@ -66,8 +80,12 @@ def test_actual_npu_execute_records_only_after_replay(use_ge, mode, raw_bs, war_
     ):
         result = runner.execute(batch)
 
-    assert order == (["prepare", "replay", "record"] if war_enabled else ["prepare", "replay"])
-    assert runner.model_runner.shared_read_done_event is (event if war_enabled else None)
+    assert order == (
+        ["prepare", "replay", "record"] if war_enabled else ["prepare", "replay"]
+    )
+    assert runner.model_runner.shared_read_done_event is (
+        event if war_enabled else None
+    )
     assert result.hidden_states.shape[0] == runner.raw_num_token
     if use_ge:
         runner.backend.replay.assert_called_once()
@@ -79,7 +97,9 @@ def test_actual_npu_execute_records_only_after_replay(use_ge, mode, raw_bs, war_
         )
 
 
-@pytest.mark.parametrize("prefill,produced", [(False, False), (False, True), (True, False)])
+@pytest.mark.parametrize(
+    "prefill,produced", [(False, False), (False, True), (True, False)]
+)
 def test_dspark_fallback_keeps_whole_worker_fence(monkeypatch, prefill, produced):
     from sglang.srt.speculative.dspark_components import dspark_worker_v2 as module
 
@@ -111,3 +131,7 @@ def test_dspark_fallback_keeps_whole_worker_fence(monkeypatch, prefill, produced
     else:
         assert worker.last_shared_read_runner is worker.model_runner
         assert worker.model_runner.shared_read_done_event is None
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

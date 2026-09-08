@@ -23,6 +23,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
+from sglang.srt.speculative.dspark_components.dspark_diagnostics import diagnostic_stage
 from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
 from sglang.srt.speculative.spec_info import (
     SpeculativeAlgorithm,
@@ -30,7 +31,6 @@ from sglang.srt.speculative.spec_info import (
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import draft_tp_context
-from sglang.srt.speculative.dspark_components.dspark_diagnostics import diagnostic_stage
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import is_pin_memory_available
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
@@ -554,9 +554,7 @@ class DraftBlockProposer:
             getattr(forward_batch, "num_token_non_padded", None) is None
             and not defer_device_metadata
         ):
-            num_token_non_padded = self._stage_num_token_non_padded(
-                num_tokens, device
-            )
+            num_token_non_padded = self._stage_num_token_non_padded(num_tokens, device)
             if num_token_non_padded is not None:
                 forward_batch.num_token_non_padded = num_token_non_padded
         forward_batch.num_token_non_padded_cpu = num_tokens

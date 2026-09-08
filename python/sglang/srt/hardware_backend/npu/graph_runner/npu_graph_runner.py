@@ -42,8 +42,8 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
-from sglang.srt.speculative.dspark_components.dspark_diagnostics import diagnostic_stage
 from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
+from sglang.srt.speculative.dspark_components.dspark_diagnostics import diagnostic_stage
 from sglang.srt.utils import (
     empty_context,
     get_bool_env_var,
@@ -381,7 +381,9 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             )
         else:
             assert isinstance(output, PPProxyTensors)
-            result = PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
+            result = PPProxyTensors(
+                {k: v[: self.bs] for k, v in output.tensors.items()}
+            )
 
         if self.target_graph_reuse_guard:
             # One event on the existing forward stream, at the same completion

@@ -304,16 +304,10 @@ class DFlashAttention(nn.Module):
                     self.head_dim,
                     self.q_norm.variance_epsilon,
                 )
-                q, k, v = qkv.split(
-                    [self.q_size, self.kv_size, self.kv_size], dim=-1
-                )
+                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             else:
-                q, k, v = qkv.split(
-                    [self.q_size, self.kv_size, self.kv_size], dim=-1
-                )
-                q, k = apply_qk_norm(
-                    q, k, self.q_norm, self.k_norm, self.head_dim
-                )
+                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+                q, k = apply_qk_norm(q, k, self.q_norm, self.k_norm, self.head_dim)
                 q, k = self.rotary_emb(positions, q, k)
         if self.attention_sink_bias is None:
             attn_output = self.attn(q, k, v, forward_batch)

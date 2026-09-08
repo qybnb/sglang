@@ -1,3 +1,4 @@
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -8,6 +9,9 @@ from sglang.srt.managers.scheduler_components.profiler_manager import (
     SchedulerProfilerManager,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 def make_manager(*, tp_rank: int = 0, profile_ranks: str = "0"):
@@ -123,3 +127,7 @@ def test_selected_rank_stop_has_no_cross_rank_barrier(tmp_path):
 
     assert result.success
     barrier.assert_not_called()
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

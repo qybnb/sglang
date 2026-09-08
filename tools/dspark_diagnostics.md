@@ -19,8 +19,8 @@ the old `target_reuse` diagnostic A/B, explicitly set the independent guard to
 `0` on **all four nodes**; otherwise the production fence also protects the
 nominal diagnostic-off arm and the comparison no longer isolates that wait.
 
-Set `SGLANG_DSPARK_DIAG_DIR` to a **new absolute directory per run**. The cluster
-launcher forwards it to all four nodes. Each rank writes `rankNNN_pidPID.jsonl`
+Set `SGLANG_DSPARK_DIAG_DIR` to a **new absolute directory per run** on every
+node through your launch environment. Each rank writes `rankNNN_pidPID.jsonl`
 locally, without depending on HTTP, Gloo or scheduler IPC. Copy the three remote
 directories back to a collection directory to obtain all 64 ranks.
 

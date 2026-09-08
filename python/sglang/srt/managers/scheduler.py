@@ -101,11 +101,6 @@ from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs, exportable_env_vars
-from sglang.srt.speculative.dspark_components.dspark_diagnostics import (
-    diagnostic_stage,
-    get_diagnostics,
-    start_diagnostics,
-)
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
@@ -305,6 +300,11 @@ from sglang.srt.server_args import PortArgs, ServerArgs, compute_world_size
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
+from sglang.srt.speculative.dspark_components.dspark_diagnostics import (
+    diagnostic_stage,
+    get_diagnostics,
+    start_diagnostics,
+)
 from sglang.srt.speculative.eagle_utils import (
     get_draft_recurrent_hidden_state_spec_from_config,
 )
@@ -1797,11 +1797,14 @@ class Scheduler(
         runner.shared_read_done_event = None
         diag = get_diagnostics()
         if diag is not None:
-            diag.emit("war_dependency", runner=id(runner),
-                      event_object=id(ev) if ev is not None else None,
-                      coarse=ev is None or envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get(),
-                      schedule_torch_stream_id=self.schedule_stream.stream_id,
-                      forward_torch_stream_id=self.forward_stream.stream_id)
+            diag.emit(
+                "war_dependency",
+                runner=id(runner),
+                event_object=id(ev) if ev is not None else None,
+                coarse=ev is None or envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get(),
+                schedule_torch_stream_id=self.schedule_stream.stream_id,
+                forward_torch_stream_id=self.forward_stream.stream_id,
+            )
         if ev is not None and not envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get():
             self.schedule_stream.wait_event(ev)
         else:

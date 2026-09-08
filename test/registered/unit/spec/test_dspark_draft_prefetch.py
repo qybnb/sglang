@@ -5,13 +5,13 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.runtime_context import get_context
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
     should_defer_device_mlp_sync_metadata,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftBlockProposer,

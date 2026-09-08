@@ -250,12 +250,17 @@ class DFlashDraftInputV2(SpecInput):
         nxt_kv_lens = self._prepare_nxt_kv_lens_gpu_buf[:bs]
         diag = get_diagnostics()
         if diag is not None:
-            diag.emit("kv_allocation_plan", needed_tokens=num_needed_tokens,
-                      reserve=reserve, page_size=page_size,
-                      cur_host=cur_kv_lens_host, next_host=nxt_kv_lens_host,
-                      cur_device=tensor_description(cur_kv_lens),
-                      next_device=tensor_description(nxt_kv_lens),
-                      separate_plan_stream=plan_stream is not None)
+            diag.emit(
+                "kv_allocation_plan",
+                needed_tokens=num_needed_tokens,
+                reserve=reserve,
+                page_size=page_size,
+                cur_host=cur_kv_lens_host,
+                next_host=nxt_kv_lens_host,
+                cur_device=tensor_description(cur_kv_lens),
+                next_device=tensor_description(nxt_kv_lens),
+                separate_plan_stream=plan_stream is not None,
+            )
 
         if plan_stream is not None:
             with plan_stream_ctx:

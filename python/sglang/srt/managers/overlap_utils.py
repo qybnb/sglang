@@ -8,13 +8,13 @@ import torch
 
 from sglang.kernels.ops.speculative.gather_spec_extras import gather_spec_extras
 from sglang.srt.environ import envs
-from sglang.srt.speculative.dspark_components.dspark_diagnostics import (
-    diagnostic_stage,
-    get_diagnostics,
-)
 from sglang.srt.runtime_context import (
     get_exec,
     get_spec,
+)
+from sglang.srt.speculative.dspark_components.dspark_diagnostics import (
+    diagnostic_stage,
+    get_diagnostics,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 
@@ -675,11 +675,15 @@ class FutureMap:
             assert self.new_seq_lens_cpu_pinned is not None
             diag = get_diagnostics()
             if diag is not None:
-                diag.emit("d2h_dependency", generation=self.seq_lens_d2h_issued + 1,
-                          publish_event_object=id(self.publish_ready),
-                          previous_copy_event_object=id(self.seq_lens_d2h_copy_done),
-                          copy_torch_stream_id=self.fwd_prepare_d2h_stream.stream_id,
-                          bytes=self.new_seq_lens_buf.numel() * self.new_seq_lens_buf.element_size())
+                diag.emit(
+                    "d2h_dependency",
+                    generation=self.seq_lens_d2h_issued + 1,
+                    publish_event_object=id(self.publish_ready),
+                    previous_copy_event_object=id(self.seq_lens_d2h_copy_done),
+                    copy_torch_stream_id=self.fwd_prepare_d2h_stream.stream_id,
+                    bytes=self.new_seq_lens_buf.numel()
+                    * self.new_seq_lens_buf.element_size(),
+                )
             self.fwd_prepare_d2h_stream.wait_event(self.publish_ready)
             with torch.get_device_module(self.device).stream(
                 self.fwd_prepare_d2h_stream

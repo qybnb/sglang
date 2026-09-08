@@ -502,9 +502,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # exact post-accept host mirror is still in flight.  The resolver replaces
     # it before NPUGraph.update/replay; all other paths leave both fields None.
     seq_lens_cpu_upper_bound: Optional[torch.Tensor] = None
-    deferred_seq_lens_cpu_resolver: Optional[
-        Callable[[], Tuple[torch.Tensor, int]]
-    ] = None
+    deferred_seq_lens_cpu_resolver: Optional[Callable[[], Tuple[torch.Tensor, int]]] = (
+        None
+    )
 
     # For logprob
     top_logprobs_nums: Optional[List[int]] = None

@@ -57,8 +57,7 @@ def test_direct_ge_backend_forces_post_replay_fence():
     backend = _backend(SharedReadEnds.IN_REPLAY)
 
     assert (
-        runner._resolve_shared_read_ends(backend, DECODE)
-        is SharedReadEnds.POST_REPLAY
+        runner._resolve_shared_read_ends(backend, DECODE) is SharedReadEnds.POST_REPLAY
     )
     backend.shared_read_ends.assert_not_called()
 

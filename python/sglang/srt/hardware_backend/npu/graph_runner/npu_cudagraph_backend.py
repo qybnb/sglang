@@ -12,6 +12,7 @@ non-NPU hosts.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, contextmanager
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
@@ -27,8 +28,8 @@ from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
 )
-from sglang.srt.utils import empty_context, get_bool_env_var
 from sglang.srt.speculative.dspark_components.dspark_diagnostics import get_diagnostics
+from sglang.srt.utils import empty_context, get_bool_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -62,6 +63,13 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         )
         self._enable_torch_compile = getattr(
             cuda_graph_runner, "enable_torch_compile", False
+        )
+        # Reuse one device-bound worker for graph input updates.
+        self._update_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="npu-graph-update",
+            initializer=self._device_module.set_device,
+            initargs=(self._device_id,),
         )
 
     @contextmanager
@@ -168,10 +176,16 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
 
         graph = self._graphs[shape_key]
 
-        self._device_module.set_device(self._device_id)
         diag = get_diagnostics()
-        token = diag.begin("npugraph_update", key=str(shape_key)) if diag is not None else None
-        graph.update(cpu_update_input=cpu_update_input)
+        token = (
+            diag.begin("npugraph_update", key=str(shape_key))
+            if diag is not None
+            else None
+        )
+        update_future = self._update_executor.submit(
+            graph.update, cpu_update_input=cpu_update_input
+        )
+        update_future.result()
         if diag is not None:
             diag.end(token)
             token = diag.begin("npugraph_replay", key=str(shape_key))
@@ -181,6 +195,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:
+        self._update_executor.shutdown(wait=True, cancel_futures=True)
         self._graphs.clear()
         self._outputs.clear()
         self._pool = None

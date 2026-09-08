@@ -1,6 +1,12 @@
+import sys
+
+import pytest
 import torch
 
 from sglang.srt.hardware_backend.npu import allocator_npu
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 def test_alloc_extend_counts_pages_from_cpu_metadata(monkeypatch):
@@ -26,9 +32,7 @@ def test_alloc_extend_counts_pages_from_cpu_metadata(monkeypatch):
         return None
 
     monkeypatch.setattr(allocator_npu, "get_num_new_pages", fake_get_num_new_pages)
-    monkeypatch.setattr(
-        allocator_npu, "alloc_extend_naive", fake_alloc_extend_naive
-    )
+    monkeypatch.setattr(allocator_npu, "alloc_extend_naive", fake_alloc_extend_naive)
 
     result = allocator.alloc_extend(
         prefix_lens=torch.tensor([999], dtype=torch.int64),
@@ -43,3 +47,7 @@ def test_alloc_extend_counts_pages_from_cpu_metadata(monkeypatch):
     assert allocator.free_pages.numel() == 44
     assert result.shape == (1,)
     assert result.dtype == torch.int32
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

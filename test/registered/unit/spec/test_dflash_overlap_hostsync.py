@@ -306,9 +306,7 @@ class TestNpuSeqLensPublishPrefetch(CustomTestCase):
         future_map = object.__new__(FutureMap)
         future_map.device = torch.device("cpu")
         future_map.new_seq_lens_buf = torch.zeros(8, dtype=torch.int64)
-        future_map.new_seq_lens_cpu_pinned = torch.full(
-            (8,), -1, dtype=torch.int64
-        )
+        future_map.new_seq_lens_cpu_pinned = torch.full((8,), -1, dtype=torch.int64)
         future_map.fwd_prepare_d2h_stream = _FakeCopyStream()
         future_map.prefetch_seq_lens_cpu_on_publish = True
         future_map.seq_lens_d2h_copy_done = None

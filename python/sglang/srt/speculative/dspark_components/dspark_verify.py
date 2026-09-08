@@ -32,6 +32,7 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, Forw
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
+from sglang.srt.speculative.dspark_components.dspark_diagnostics import diagnostic_stage
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
@@ -46,7 +47,6 @@ from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_METHOD,
     sample_simulated_acc_len,
 )
-from sglang.srt.speculative.dspark_components.dspark_diagnostics import diagnostic_stage
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
 
@@ -336,6 +336,7 @@ class TargetVerifyExecutor:
         )
 
         if seq_lens_cpu_resolver is not None:
+
             def resolve_target_seq_lens_cpu():
                 seq_lens_cpu_resolver()
                 exact_live = batch.seq_lens_cpu

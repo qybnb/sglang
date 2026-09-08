@@ -43,18 +43,18 @@ from sglang.srt.speculative.dspark_components.dspark_config import (
     draft_is_deepseek_v4,
     resolve_runtime_config,
 )
+from sglang.srt.speculative.dspark_components.dspark_diagnostics import (
+    configure_diagnostics,
+    diagnostic_stage,
+)
 from sglang.srt.speculative.dspark_components.dspark_draft import (
-    DraftBlockResult,
     DraftBlockProposer,
+    DraftBlockResult,
     DraftProposal,
     make_next_draft_input,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
     maybe_build_draft_sampler,
-)
-from sglang.srt.speculative.dspark_components.dspark_diagnostics import (
-    configure_diagnostics,
-    diagnostic_stage,
 )
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
@@ -1282,9 +1282,32 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         last_correct_step_indices = commit_lens.to(torch.int64) - 1
         mamba_steps_to_track = None
+        mamba_track_indices = batch.mamba_track_indices
 
-        if batch.mamba_track_indices is not None:
+        if mamba_track_indices is not None:
             mamba_track_interval = mamba_track_grid(batch.tree_cache.page_size)
+            seq_lens_cpu = batch.seq_lens_cpu
+            if (
+                is_npu()
+                and seq_lens_cpu is not None
+                and seq_lens_cpu.device.type == "cpu"
+                and seq_lens_cpu.ndim == 1
+                and seq_lens_cpu.numel() == seq_lens_pre_verify.numel()
+                and seq_lens_cpu.dtype in (torch.int32, torch.int64)
+            ):
+                # Verify restores the CPU prefix lengths before the forward.
+                # Acceptance can commit at most this many tokens, so this
+                # check needs no device readback. Passing None also avoids
+                # the NPU backend's conv-state self-copy for untracked rows.
+                if all(
+                    seq_len >= 0
+                    and seq_len // mamba_track_interval
+                    == (seq_len + self.verify_num_draft_tokens) // mamba_track_interval
+                    for seq_len in seq_lens_cpu.tolist()
+                ):
+                    mamba_track_indices = None
+
+        if mamba_track_indices is not None:
             to_track_mask = (
                 seq_lens_pre_verify // mamba_track_interval
                 != seq_lens_post_verify // mamba_track_interval
@@ -1304,7 +1327,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         attn_backend.update_mamba_state_after_mtp_verify(
             last_correct_step_indices=last_correct_step_indices,
-            mamba_track_indices=batch.mamba_track_indices,
+            mamba_track_indices=mamba_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
             model=self.target_worker.model_runner.model,
             req_pool_indices=batch.req_pool_indices,
