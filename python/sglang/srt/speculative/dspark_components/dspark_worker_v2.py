@@ -383,7 +383,7 @@ class DSparkWorkerV2(BaseSpecWorker):
     @property
     def last_shared_read_runner(self):
         # The scheduler's next allocation can mutate the shared req_to_token
-        # table.  A successful prefetched Draft GE replay reads that table
+        # table. A successful prefetched Draft ACLGraph replay reads that table
         # after Target has finished, so its POST_REPLAY event—not Target's
         # earlier event—is the only sound WAR boundary.  Keeping only a narrow
         # draft-input reuse fence is insufficient: req_to_token would still be
@@ -434,7 +434,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._draft_prefetch_device_seq_lens = is_npu() and bool(
             getattr(
                 self.draft_model_runner.attn_backend,
-                "use_dspark_torchair_fia",
+                "use_dspark_device_verify",
                 False,
             )
         )
@@ -482,13 +482,13 @@ class DSparkWorkerV2(BaseSpecWorker):
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )
         # Device sequence lengths are valid only when the draft runner really
-        # captured the TorchAir GE graph. If graph capture was disabled for low
+        # captured a device-length ACLGraph. If graph capture was disabled for low
         # memory, retain the functional host-metadata prefetch fallback.
         draft_graph_runner = self.draft_model_runner.decode_cuda_graph_runner
         self._draft_prefetch_device_seq_lens = bool(
             is_npu()
             and draft_graph_runner is not None
-            and getattr(draft_graph_runner, "use_dspark_ge_graph", False)
+            and getattr(draft_graph_runner, "use_dspark_device_seq_lens", False)
         )
 
     def _maybe_build_draft_sampler(self, *, available_memory_gb: float):
@@ -945,7 +945,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         next_draft_input.draft_prefetch_direct = produced
         if produced:
-            # NpuGEGraphBackend publishes the sound POST_REPLAY event on the
+            # NPUGraphRunner publishes the sound POST_REPLAY event on the
             # draft runner.  The next scheduler iteration must consume that
             # event before modifying the shared req_to_token allocation map.
             self._last_shared_read_runner = self.draft_model_runner
@@ -1217,7 +1217,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
         # Keep the critical enqueue path short.  The observer can do CPU
         # bookkeeping (and optional debug D2H staging) after the prefetched
-        # Draft GE graph/Markov tail is already in flight, so those tasks are
+        # Draft ACLGraph/Markov tail is already in flight, so those tasks are
         # covered by useful NPU work instead of delaying its launch.
         self._observers.observe_verify_step(
             forward_ct=int(batch.forward_iter),

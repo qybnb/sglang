@@ -229,9 +229,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.in_graph_metadata_prep_done: Optional[torch.cuda.Event] = None
 
         # --- core state ------------------------------------------------
-        self.enable_torch_compile = get_flags().capture.enable_torch_compile or getattr(
-            self, "force_npu_ge_compile", False
-        )
+        self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
         self.require_mlp_tp_gather = (
@@ -341,11 +339,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
             model_runner, self.captured_req_width
         )
-        if getattr(self, "force_npu_ge_compile", False):
-            # Every GE artifact contains torchair.ops FIA and therefore every
-            # captured bucket must be compiled, independently of the global
-            # --torch-compile-max-bs setting.
-            self.compile_bs = list(self.capture_bs)
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
 
@@ -395,9 +388,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             else 0
         )
 
-        if self.enable_torch_compile and not getattr(
-            self, "force_npu_ge_compile", False
-        ):
+        if self.enable_torch_compile:
             set_torch_compile_config()
 
         if self.model_runner.lora_manager is not None:
@@ -1051,11 +1042,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.warmup()
         # warmup() may disable torch.compile for a model whose _can_torch_compile
         # is False; recompute the compile bucket so capture matches.
-        if (
-            self.enable_torch_compile
-            and not getattr(self, "force_npu_ge_compile", False)
-            and not get_flags().capture.enable_torch_compile
-        ):
+        if self.enable_torch_compile and not get_flags().capture.enable_torch_compile:
             self.enable_torch_compile = False
             _, self.compile_bs = get_batch_sizes_to_capture(
                 self.model_runner, self.captured_req_width
@@ -1077,13 +1064,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # plan reads these as the per-request KV length, and the prefill wrapper
         # (DLLM_EXTEND) asserts kv_len >= qo_len, so restore the fill value the
         # captured graph needs before capturing.
-        capture_seq_len_fill_value = (
-            max(1, self.seq_len_fill_value)
-            if getattr(self, "force_npu_ge_compile", False)
-            else self.seq_len_fill_value
-        )
-        self.buffers.seq_lens.fill_(capture_seq_len_fill_value)
-        self.buffers.seq_lens_cpu.fill_(capture_seq_len_fill_value)
+        self.buffers.seq_lens.fill_(self.seq_len_fill_value)
+        self.buffers.seq_lens_cpu.fill_(self.seq_len_fill_value)
         # Capture runs real forwards, so a mid-serving recapture would index --
         # and write KV -- through the previous batch's live values. Replay is
         # already covered by the registry's padding policy.

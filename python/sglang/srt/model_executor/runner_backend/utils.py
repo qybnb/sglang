@@ -67,13 +67,6 @@ def resolve_decode_backend(
     enable_memory_saver = get_exec().features.enable_memory_saver
 
     if model_runner.device == "npu":
-        if getattr(cuda_graph_runner, "use_dspark_ge_graph", False):
-            from sglang.srt.hardware_backend.npu.graph_runner.npu_ge_graph_backend import (
-                NpuGEGraphBackend,
-            )
-
-            return NpuGEGraphBackend(cuda_graph_runner)
-
         from sglang.srt.hardware_backend.npu.graph_runner.npu_cudagraph_backend import (
             NPUCudaGraphBackend,
         )

@@ -454,7 +454,7 @@ class DraftBlockProposer:
             draft_input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
         if draft_input.draft_prefetch_block_table_bound_cpu is not None:
-            # This is an allocation bound only. The Ascend DSPark GE graph
+            # This is an allocation bound only. The Ascend DSPark Tensor FIA
             # reads the exact prefix lengths from batch.seq_lens on device.
             draft_seq_lens_cpu = draft_input.draft_prefetch_block_table_bound_cpu
             draft_seq_lens_sum = None

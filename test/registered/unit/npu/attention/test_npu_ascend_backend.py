@@ -32,6 +32,7 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     AscendAttnBackend,
     AscendAttnMaskBuilder,
     AscendAttnMultiStepDraftBackend,
+    AttentionType,
     ForwardMetadata,
     _expand_dsa_sparse_indices,
     _reshape_kv_for_fia_nz,
@@ -689,45 +690,45 @@ class TestGetCudaGraphSeqLenFillValue(unittest.TestCase):
 
 
 class TestIdleDpTargetVerify(unittest.TestCase):
-    def test_dspark_ge_fia_uses_bsnd_device_lengths(self):
+    def test_dspark_tensor_fia_passes_device_prefix_lengths_unchanged(self):
         backend = object.__new__(AscendAttnBackend)
         backend.use_mla = False
         backend.graph_mode = True
-        backend.use_dspark_torchair_fia = True
-        backend.page_size = 4
-        backend.mtp_mask = torch.zeros((8, 8), dtype=torch.bool)
+        backend.use_dspark_tensor_fia = True
+        backend.page_size = 128
         backend.forward_metadata = ForwardMetadata(
             seq_lens=torch.tensor([5, 0], dtype=torch.int64),
             block_tables=torch.tensor([[0, 1], [0, 0]], dtype=torch.int32),
         )
         backend.token_to_kv_pool = SimpleNamespace(
-            get_key_buffer=lambda _layer_id: torch.zeros((16, 1, 4)),
-            get_value_buffer=lambda _layer_id: torch.zeros((16, 1, 4)),
+            get_key_buffer=lambda _layer_id: torch.zeros((256, 1, 64)),
+            get_value_buffer=lambda _layer_id: torch.zeros((256, 1, 64)),
         )
-        ge_fia = MagicMock(
-            side_effect=lambda query, *_args, **_kwargs: (torch.zeros_like(query), None)
+        tensor_fia = MagicMock(
+            side_effect=lambda query, *_args, **_kwargs: torch.zeros_like(query)
         )
-        backend._dspark_torchair_fia_op = ge_fia
+        backend._dspark_tensor_fia_op = tensor_fia
 
         mode = MagicMock()
         mode.is_target_verify.return_value = True
         forward_batch = SimpleNamespace(
-            num_token_non_padded_cpu=6,
+            num_token_non_padded_cpu=7,
             forward_mode=mode,
-            spec_info=SimpleNamespace(draft_token_num=3),
+            spec_info=SimpleNamespace(draft_token_num=7),
         )
         layer = SimpleNamespace(
             layer_id=0,
-            tp_q_head_num=2,
+            tp_q_head_num=4,
             tp_k_head_num=1,
             tp_v_head_num=1,
-            qk_head_dim=4,
-            v_head_dim=4,
+            qk_head_dim=64,
+            v_head_dim=64,
             scaling=0.5,
+            attn_type=AttentionType.ENCODER_ONLY,
         )
 
         output = backend.forward_mtp(
-            q=torch.randn((6, 8)),
+            q=torch.randn((14, 256), dtype=torch.bfloat16),
             k=None,
             v=None,
             layer=layer,
@@ -735,12 +736,16 @@ class TestIdleDpTargetVerify(unittest.TestCase):
             save_kv_cache=False,
         )
 
-        self.assertEqual(output.shape, (6, 8))
-        call = ge_fia.call_args
-        self.assertEqual(call.args[0].shape, (2, 3, 2, 4))
-        self.assertEqual(call.kwargs["input_layout"], "BSND")
-        self.assertEqual(call.kwargs["actual_seq_lengths"].tolist(), [3, 0])
-        self.assertEqual(call.kwargs["actual_seq_lengths_kv"].tolist(), [8, 0])
+        self.assertEqual(output.shape, (14, 256))
+        call = tensor_fia.call_args
+        self.assertEqual(call.args[0].shape, (14, 4, 64))
+        # Padding remains zero and the native kernel adds the seven draft
+        # slots. Python must not cast, copy, or resolve these lengths on CPU.
+        self.assertEqual(call.args[4].tolist(), [5, 0])
+        self.assertEqual(
+            call.args[4].data_ptr(), backend.forward_metadata.seq_lens.data_ptr()
+        )
+        self.assertEqual(call.kwargs, {"scale": 0.5})
 
     def test_empty_target_verify_metadata(self):
         backend = object.__new__(AscendAttnBackend)

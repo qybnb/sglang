@@ -379,38 +379,58 @@ class AscendAttnBackend(AttentionBackend):
             isinstance(self.token_to_kv_pool, SWAKVPool)
             and self.token_to_kv_pool.swa_layer_nums > 0
         )
-        # DSPark's fixed-width dense draft runs as a TorchAir GE graph.  Its FIA
-        # path uses BSND page attention so both query and KV sequence lengths
-        # can remain device tensors.  Keep this backend-specific: the target
-        # Kimi-K3 hybrid backend still uses host FIA metadata.
+        # Only the explicitly selected Tensor FIA consumes device prefix lengths
+        # in ACLGraph. Target Kimi-K3 attention still needs exact host metadata.
         spec_algorithm = model_runner.spec_algorithm
-        self.use_dspark_torchair_fia = (
-            get_spec().enable_draft_prefetch
-            and get_bool_env_var("SGLANG_DSPARK_TORCHAIR_FIA", "True")
+        self.use_dspark_tensor_fia = (
+            get_bool_env_var("SGLANG_DSPARK_FIA_TENSOR", "False")
             and model_runner.is_draft_worker
-            and spec_algorithm is not None
-            and spec_algorithm.is_dspark()
-            and not self.use_mla
-            and not self.is_hybrid_swa
-            and not getattr(self.token_to_kv_pool, "use_hnd", False)
-            and not self.token_to_kv_pool.is_quantized_kv_cache
         )
-        if self.use_dspark_torchair_fia:
-            try:
-                import torchair
-            except ImportError as exc:
-                raise ImportError(
-                    "DSPark device-seq prefetch requires TorchAir GE support. "
-                    "Set SGLANG_DSPARK_TORCHAIR_FIA=0 to use the host-metadata "
-                    "fallback."
-                ) from exc
-            self._dspark_torchair_fia_op = torchair.ops.npu_fused_infer_attention_score
-            logger.info("DSPark draft uses TorchAir GE BSND FIA with device seq_lens.")
-        else:
-            self._dspark_torchair_fia_op = None
-        # Compatibility alias for the already-migrated prefetch plumbing.
-        self.use_dspark_device_verify = self.use_dspark_torchair_fia
-        self.needs_cpu_seq_lens = not self.use_dspark_torchair_fia
+        self._dspark_tensor_fia_op = None
+        if self.use_dspark_tensor_fia:
+            cfg = model_runner.model_config.hf_text_config
+            if (
+                not get_spec().enable_draft_prefetch
+                or spec_algorithm is None
+                or not spec_algorithm.is_dspark()
+                or self.enable_torch_compile
+                or self.use_mla
+                or self.is_hybrid_swa
+                or self.use_sliding_window_kv_pool
+                or self.use_fias_v2_bsnd
+                or not self.use_fia
+                or getattr(self.token_to_kv_pool, "use_hnd", False)
+                or self.token_to_kv_pool.is_quantized_kv_cache
+                or self.page_size != 128
+                or self.speculative_num_draft_tokens != 7
+                or getattr(cfg, "head_dim", None) != 64
+                or getattr(cfg, "num_attention_heads", 0) != 64
+                or getattr(cfg, "num_key_value_heads", 0) != 16
+                or get_parallel().attn_tp_size != 16
+                or getattr(cfg, "is_causal", False)
+                or any(
+                    t != "full_attention"
+                    for t in (getattr(cfg, "layer_types", None) or [])
+                )
+            ):
+                raise ValueError(
+                    "Experimental Tensor FIA requires K3 dense DSPARK, block=7, "
+                    "BF16 ND KV, head_dim=64, local Q/KV heads=4/1, page=128, "
+                    "non-causal full attention, prefetch and plain ACLGraph. "
+                    "torch.compile and SGLANG_NPU_USE_FIAS_V2_BSND are unsupported."
+                )
+            from sglang.srt.hardware_backend.npu.attention.dspark_tensor_fia import (
+                DsparkTensorFIA,
+            )
+
+            self._dspark_tensor_fia_op = DsparkTensorFIA()
+            logger.warning(
+                "EXPERIMENTAL DSPark Tensor FIA: ACLGraph with NPU prefix lengths; "
+                "no GE or host FIA update for supported draft batches. "
+                "Use chip-matched native artifacts; A5 serving validation is pending."
+            )
+        self.use_dspark_device_verify = self.use_dspark_tensor_fia
+        self.needs_cpu_seq_lens = not self.use_dspark_device_verify
 
         # head num padding
         self.padding_size_list = [1, 2, 4, 8, 16, 32, 64, 128]
@@ -499,7 +519,7 @@ class AscendAttnBackend(AttentionBackend):
                 0
                 if forward_batch.seq_lens_cpu.numel() == 0
                 else forward_batch.seq_lens_cpu.max().item()
-                + (0 if self.use_dspark_torchair_fia else spec_tokens_per_req)
+                + (0 if self.use_dspark_device_verify else spec_tokens_per_req)
             )
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
@@ -624,6 +644,11 @@ class AscendAttnBackend(AttentionBackend):
         self.graph_mode = False
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        if self.use_dspark_tensor_fia and max_bs > 32:
+            raise ValueError(
+                "Tensor FIA only captures draft bs<=32; larger eager batches "
+                "require the exact host-length fallback"
+            )
         total_context_len = self.max_context_len + self.page_size - 1
         if self.speculative_num_draft_tokens is not None:
             total_context_len += self.speculative_num_draft_tokens
@@ -803,7 +828,7 @@ class AscendAttnBackend(AttentionBackend):
         metadata.block_tables[:bs, max_seq_pages:].fill_(0)
         metadata.block_tables[bs:, :].fill_(0)
 
-        if forward_mode.is_target_verify() and not self.use_dspark_torchair_fia:
+        if forward_mode.is_target_verify() and not self.use_dspark_device_verify:
             seq_lens = seq_lens + self.speculative_num_draft_tokens
         elif forward_mode.is_decode_or_idle() and spec_info is not None:
             seq_lens = seq_lens + self.speculative_step_offset_npu
@@ -1959,56 +1984,48 @@ class AscendAttnBackend(AttentionBackend):
                 query = query[: forward_batch.num_token_non_padded_cpu]
 
             if (
-                self.use_dspark_torchair_fia
-                and self.graph_mode
+                self.use_dspark_tensor_fia
                 and forward_batch.forward_mode.is_target_verify()
             ):
-                block_q = int(forward_batch.spec_info.draft_token_num)
-                graph_bs = self.forward_metadata.seq_lens.shape[0]
-                query_bsnd = query.view(
-                    graph_bs,
-                    block_q,
-                    layer.tp_q_head_num,
-                    layer.qk_head_dim,
-                )
-                prefix_lens = self.forward_metadata.seq_lens.to(torch.int64)
-                valid_rows = prefix_lens > 0
-                actual_seq_lengths = torch.where(
-                    valid_rows,
-                    torch.full_like(prefix_lens, block_q),
-                    torch.zeros_like(prefix_lens),
-                )
-                actual_seq_lengths_kv = torch.where(
-                    valid_rows,
-                    prefix_lens + block_q,
-                    torch.zeros_like(prefix_lens),
-                )
-                attn_output, _ = self._dspark_torchair_fia_op(
-                    query_bsnd,
-                    k_cache,
-                    v_cache,
-                    block_table=self.forward_metadata.block_tables,
-                    block_size=self.page_size,
-                    num_heads=layer.tp_q_head_num,
-                    num_key_value_heads=layer.tp_k_head_num,
-                    input_layout="BSND",
-                    atten_mask=self.mtp_mask,
-                    scale=layer.scaling,
-                    actual_seq_lengths=actual_seq_lengths,
-                    actual_seq_lengths_kv=actual_seq_lengths_kv,
-                    sparse_mode=3,
-                )
-                return attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+                if layer.attn_type != AttentionType.ENCODER_ONLY or sinks is not None:
+                    raise ValueError(
+                        "Tensor FIA requires non-causal attention without masks or sinks"
+                    )
+                bs = query.shape[0] // 7
+                if query.shape[0] != bs * 7:
+                    raise ValueError("Tensor FIA requires seven query tokens per row")
+                if 1 <= bs <= 32:
+                    attn_output = self._dspark_tensor_fia_op(
+                        query,
+                        k_cache,
+                        v_cache,
+                        self.forward_metadata.block_tables[:bs],
+                        self.forward_metadata.seq_lens[:bs],
+                        scale=layer.scaling,
+                    ).view(-1, layer.tp_q_head_num * layer.v_head_dim)
+                    if not self.graph_mode and query.shape[0] < num_token_padding:
+                        attn_output = torch.cat(
+                            (
+                                attn_output,
+                                attn_output.new_zeros(
+                                    num_token_padding - query.shape[0],
+                                    attn_output.shape[-1],
+                                ),
+                            )
+                        )
+                    return attn_output
+                if self.graph_mode:
+                    raise RuntimeError("Unsupported Tensor FIA graph bucket")
 
             if (
-                self.use_dspark_torchair_fia
+                self.use_dspark_tensor_fia
                 and forward_batch.forward_mode.is_target_verify()
             ):
-                # A batch outside the captured GE buckets must stay correct.
-                # Pay the exact D2H only on that uncommon eager fallback.
-                block_q = int(forward_batch.spec_info.draft_token_num)
+                # Eager overflow above 32 rows needs exact host lengths, not
+                # the allocation bound used by device-length prefetch. The
+                # ordinary supported ACLGraph path returns above without D2H.
                 actual_seq_lengths_kv = (
-                    (self.forward_metadata.seq_lens.to(torch.int64) + block_q)
+                    (self.forward_metadata.seq_lens[:bs].to(torch.int64) + 7)
                     .cpu()
                     .tolist()
                 )

@@ -74,19 +74,7 @@ def patch_model_npu(
     tp_group: GroupCoordinator,
 ):
     if enable_compile:
-        use_dspark_ge = bool(getattr(model, "_sglang_use_dspark_ge_graph", False))
-        if use_dspark_ge:
-            # BaseFusedOp resolves its platform implementation lazily on the
-            # first call.  Letting Dynamo trace that dispatch reaches
-            # is_cuda()/is_npu() and breaks a fullgraph GE compile.  Switch all
-            # fused ops to their compile-safe implementations before creating
-            # the callable.  Keep them in compile mode after this context: the
-            # GE backend retains and invokes the compiled callable at replay,
-            # unlike an outer NPUGraph which only retains recorded kernels.
-            from sglang.srt.compilation.torch_compile_decoration import _to_torch
-
-            _to_torch(model, reverse=False, num_tokens=num_tokens)
-        backend = get_compiler_backend("dspark_ge" if use_dspark_ge else "npugraph_ex")
+        backend = get_compiler_backend("npugraph_ex")
         yield torch.compile(
             torch.no_grad()(model.forward),
             fullgraph=True,
@@ -113,23 +101,13 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         from sglang.srt.compilation import torch_compile_decoration
 
         replay_attn_backend = attn_backend or model_runner.attn_backend
-        self.use_dspark_ge_graph = bool(
-            getattr(replay_attn_backend, "use_dspark_torchair_fia", False)
-        )
-        self.force_npu_ge_compile = self.use_dspark_ge_graph
-        if self.use_dspark_ge_graph:
-            model_runner.model._sglang_use_dspark_ge_graph = True
         torch_compile_decoration.patch_model = patch_model_npu
-        try:
-            super().__init__(
-                model_runner,
-                attn_backend=attn_backend,
-                speculative_num_steps=speculative_num_steps,
-                speculative_num_draft_tokens=speculative_num_draft_tokens,
-            )
-        finally:
-            if self.use_dspark_ge_graph:
-                delattr(model_runner.model, "_sglang_use_dspark_ge_graph")
+        super().__init__(
+            model_runner,
+            attn_backend=attn_backend,
+            speculative_num_steps=speculative_num_steps,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
+        )
         self.update_attr_name = None
         self.update_attr_type = None
         self.model_runner = model_runner
@@ -145,8 +123,13 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             and model_runner.spec_algorithm.is_dspark()
         )
         self.use_dspark_device_seq_lens = bool(
-            getattr(replay_attn_backend, "use_dspark_torchair_fia", False)
+            getattr(replay_attn_backend, "use_dspark_device_verify", False)
         )
+        if model_runner.is_draft_worker and model_runner.spec_algorithm.is_dspark():
+            logger.info(
+                "DSPark draft graph backend=ACLGraph; FIA lengths=%s",
+                "device Tensor" if self.use_dspark_device_seq_lens else "exact CPU",
+            )
         # Keep the experimentally effective target_reuse fence independent of
         # diagnostic logging/observation. Idle DP ranks also execute this runner
         # and can reach the next graph update before the previous replay ends.
@@ -271,7 +254,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
 
         # This override does not call DecodeCudaGraphRunner.execute().  Do not
         # inherit a previous iteration's event, or assume the base runner will
-        # publish one for the NPU/GE replay below.
+        # publish one for the NPU replay below.
         self.model_runner.shared_read_done_event = None
         log_graph_key = envs.SGLANG_LOG_DECODE_GRAPH_KEY.get()
         if log_graph_key:
@@ -342,7 +325,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             output = self.backend.replay(graph_key, forward_batch)
 
         if envs.SGLANG_ENABLE_WAR_BARRIER.get():
-            # NPU has no audited external in-graph read marker. GE also reads
+            # NPU has no audited external in-graph read marker. Replay also reads
             # metadata asynchronously. A post-launch event covers both; a
             # pre-replay event would let scheduler writes overtake the reads.
             self._publish_read_done(in_graph=False)

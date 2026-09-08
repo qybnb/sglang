@@ -280,13 +280,7 @@ class DFlashAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        # The eager NPU path uses the fused Triton implementation.  TorchAir
-        # full-graph capture cannot trace Triton's Ascend driver/launcher, so
-        # use the compile-safe tensor implementation for the GE draft graph.
-        # ``patch_model_npu`` switches RMSNorm and RoPE fused modules to their
-        # native implementations before compiling this path.
-        use_npu_fused_qkv = _is_npu and not torch.compiler.is_compiling()
-        if use_npu_fused_qkv:
+        if _is_npu:
             q, k, v = self.forward_prepare_npu(positions, hidden_states)
         else:
             qkv, _ = self.qkv_proj(hidden_states)

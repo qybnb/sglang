@@ -17,7 +17,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 @pytest.mark.parametrize(
-    "use_ge,mode,raw_bs",
+    "device_lengths,mode,raw_bs",
     [
         (True, ForwardMode.TARGET_VERIFY, 1),
         (True, ForwardMode.TARGET_VERIFY, 4),
@@ -27,7 +27,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 )
 @pytest.mark.parametrize("war_enabled", [False, True])
 def test_actual_npu_execute_records_only_after_replay(
-    use_ge, mode, raw_bs, war_enabled
+    device_lengths, mode, raw_bs, war_enabled
 ):
     order = []
     runner = NPUGraphRunner.__new__(NPUGraphRunner)
@@ -38,15 +38,15 @@ def test_actual_npu_execute_records_only_after_replay(
     old_event = object()
     runner.model_runner = SimpleNamespace(
         shared_read_done_event=old_event,
-        is_draft_worker=use_ge,
+        is_draft_worker=device_lengths,
         spec_algorithm=SimpleNamespace(is_dspark=lambda: True),
         model_config=SimpleNamespace(hf_config=SimpleNamespace(architectures=[])),
     )
-    runner.bs = 16 if use_ge else 2
+    runner.bs = 16 if device_lengths else 2
     runner.raw_bs = raw_bs
-    runner.raw_num_token = raw_bs * (7 if use_ge else 8)
+    runner.raw_num_token = raw_bs * (7 if device_lengths else 8)
     runner.is_dllm = False
-    runner.use_dspark_device_seq_lens = use_ge
+    runner.use_dspark_device_seq_lens = device_lengths
     runner.load_batch = Mock(side_effect=lambda *_: order.append("prepare"))
     runner._make_graph_key = lambda bs: bs
     runner._get_update_attr_name = lambda: "actual_seq_kvlen"
@@ -87,7 +87,7 @@ def test_actual_npu_execute_records_only_after_replay(
         event if war_enabled else None
     )
     assert result.hidden_states.shape[0] == runner.raw_num_token
-    if use_ge:
+    if device_lengths:
         runner.backend.replay.assert_called_once()
         runner.backend.replay_with_input_update.assert_not_called()
     else:
