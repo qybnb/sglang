@@ -348,6 +348,11 @@ class _SinglePassGatherer(ABC):
                     rank,
                     elastic_ep_enabled=get_exec().moe.elastic_ep_backend is not None,
                 )
+            elif get_exec().moe.deepep_mode == "auto":
+                # AUTO switches between normal and low-latency dispatch per
+                # forward. Count the selected experts before dispatch so both
+                # paths feed the same expert-distribution profile.
+                return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
             else:
                 raise NotImplementedError
 
