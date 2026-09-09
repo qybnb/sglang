@@ -54,6 +54,38 @@ def test_kimi_k3_dense_config_has_no_expert_location_config():
     assert KimiK3LinearForCausalLM.get_model_config_for_expert_location(config) is None
 
 
+def test_kimi_k3_allocates_redundant_physical_expert_slots():
+    config = SimpleNamespace(num_experts=896)
+
+    for redundant_experts, expected_physical_experts in [
+        (0, 896),
+        (32, 928),
+        (64, 960),
+    ]:
+        with patch.object(
+            kimi_k3,
+            "get_exec",
+            return_value=SimpleNamespace(
+                moe=SimpleNamespace(ep_num_redundant_experts=redundant_experts)
+            ),
+        ):
+            assert (
+                kimi_k3._get_num_physical_routed_experts(config)
+                == expected_physical_experts
+            )
+
+
+def test_kimi_k3_prefers_n_routed_experts_for_physical_slots():
+    config = SimpleNamespace(num_experts=896, n_routed_experts=384)
+
+    with patch.object(
+        kimi_k3,
+        "get_exec",
+        return_value=SimpleNamespace(moe=SimpleNamespace(ep_num_redundant_experts=32)),
+    ):
+        assert kimi_k3._get_num_physical_routed_experts(config) == 416
+
+
 def test_kimi_k3_topk_receives_expert_location_dispatch_info():
     expected_output = object()
     dispatch_info = object()

@@ -415,6 +415,18 @@ def _k3_symm_o_proj_out(o_proj: RowParallelLinear, x: torch.Tensor) -> torch.Ten
     )
 
 
+def _get_num_physical_routed_experts(config: KimiLinearConfig) -> int:
+    """Return the routed-expert slots allocated by FusedMoE/DeepEP.
+
+    Routing still selects among the checkpoint's logical experts. EPLB maps
+    those logical ids to this larger physical space when replicas are enabled.
+    """
+    num_logical_experts = getattr(config, "n_routed_experts", None)
+    if num_logical_experts is None:
+        num_logical_experts = config.num_experts
+    return num_logical_experts + get_exec().moe.ep_num_redundant_experts
+
+
 class KimiK3MoE(nn.Module):
     """K3 MoE with Latent MoE (experts run in moe_hidden_size space)."""
 
@@ -471,7 +483,7 @@ class KimiK3MoE(nn.Module):
         # Routed experts (operate in moe_hidden_size space)
         # gate_up_interleaved=False: K3 loads per-expert w1/w3 into non-interleaved layout
         self.experts = get_moe_impl_class(moe_quant_config)(
-            num_experts=getattr(config, "n_routed_experts", config.num_experts),
+            num_experts=_get_num_physical_routed_experts(config),
             top_k=config.num_experts_per_token,
             hidden_size=self.moe_hidden_size,
             intermediate_size=config.moe_intermediate_size,
