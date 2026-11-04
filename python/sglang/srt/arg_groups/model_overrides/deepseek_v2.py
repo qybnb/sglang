@@ -21,17 +21,20 @@ def _dsa_dcp_overrides(cfg: Any) -> dict:
     if cfg.enable_hisparse or cfg.enable_hierarchical_cache:
         raise ValueError("DSA DCP does not support HiSparse or HiCache.")
     platform = get_platform()
-    ascend_pd_decode = (
+    npu_pd_decode = (
         platform.is_npu
         and cfg.disaggregation_mode == "decode"
-        and cfg.disaggregation_transfer_backend == "ascend"
+        and (
+            cfg.disaggregation_transfer_backend == "ascend"
+            or (cfg.disaggregation_transfer_backend == "fake" and cfg.nnodes == 1)
+        )
     )
-    if cfg.disaggregation_mode != "null" and not ascend_pd_decode:
+    if cfg.disaggregation_mode != "null" and not npu_pd_decode:
         raise ValueError("DSA DCP does not support PD disaggregation.")
     if cfg.speculative_eagle_topk not in (None, 1):
         raise ValueError("DSA DCP requires --speculative-eagle-topk 1.")
-    if ascend_pd_decode:
-        # Ascend uses its own DSA attention and DCP transfer implementation.
+    if npu_pd_decode:
+        # NPU Decode uses Ascend attention for both real and synthetic KV.
         return {}
     # The DCP paths: trtllm on CUDA, triton on ROCm.
     backend = "triton" if platform.is_hip else "trtllm"

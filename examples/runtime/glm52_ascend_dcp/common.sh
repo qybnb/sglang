@@ -15,8 +15,7 @@ load_ascend_env() {
     source "${ATB_ENV_SCRIPT:-/usr/local/Ascend/nnal/atb/set_env.sh}"
 }
 
-prepare_server() {
-    : "${P_IP:?Set P_IP to the Prefill node address}"
+prepare_server_runtime() {
     if [[ ! -f "$MODEL_PATH/config.json" ]]; then
         echo "Missing model config at $MODEL_PATH/config.json" >&2
         exit 1
@@ -33,6 +32,11 @@ prepare_server() {
     export PYTHONUNBUFFERED=1 TRANSFORMERS_VERBOSITY=error
     export SGLANG_SET_CPU_AFFINITY=1 PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
     export STREAMS_PER_DEVICE=32
+}
+
+prepare_server() {
+    : "${P_IP:?Set P_IP to the Prefill node address}"
+    prepare_server_runtime
     export ASCEND_MF_TRANSFER_PROTOCOL="${ASCEND_MF_TRANSFER_PROTOCOL:-sdma}"
     export ASCEND_MF_STORE_URL="tcp://$P_IP:$MF_PORT"
     export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=1200
