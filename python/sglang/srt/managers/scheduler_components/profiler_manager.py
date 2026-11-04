@@ -22,7 +22,7 @@ from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileR
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.step_span_utils import set_detailed_annotations_enabled
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_device, get_parallel
+from sglang.srt.runtime_context import get_device, get_disagg, get_parallel
 from sglang.srt.utils import is_mps, is_npu
 from sglang.srt.utils.profile_merger import ProfileMerger
 from sglang.srt.utils.profile_utils import ProfileManager
@@ -48,6 +48,7 @@ elif _is_mps:
     apply_metal_profiler_patches()
 
 logger = logging.getLogger(__name__)
+_SYNCED_DECODE_PROFILE_STEPS = 10
 
 
 @dataclass(kw_only=True)
@@ -59,6 +60,17 @@ class SchedulerProfilerManager:
 
     def __post_init__(self) -> None:
         self.dp_tp_cpu_group = get_dp_tp_group().cpu_group
+        self.synced_decode_steps_remaining = 0
+        self.is_npu_pd_decode = _is_npu and get_disagg().disaggregation_mode == "decode"
+        self.synced_decode_profile_supported = (
+            self.is_npu_pd_decode
+            and get_parallel().attn_dp_enabled
+            and get_parallel().num_dp_ranks > 1
+            and get_parallel().pp_size == 1
+            and get_parallel().dwdp_size == 1
+            and not envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
+            and not envs.SGLANG_PROFILE_V2.get()
+        )
         if envs.SGLANG_PROFILE_V2.get():
             self._profile_manager = ProfileManager(
                 cpu_group=self.dp_tp_cpu_group,
@@ -316,7 +328,7 @@ class SchedulerProfilerManager:
             return merge_message
 
     def _stop_profile(
-        self, stage: Optional[ForwardMode] = None
+        self, stage: Optional[ForwardMode] = None, *, synchronize: bool = True
     ) -> ProfileReqOutput | None:
         if envs.SGLANG_PROFILE_V2.get():
             self._apply_detailed_annotations(False)
@@ -361,7 +373,8 @@ class SchedulerProfilerManager:
                 self.torch_profiler.export_chrome_trace(
                     os.path.join(self.torch_profiler_output_dir, filename)
                 )
-            torch.distributed.barrier(self.dp_tp_cpu_group)
+            if synchronize:
+                torch.distributed.barrier(self.dp_tp_cpu_group)
 
         if self.rpd_profiler is not None:
             self.rpd_profiler.rangePop()
@@ -415,6 +428,34 @@ class SchedulerProfilerManager:
             self._profile_manager.step(forward_mode=batch.forward_mode)
             return
 
+        if self.synced_decode_steps_remaining:
+            if (
+                batch.synced_decode_profile_step
+                and self.synced_decode_steps_remaining == _SYNCED_DECODE_PROFILE_STEPS
+            ):
+                # Drain the previous step, then start on the same Decode iteration.
+                torch.npu.synchronize()
+                group = get_parallel().tp_group.cpu_group
+                torch.distributed.barrier(group)
+                started = torch.ones((), dtype=torch.int32, device="cpu")
+                if torch.distributed.get_rank() == 0:
+                    try:
+                        result = self._start_profile(ForwardMode.DECODE)
+                        if not result.success:
+                            logger.error(
+                                "Decode rank 0 profile failed: %s", result.message
+                            )
+                            started.zero_()
+                    except Exception:
+                        logger.exception("Decode rank 0 profile failed to start")
+                        started.zero_()
+                torch.distributed.all_reduce(
+                    started, op=torch.distributed.ReduceOp.MIN, group=group
+                )
+                if not started.item():
+                    self.synced_decode_steps_remaining = 0
+            return
+
         if self.profile_by_stage:
             if batch.forward_mode.is_prefill():
                 if self.profiler_prefill_ct == 0:
@@ -456,8 +497,77 @@ class SchedulerProfilerManager:
             ):
                 self._start_profile()
 
+    @property
+    def synced_decode_profile_state(self) -> Optional[int]:
+        if not self.synced_decode_profile_supported:
+            return None
+        if not self.synced_decode_steps_remaining:
+            return 0
+        if self.synced_decode_steps_remaining == _SYNCED_DECODE_PROFILE_STEPS:
+            return 1
+        return 2
+
+    def finish_synced_decode_step(self, batch: ScheduleBatch) -> None:
+        if (
+            not batch.synced_decode_profile_step
+            or not self.synced_decode_steps_remaining
+        ):
+            return
+        self.synced_decode_steps_remaining -= 1
+        if self.synced_decode_steps_remaining == 0 and self.profile_in_progress:
+            torch.npu.synchronize()
+            self._stop_profile(ForwardMode.DECODE, synchronize=False)
+            logger.info(
+                "Synchronized Decode profile completed %d steps on rank 0",
+                _SYNCED_DECODE_PROFILE_STEPS,
+            )
+
     def _profile(self, recv_req: ProfileReq):
+        if self.synced_decode_steps_remaining:
+            return ProfileReqOutput(
+                success=False,
+                message="Synchronized Decode profiling stops automatically after 10 steps.",
+            )
         if recv_req.req_type == ProfileReqType.START_PROFILE:
+            if self.is_npu_pd_decode and recv_req.profile_stages == ["decode"]:
+                if not self.synced_decode_profile_supported:
+                    return ProfileReqOutput(
+                        success=False,
+                        message="Synchronized Decode profiling requires Attention DP "
+                        "with scheduler all-gather, PP=1, DWDP=1, and profiler V1.",
+                    )
+                if (
+                    recv_req.start_step is not None
+                    or recv_req.num_steps not in (None, _SYNCED_DECODE_PROFILE_STEPS)
+                    or recv_req.merge_profiles
+                    or (
+                        recv_req.activities is not None
+                        and (
+                            "GPU" not in recv_req.activities
+                            or set(recv_req.activities) - {"CPU", "GPU"}
+                        )
+                    )
+                ):
+                    return ProfileReqOutput(
+                        success=False,
+                        message="Synchronized Decode profiling requires 10 steps, GPU activity, "
+                        "and no start_step or merge_profiles.",
+                    )
+                result = self._init_profile(
+                    output_dir=recv_req.output_dir,
+                    start_step=None,
+                    num_steps=None,
+                    activities=recv_req.activities,
+                    with_stack=recv_req.with_stack,
+                    record_shapes=recv_req.record_shapes,
+                    profile_by_stage=False,
+                    profile_id=recv_req.profile_id,
+                    profile_prefix=recv_req.profile_prefix,
+                    detailed_annotations=recv_req.detailed_annotations,
+                )
+                if result.success:
+                    self.synced_decode_steps_remaining = _SYNCED_DECODE_PROFILE_STEPS
+                return result
             if recv_req.profile_by_stage or recv_req.start_step:
                 return self._init_profile(
                     recv_req.output_dir,

@@ -161,6 +161,9 @@ class MLPSyncBatchInfo:
     is_health_check: bool = False
     # Causal (query, key) pairs this rank attends this step.
     attention_pairs: int = 0
+    # None leaves the gather layout unchanged for other scheduler paths.
+    decode_profile_state: Optional[int] = None
+    synced_decode_profile_step: bool = False
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
@@ -187,6 +190,11 @@ class MLPSyncBatchInfo:
                 int(self.can_run_draft_cuda_graph),
                 int(self.is_health_check),
                 self.attention_pairs,
+                *(
+                    [self.decode_profile_state]
+                    if self.decode_profile_state is not None
+                    else []
+                ),
             ],
             device=device,
             dtype=dtype,
@@ -206,6 +214,7 @@ class MLPSyncBatchInfo:
                 1,  # can_run_draft_cuda_graph
                 0,  # is_health_check
                 0,  # attention_pairs
+                *([0] if self.decode_profile_state is not None else []),
             ],
             device=device,
             dtype=dtype,
@@ -283,7 +292,8 @@ class MLPSyncBatchInfo:
         # tensor is its own stream sync. Copy the whole tensor, not the
         # `[:, 0, :]` slice -- that slice is non-contiguous once
         # attn_tp * attn_cp > 1, adding a gather kernel inside the wait.
-        tp0_info_cpu = global_info_tensor.cpu()[:, 0, :]
+        global_info_cpu = global_info_tensor.cpu()
+        tp0_info_cpu = global_info_cpu[:, 0, :]
         self.tp0_info_cpu = tp0_info_cpu
         self.global_num_tokens = tp0_info_cpu[:, 0].tolist()
         self.global_num_tokens_for_logprob = tp0_info_cpu[:, 1].tolist()
@@ -294,6 +304,15 @@ class MLPSyncBatchInfo:
         self.can_run_draft_cuda_graph = bool(tp0_info_cpu[:, 8].min())
         self.any_health_check = bool(tp0_info_cpu[:, 9].max())
         self.global_attention_pairs = tp0_info_cpu[:, 10].tolist()
+        if self.decode_profile_state is not None:
+            # Vote across every TP rank, including the idle attention-DP groups.
+            min_state = int(global_info_cpu[..., 11].min())
+            min_bs = envs.SGLANG_PROFILE_BY_STAGE_DECODE_MIN_BS.get()
+            self.synced_decode_profile_step = min_state == 2 or (
+                min_state == 1
+                and not self.any_health_check
+                and min(self.global_num_tokens) >= min_bs
+            )
         self.sync_wait_seconds = time.perf_counter() - sync_start
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
@@ -526,6 +545,7 @@ def prepare_mlp_sync_batch_raw(
     draft_require_mlp_tp_gather: Optional[bool] = None,
     dwdp: bool = False,
     sync_wait_carry: Optional[DPSyncWaitCarry] = None,
+    decode_profile_state: Optional[int] = None,
 ):
     parallel = get_parallel()
     num_dp_ranks = parallel.num_dp_ranks
@@ -641,6 +661,7 @@ def prepare_mlp_sync_batch_raw(
         # Gathered unconditionally like the other columns, so a per-process
         # metrics flag cannot make ranks disagree on what the tensor holds.
         attention_pairs=_local_attention_pairs(local_batch),
+        decode_profile_state=decode_profile_state,
     )
 
     if num_dp_ranks == 1:
@@ -675,6 +696,9 @@ def prepare_mlp_sync_batch_raw(
             batch_to_gather = local_batch.inner_idle_batch = get_idle_batch()
 
     if batch_to_gather is not None:
+        batch_to_gather.synced_decode_profile_step = bool(
+            mlp_sync_info.synced_decode_profile_step and need_idle_batch
+        )
         _update_gather_batch(
             batch_to_gather,
             mlp_sync_info,
@@ -734,7 +758,9 @@ class SchedulerDPAttnAdapter:
         """The iteration produced no batch, so its gather waits have no step to land on."""
         self.sync_wait_carry.seconds = 0.0
 
-    def prepare_mlp_sync_batch(self, local_batch: ScheduleBatch):
+    def prepare_mlp_sync_batch(
+        self, local_batch: ScheduleBatch, decode_profile_state: Optional[int] = None
+    ):
         draft_require_mlp_tp_gather = None
         if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
             draft_moe_a2a_backend = get_spec().speculative_moe_a2a_backend
@@ -755,12 +781,15 @@ class SchedulerDPAttnAdapter:
             offload_tags=self.offload_tags,
             dwdp=get_parallel().dwdp_size > 1,
             sync_wait_carry=self.sync_wait_carry,
+            decode_profile_state=decode_profile_state,
         )
 
     def maybe_prepare_mlp_sync_batch(
         self,
         batch: Optional[ScheduleBatch],
         need_sync: Optional[bool] = None,
+        *,
+        decode_profile_state: Optional[int] = None,
     ) -> Optional[ScheduleBatch]:
         """
         Helper to prepare MLP sync batch for DP attention.
@@ -771,7 +800,7 @@ class SchedulerDPAttnAdapter:
             need_sync: If specified, overrides self.get_require_mlp_sync() for prepare_mlp_sync_batch decision
         """
         if need_sync if need_sync is not None else self.get_require_mlp_sync():
-            batch = self.prepare_mlp_sync_batch(batch)
+            batch = self.prepare_mlp_sync_batch(batch, decode_profile_state)
         return batch
 
     def maybe_convert_decode_to_extend(

@@ -2018,6 +2018,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     dp_spec_prefill_coordination_applied: bool = False
 
     # For DP attention
+    synced_decode_profile_step: bool = False
     is_extend_in_batch: bool = False
     can_run_decode_cuda_graph: bool = False
     # Rank-consistent EAGLE draft replay gate. Keep it separate so missing

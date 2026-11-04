@@ -3559,6 +3559,7 @@ class SchedulerDisaggregationDecodeMixin:
             if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
+                self.profiler_manager.finish_synced_decode_step(batch)
             else:
                 # When the server is idle, do self-check and re-init some states
                 self._sched_idled = True
@@ -3629,6 +3630,8 @@ class SchedulerDisaggregationDecodeMixin:
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             self.launch_batch_sample_if_needed(batch_result, batch)
+            if batch:
+                self.profiler_manager.finish_synced_decode_step(batch)
 
             # Update last_batch
             self.last_batch = batch
@@ -3673,7 +3676,9 @@ class SchedulerDisaggregationDecodeMixin:
             running_batch = self.update_running_batch(running_batch)
             ret = running_batch if not running_batch.is_empty() else None
 
-        ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(ret)
+        ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
+            ret, decode_profile_state=self.profiler_manager.synced_decode_profile_state
+        )
         if ret:
             set_schedule_time_batch(ret)
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
