@@ -2,7 +2,7 @@
 
 ## 单机 fake Decode
 
-只测 Decode 时，在一台可见 16 张 A3 卡的机器上运行 `decode_fake.sh`。脚本使用 TP16、Attention DP4、EP16，默认 DCP4。`fake` 后端模拟 Prefill 的 KV 交接，客户端直接请求本机 Decode，适合测 Decode 容量和性能。生成内容没有真实 Prefill 上下文。
+只测 Decode 时，在一台可见 16 张 A3 卡的机器上运行 `decode_fake.sh`。脚本使用 TP16、Attention DP4、EP16，默认 DCP4。投机参数与真实 Decode 一致，使用 NEXTN、3 步、top-k 1、4 个 draft tokens 和 Spec V2。`fake` 后端模拟 Prefill 的 KV 交接，客户端直接请求本机 Decode，适合测 Decode 容量和性能。生成内容基于合成 KV。
 
 先按下文的容器和 kernel 安装步骤准备这一台机器。进入本分支的仓库目录后执行：
 
@@ -19,6 +19,8 @@ DCP_SIZE=1 bash "$S/decode_fake.sh"
 
 服务监听 `127.0.0.1:18004`。可用 `FAKE_PORT`、`MEM_FRACTION_STATIC` 和 `MAX_RUNNING_REQUESTS` 覆盖默认值 `18004`、`0.90` 和 `128`。`MAX_RUNNING_REQUESTS` 按 4 个 Attention DP 组均分。需要显式指定 HCCL/Gloo 网卡时，在本机设置 `D_NIC`。
 
+`check` 会显示投机步数、top-k 和 draft tokens。参数解析会把 NEXTN 归一化为 `EAGLE`。
+
 在同一容器的另一个终端发一条冒烟请求，检查响应的 `meta_info.completion_tokens`：
 
 ```bash
@@ -30,6 +32,8 @@ python3 -c 'import json; print(json.dumps({"input_ids": [123] * 128, "sampling_p
 ## 双机真实 P/D
 
 使用两台 AArch64 Ascend A3 服务器，每台容器可见 16 张卡。Prefill 使用 TP4 × PP4、Attention DP4。Decode 使用 TP16、Attention DP4、EP16，默认 DCP4。P/D KV 传输使用 Ascend MemFabric SDMA。
+
+P/D 两端使用相同的 NEXTN 配置，3 步、top-k 1、4 个 draft tokens。Decode 开启 Spec V2。
 
 ## 1. 准备容器和权重
 

@@ -74,6 +74,8 @@ cfg = resolving_view(args)
 for key in (
     "device", "disaggregation_mode", "disaggregation_transfer_backend",
     "tp_size", "pp_size", "attn_dp_size", "ep_size", "dcp_size", "port",
+    "speculative_algorithm", "speculative_num_steps", "speculative_eagle_topk",
+    "speculative_num_draft_tokens",
 ):
     print(f"{key}={getattr(cfg, key)}")
 PY

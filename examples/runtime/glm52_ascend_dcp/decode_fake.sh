@@ -3,6 +3,7 @@ set -eo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 max_running=${MAX_RUNNING_REQUESTS:-128}
+draft_tokens=4
 if [[ ! "$max_running" =~ ^[1-9][0-9]*$ ]] || (( max_running % 4 != 0 )); then
     echo "MAX_RUNNING_REQUESTS must be a positive multiple of 4" >&2
     exit 2
@@ -13,8 +14,11 @@ unset ASCEND_MF_STORE_URL ASCEND_MF_TRANSFER_PROTOCOL
 if [[ -n "${D_NIC:-}" ]]; then
     export HCCL_SOCKET_IFNAME="$D_NIC" GLOO_SOCKET_IFNAME="$D_NIC"
 fi
+export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1 SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
 export TASK_QUEUE_ENABLE=0 DEEPEP_HCCL_BUFFSIZE=400
-export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=$((max_running / 4))
+# Verification dispatches up to draft_tokens tokens for each request on a DP rank.
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=$((max_running / 4 * draft_tokens))
 
 run_server "${1:-serve}" \
     --model-path "$MODEL_PATH" --served-model-name glm-5.2-fake-capacity \
@@ -29,4 +33,6 @@ run_server "${1:-serve}" \
     --context-length 220000 --cuda-graph-max-bs-decode 8 \
     --watchdog-timeout 9000 --disable-shared-experts-fusion \
     --dtype bfloat16 --trust-remote-code \
-    --enable-metrics --decode-log-interval 1
+    --enable-metrics --decode-log-interval 1 \
+    --speculative-algorithm NEXTN --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 --speculative-num-draft-tokens "$draft_tokens"
