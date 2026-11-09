@@ -86,6 +86,8 @@ def launch_command(args, case):
         command += ["--cuda-graph-bs-decode", "1", "2", "4", "8"]
     if topology == "pcp":
         command += ["--enable-prefill-cp", "--cp-strategy", "interleave"]
+    if args.diagnose_indexer:
+        command += ["--skip-server-warmup"]
     if draft:
         command += [
             "--speculative-algorithm",
@@ -127,7 +129,7 @@ def http(url, timeout, payload=None, *, text=False):
         raise RuntimeError(f"{url}: HTTP {exc.code}: {detail}") from exc
 
 
-def workload(args, tokenizer_path):
+def workload(args, tokenizer_path, *, seed=531):
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
@@ -141,7 +143,7 @@ def workload(args, tokenizer_path):
     safe_ids = [token for token in safe_ids if token not in tokenizer.all_special_ids]
     if len(safe_ids) < 2:
         raise ValueError("Tokenizer did not produce enough ordinary token IDs")
-    rng = random.Random(531)
+    rng = random.Random(seed)
 
     def tokens(count):
         return rng.choices(safe_ids, k=count)
@@ -206,6 +208,7 @@ def probe(url, args, prompts, out, *, expect_spec):
     out.mkdir(parents=True, exist_ok=True)
     results = {}
     for name, prompt in prompts:
+        print(f"REQUEST {out.name}/{name}", flush=True)
         payload = {
             "input_ids": prompt,
             "sampling_params": {
@@ -300,6 +303,15 @@ def run_case(args, case, prompts, command, revision):
     env.setdefault("PYTORCH_NPU_ALLOC_CONF", "expandable_segments:True")
     env.setdefault("SGLANG_ENABLE_SPEC_V2", "1")
     env["PYTHONUNBUFFERED"] = "1"
+    if args.diagnose_indexer:
+        diag = out.resolve() / "indexer_diag"
+        diag.mkdir()
+        capture = diag / "capture"
+        capture.touch()
+        env["SGLANG_NPU_INDEXER_DIAG_DIR"] = str(diag)
+        env["SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION"] = "0"
+        env["ASCEND_LAUNCH_BLOCKING"] = "0"
+        env["PYTHONFAULTHANDLER"] = "1"
     log_path = out / "server.log"
     print(f"START {case} {args.graph}, log={log_path}", flush=True)
     with log_path.open("w", encoding="utf-8") as log:
@@ -335,7 +347,13 @@ def run_case(args, case, prompts, command, revision):
                         f"{case}: resolved {key}={info.get(key)!r}, expected {value!r}"
                     )
             before = snapshot_graph_counter(url, out / "metrics-before.prom")
-            probe(url, args, prompts, out, expect_spec=bool(draft))
+            if args.diagnose_indexer:
+                probe(url, args, prompts[:2], out / "synchronized", expect_spec=False)
+                capture.unlink()
+                fresh = workload(args, args.tokenizer or args.model, seed=532)
+                probe(url, args, fresh[:2], out / "async", expect_spec=False)
+            else:
+                probe(url, args, prompts, out, expect_spec=bool(draft))
             graph_passes = (
                 snapshot_graph_counter(url, out / "metrics-after.prom") - before
             )
@@ -351,6 +369,31 @@ def run_case(args, case, prompts, command, revision):
             if log_thread.ident is not None:
                 log_thread.join()
             proc.stdout.close()
+            if args.diagnose_indexer:
+                for snapshot in sorted(diag.glob("rank-*.pt")):
+                    with (diag / f"{snapshot.stem}-replay.log").open("w") as replay_log:
+                        print(f"REPLAY {snapshot}", flush=True)
+                        try:
+                            result = subprocess.run(
+                                [
+                                    sys.executable,
+                                    "-m",
+                                    "sglang.srt.layers.attention.dsa.dsa_npu_indexer_diagnostics",
+                                    str(snapshot),
+                                ],
+                                cwd=ROOT,
+                                env=env,
+                                stdout=replay_log,
+                                stderr=subprocess.STDOUT,
+                                timeout=90,
+                                check=False,
+                            )
+                            print(
+                                f"REPLAY {snapshot.stem} exit={result.returncode}",
+                                flush=True,
+                            )
+                        except subprocess.TimeoutExpired:
+                            print(f"REPLAY {snapshot.stem} timed out", flush=True)
 
 
 def compare(args):
@@ -447,6 +490,11 @@ def main():
     run.add_argument("--spec-steps", type=int, default=3)
     run.add_argument("--extra-args-json", default="[]")
     run.add_argument("--print-command", action="store_true")
+    run.add_argument(
+        "--diagnose-indexer",
+        action="store_true",
+        help="Capture PCP C8 indexer inputs, then compare asynchronous requests",
+    )
     add_probe_args(run, require_cache_hit=True)
     client = subs.add_parser(
         "client", help="Probe an already running worker or PD router"
@@ -464,8 +512,18 @@ def main():
     args = parser.parse_args()
     if args.action == "compare":
         return compare(args)
-    if args.long_tokens <= 2048 or args.new_tokens < 8:
-        parser.error("use --long-tokens > 2048 and --new-tokens >= 8")
+    diagnose_indexer = args.action == "run" and args.diagnose_indexer
+    min_new_tokens = 2 if diagnose_indexer else 8
+    if args.long_tokens <= 2048 or args.new_tokens < min_new_tokens:
+        parser.error(f"use --long-tokens > 2048 and --new-tokens >= {min_new_tokens}")
+    if diagnose_indexer and (
+        args.cases != ["pcp"]
+        or args.graph != "eager"
+        or args.kv_cache_dtype != "fp8_e4m3"
+    ):
+        parser.error(
+            "--diagnose-indexer requires --cases pcp --graph eager with FP8 KV"
+        )
     if args.action == "client":
         probe(
             args.url.rstrip("/"),

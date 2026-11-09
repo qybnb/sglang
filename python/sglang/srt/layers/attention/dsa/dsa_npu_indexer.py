@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 
 import torch
@@ -25,6 +26,7 @@ if is_npu():
     from sglang.srt.hardware_backend.npu.utils import get_indexer_weight_stream
 
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
+_indexer_diag_dir = os.environ.get("SGLANG_NPU_INDEXER_DIAG_DIR")
 
 
 @lru_cache(maxsize=1)
@@ -238,12 +240,26 @@ class DSANPUIndexerMixin:
             )
         pool = get_token_to_kv_pool()
         use_quant_indexer = pool.index_k_scale_buffer is not None
+        diag = None
         if use_quant_indexer:
+            if _indexer_diag_dir:
+                from sglang.srt.layers.attention.dsa.dsa_npu_indexer_diagnostics import (
+                    IndexerDiagnostic,
+                )
+
+                diag = IndexerDiagnostic(_indexer_diag_dir, forward_batch, layer_id)
+                diag.fence("before_k_quant")
             k, k_scale = _quantize_npu_indexer_activation(
                 k, pool.indexer_hadamard_128, pool.dtype
             )
+            if diag is not None:
+                diag.cache_write(indexer_cache_loc, k, k_scale, pool)
             pool.set_index_k_scale_buffer(layer_id, indexer_cache_loc, k_scale)
+            if diag is not None:
+                diag.fence("scale_scatter")
         pool.set_index_k_buffer(layer_id, indexer_cache_loc, k)
+        if diag is not None:
+            diag.cache_written(k, k_scale, pool, layer_id)
         if is_prefill:
             if use_cp_indexer:
                 # V2: local metadata already prepared by prepare_dsa_cp_metadata.
@@ -320,7 +336,10 @@ class DSANPUIndexerMixin:
             query, query_scale = _quantize_npu_indexer_activation(
                 q, pool.indexer_hadamard_128, pool.dtype
             )
-            topk_indices = torch_npu.npu_quant_lightning_indexer(
+            indexer = (
+                diag.call if diag is not None else torch_npu.npu_quant_lightning_indexer
+            )
+            topk_indices = indexer(
                 query=query,
                 key=past_key_states,
                 weights=weights,
