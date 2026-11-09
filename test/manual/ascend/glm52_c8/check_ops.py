@@ -79,6 +79,11 @@ def report_env():
                 f"torch_npu.{name}: {callable(getattr(torch_npu, name, None))}",
                 flush=True,
             )
+        print(
+            f"indexer alias={getattr(torch_npu, 'npu_quant_lightning_indexer', None)!r}; "
+            f"native={getattr(torch.ops.npu, 'npu_quant_lightning_indexer', None)!r}",
+            flush=True,
+        )
         namespace = torch.ops.cann_ops_transformer
         v2 = getattr(namespace, "kv_quant_sparse_flash_attention", None)
         print(f"QSFA V2 binding: {callable(v2)}", flush=True)
@@ -139,7 +144,6 @@ def check_indexer(
     decode_indexer_shape=None,
 ):
     import torch
-    import torch_npu
 
     from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
         _quantize_npu_indexer_activation,
@@ -188,7 +192,7 @@ def check_indexer(
             f"topk={topk} K storage_offset={key.storage_offset()}",
             flush=True,
         )
-    result = torch_npu.npu_quant_lightning_indexer(
+    result = torch.ops.npu.npu_quant_lightning_indexer(
         query=q8,
         key=key,
         weights=weights,

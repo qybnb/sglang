@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 import torch
-import torch_npu
+import torch_npu  # noqa: F401
 
 
 def describe(tensor):
@@ -156,8 +156,9 @@ class IndexerDiagnostic:
             self.log("input_values", finite=finite)
             torch.save(dict(args=payload, meta=meta, context=self.context), tmp)
             tmp.replace(snapshot)
-        self.log("native_enter", tensors=meta)
-        result = torch_npu.npu_quant_lightning_indexer(**kwargs)
+        indexer = torch.ops.npu.npu_quant_lightning_indexer
+        self.log("native_enter", operator=str(indexer), tensors=meta)
+        result = indexer(**kwargs)
         self.fence("indexer")
         self.log("native_exit")
         if snapshot is not None:
@@ -189,11 +190,15 @@ def replay(path):
             else view
         )
     torch.npu.synchronize()
-    print(f"QLI replay ENTER {snapshot['context']}", flush=True)
-    result = torch_npu.npu_quant_lightning_indexer(**args)
+    indexer = torch.ops.npu.npu_quant_lightning_indexer
+    print(f"QLI replay ENTER operator={indexer} {snapshot['context']}", flush=True)
+    result = indexer(**args)
     torch.npu.synchronize()
     print(f"QLI replay PASS {tuple(result.shape)}", flush=True)
 
 
 if __name__ == "__main__":
+    from sglang.srt.hardware_backend.npu.utils import init_npu_backend
+
+    init_npu_backend()
     replay(sys.argv[1])

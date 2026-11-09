@@ -336,8 +336,12 @@ class DSANPUIndexerMixin:
             query, query_scale = _quantize_npu_indexer_activation(
                 q, pool.indexer_hadamard_128, pool.dtype
             )
+            # custom_ops can replace the torch_npu alias with an experimental
+            # binding that takes metadata and uses a different ACLNN ABI.
             indexer = (
-                diag.call if diag is not None else torch_npu.npu_quant_lightning_indexer
+                diag.call
+                if diag is not None
+                else torch.ops.npu.npu_quant_lightning_indexer
             )
             topk_indices = indexer(
                 query=query,
