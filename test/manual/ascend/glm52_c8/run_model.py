@@ -288,6 +288,17 @@ def snapshot_graph_counter(url, path):
     )
 
 
+def launch_env():
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(
+        filter(None, (str(ROOT / "python"), env.get("PYTHONPATH")))
+    )
+    env.setdefault("PYTORCH_NPU_ALLOC_CONF", "expandable_segments:True")
+    env.setdefault("SGLANG_ENABLE_SPEC_V2", "1")
+    env["PYTHONUNBUFFERED"] = "1"
+    return env
+
+
 def run_case(args, case, prompts, command, revision):
     out = args.out_dir / f"{case}-{args.graph}"
     out.mkdir(parents=True, exist_ok=False)
@@ -296,13 +307,7 @@ def run_case(args, case, prompts, command, revision):
     with socket.socket() as sock:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(("127.0.0.1", args.port))
-    env = os.environ.copy()
-    env["PYTHONPATH"] = os.pathsep.join(
-        filter(None, (str(ROOT / "python"), env.get("PYTHONPATH")))
-    )
-    env.setdefault("PYTORCH_NPU_ALLOC_CONF", "expandable_segments:True")
-    env.setdefault("SGLANG_ENABLE_SPEC_V2", "1")
-    env["PYTHONUNBUFFERED"] = "1"
+    env = launch_env()
     if args.diagnose_indexer:
         diag = out.resolve() / "indexer_diag"
         diag.mkdir()
@@ -464,38 +469,56 @@ def add_probe_args(parser, *, require_cache_hit):
     )
 
 
+def add_launch_args(parser):
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--tp", type=int, default=8)
+    parser.add_argument("--cp-size", type=int, default=2)
+    parser.add_argument("--graph", choices=("eager", "decode"), default="eager")
+    parser.add_argument(
+        "--kv-cache-dtype", choices=("fp8_e4m3", "bf16"), default="fp8_e4m3"
+    )
+    parser.add_argument("--quantization", default="modelslim")
+    parser.add_argument("--port", type=int, default=31265)
+    parser.add_argument("--context-length", type=int, default=16384)
+    parser.add_argument("--chunk-size", type=int, default=8192)
+    parser.add_argument("--mem-fraction-static", type=float, default=0.80)
+    parser.add_argument("--spec-steps", type=int, default=3)
+    parser.add_argument("--extra-args-json", default="[]")
+    parser.add_argument("--print-command", action="store_true")
+
+
+def validate_local_launch(parser, args):
+    if sys.platform != "linux":
+        parser.error(
+            f"{args.action} requires Linux with Ascend NPU; "
+            "use --print-command to inspect arguments"
+        )
+    if not (Path(args.model) / "config.json").is_file():
+        parser.error("--model must be a local checkpoint directory with config.json")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     subs = parser.add_subparsers(dest="action", required=True)
     run = subs.add_parser(
         "run", help="Launch and probe single-host A5 servers in sequence"
     )
-    run.add_argument("--model", required=True)
+    add_launch_args(run)
     run.add_argument("--tokenizer")
-    run.add_argument("--tp", type=int, default=8)
-    run.add_argument("--cp-size", type=int, default=2)
     run.add_argument(
         "--cases", nargs="+", choices=CASES, default=["base", "pcp", "dcp"]
     )
-    run.add_argument("--graph", choices=("eager", "decode"), default="eager")
-    run.add_argument(
-        "--kv-cache-dtype", choices=("fp8_e4m3", "bf16"), default="fp8_e4m3"
-    )
-    run.add_argument("--quantization", default="modelslim")
-    run.add_argument("--port", type=int, default=31265)
-    run.add_argument("--context-length", type=int, default=16384)
-    run.add_argument("--chunk-size", type=int, default=8192)
-    run.add_argument("--mem-fraction-static", type=float, default=0.80)
     run.add_argument("--startup-timeout", type=int, default=2400)
-    run.add_argument("--spec-steps", type=int, default=3)
-    run.add_argument("--extra-args-json", default="[]")
-    run.add_argument("--print-command", action="store_true")
     run.add_argument(
         "--diagnose-indexer",
         action="store_true",
         help="Capture PCP C8 indexer inputs, then compare asynchronous requests",
     )
     add_probe_args(run, require_cache_hit=True)
+    serve = subs.add_parser("serve", help="Launch one A5 server in the foreground")
+    add_launch_args(serve)
+    serve.add_argument("--case", choices=CASES, required=True)
+    serve.set_defaults(diagnose_indexer=False)
     client = subs.add_parser(
         "client", help="Probe an already running worker or PD router"
     )
@@ -512,6 +535,15 @@ def main():
     args = parser.parse_args()
     if args.action == "compare":
         return compare(args)
+    if args.action == "serve":
+        command = launch_command(args, args.case)
+        if args.print_command:
+            print(shlex.join(command))
+            return 0
+        validate_local_launch(parser, args)
+        print(f"START {args.case} {args.graph} in foreground", flush=True)
+        # Replace the runner so only the server owns the process lifecycle.
+        os.execvpe(command[0], command, launch_env())
     diagnose_indexer = args.action == "run" and args.diagnose_indexer
     min_new_tokens = 2 if diagnose_indexer else 8
     if args.long_tokens <= 2048 or args.new_tokens < min_new_tokens:
@@ -540,12 +572,7 @@ def main():
         for _, command in commands:
             print(shlex.join(command))
         return 0
-    if sys.platform != "linux":
-        parser.error(
-            "run requires Linux with Ascend NPU; use --print-command to inspect arguments"
-        )
-    if not (Path(args.model) / "config.json").is_file():
-        parser.error("--model must be a local checkpoint directory with config.json")
+    validate_local_launch(parser, args)
     revision = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
     ).strip()
