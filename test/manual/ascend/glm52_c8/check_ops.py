@@ -96,7 +96,7 @@ def fp8_cpu(tensor):
     return tensor.view(torch.uint8).cpu().view(torch.float8_e4m3fn).float()
 
 
-def write_indexer_cache(k, scale):
+def write_indexer_cache(k, scale, decode_kv_len=None):
     import torch
 
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
@@ -113,14 +113,30 @@ def write_indexer_cache(k, scale):
     pool.indexer_layer_id_to_slot = {0: 0, 1: 1}
     pool.index_k_buffer = k.new_zeros((2, *k.shape))
     pool.index_k_scale_buffer = scale.new_zeros((2, *scale.shape))
-    loc = torch.arange(PAGE, k.shape[0] * PAGE, device=k.device, dtype=torch.int64)
-    pool.set_index_k_scale_buffer(1, loc, scale[1:].clone())
-    pool.set_index_k_buffer(1, loc, k[1:].clone())
+
+    def write_slots(start, stop):
+        loc = torch.arange(start, stop, device=k.device, dtype=torch.int64)
+        pool.set_index_k_scale_buffer(1, loc, scale.flatten(0, 1)[start:stop].clone())
+        pool.set_index_k_buffer(1, loc, k.flatten(0, 1)[start:stop].clone())
+
+    if decode_kv_len is None:
+        write_slots(PAGE, k.shape[0] * PAGE)
+    else:
+        decode_slot = PAGE + decode_kv_len - 1
+        write_slots(PAGE, decode_slot)
+        torch.npu.synchronize()
+        print(f"indexer cache append decode slot={decode_slot}", flush=True)
+        write_slots(decode_slot, decode_slot + 1)
     return pool.get_index_k_buffer(1), pool.get_index_k_scale_buffer(1)
 
 
 def check_indexer(
-    device, score_atol, lengths=(127, 129, 2305, 2561), write_cache=False
+    device,
+    score_atol,
+    lengths=(127, 129, 2305, 2561),
+    *,
+    write_cache=False,
+    decode_indexer_shape=None,
 ):
     import torch
     import torch_npu
@@ -130,10 +146,15 @@ def check_indexer(
         create_npu_hadamard_128,
     )
 
+    heads, dim, topk = decode_indexer_shape or (64, 128, TOPK)
+    # Decode appends to the prefix and uses the same request's page table.
+    decode_kv_len = lengths[0] if decode_indexer_shape is not None else None
     lengths = torch.tensor(lengths, dtype=torch.int32)
-    rows, heads, dim = lengths.numel(), 64, 128
+    rows = lengths.numel()
     pages = math.ceil(int(lengths.max()) / PAGE)
-    page_ids = torch.arange(1, pages + 1, dtype=torch.int32).flip(0)
+    page_ids = torch.arange(1, pages + 1, dtype=torch.int32)
+    if decode_kv_len is None:
+        page_ids = page_ids.flip(0)
     tables = torch.stack([page_ids.roll(row) for row in range(rows)])
     q = torch.randn(rows, heads, dim).to(device, torch.bfloat16)
     k = torch.randn(pages + 1, PAGE, 1, dim).to(device, torch.bfloat16)
@@ -142,19 +163,30 @@ def check_indexer(
     q8, sq = _quantize_npu_indexer_activation(q, hadamard, torch.float8_e4m3fn)
     k8, sk = _quantize_npu_indexer_activation(k, hadamard, torch.float8_e4m3fn)
     key, key_scale = k8, sk
-    if write_cache:
+    if write_cache or decode_kv_len is not None:
         torch.npu.synchronize()
         print(f"indexer cache write lengths={lengths.tolist()}", flush=True)
-        key, key_scale = write_indexer_cache(k8, sk)
+        key, key_scale = write_indexer_cache(k8, sk, decode_kv_len)
         torch.npu.synchronize()
         # Use the pre-scatter tensors as the score reference. Check the cache
         # first, so a scatter failure cannot look like a Top-K selection error.
-        torch.testing.assert_close(
-            key[1:].view(torch.uint8).cpu(), k8[1:].view(torch.uint8).cpu()
+        valid_slots = slice(
+            PAGE, None if decode_kv_len is None else PAGE + decode_kv_len
         )
-        torch.testing.assert_close(key_scale[1:].cpu(), sk[1:].cpu(), rtol=0, atol=0)
+        torch.testing.assert_close(
+            key.flatten(0, 1)[valid_slots].view(torch.uint8).cpu(),
+            k8.flatten(0, 1)[valid_slots].view(torch.uint8).cpu(),
+        )
+        torch.testing.assert_close(
+            key_scale.flatten(0, 1)[valid_slots].cpu(),
+            sk.flatten(0, 1)[valid_slots].cpu(),
+            rtol=0,
+            atol=0,
+        )
         print(
-            f"indexer native call K storage_offset={key.storage_offset()}", flush=True
+            f"indexer native call Q={tuple(q8.shape)} table={tuple(tables.shape)} "
+            f"topk={topk} K storage_offset={key.storage_offset()}",
+            flush=True,
         )
     result = torch_npu.npu_quant_lightning_indexer(
         query=q8,
@@ -169,19 +201,19 @@ def check_indexer(
         block_table=tables.to(device),
         layout_query="TND",
         layout_key="PA_BSND",
-        sparse_count=TOPK,
+        sparse_count=topk,
         sparse_mode=3,
         query_quant_mode=0,
         key_quant_mode=0,
     ).cpu()
-    if result.shape != (rows, 1, TOPK) or result.dtype != torch.int32:
+    if result.shape != (rows, 1, topk) or result.dtype != torch.int32:
         raise AssertionError(f"Unexpected indexer output {result.shape} {result.dtype}")
     q_ref = fp8_cpu(q8) * sq.float().cpu().unsqueeze(-1)
     k_ref = (fp8_cpu(k8) * sk.float().cpu().unsqueeze(-1)).squeeze(2)
     weights = weights.float().cpu()
     for row, length in enumerate(lengths.tolist()):
         picked = result[row, 0].long()
-        count = min(length, TOPK)
+        count = min(length, topk)
         ids = picked[:count]
         if (
             not bool(((ids >= 0) & (ids < length)).all())
@@ -457,7 +489,19 @@ def check_dcp2(data, device, args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "case", choices=("env", "indexer", "indexer-cache", "qsfa", "dcp", "dcp2")
+        "case",
+        choices=(
+            "env",
+            "indexer",
+            "indexer-cache",
+            "indexer-decode",
+            "qsfa",
+            "dcp",
+            "dcp2",
+        ),
+    )
+    parser.add_argument(
+        "--model", type=Path, help="Local checkpoint directory for indexer-decode"
     )
     parser.add_argument(
         "--device", type=int, default=int(os.environ.get("LOCAL_RANK", "0"))
@@ -472,6 +516,15 @@ def main():
     if args.case == "env":
         report_env()
         return
+    if args.case == "indexer-decode":
+        if args.model is None or not (args.model / "config.json").is_file():
+            parser.error(
+                "indexer-decode requires --model pointing to a local config.json"
+            )
+        config = json.loads((args.model / "config.json").read_text(encoding="utf-8"))
+        decode_indexer_shape = tuple(
+            config[key] for key in ("index_n_heads", "index_head_dim", "index_topk")
+        )
 
     import torch
     import torch_npu  # noqa: F401
@@ -489,6 +542,14 @@ def main():
                 device, args.topk_score_atol, lengths=(2, 4, 6), write_cache=True
             )
             check_indexer(device, args.topk_score_atol, write_cache=True)
+        elif args.case == "indexer-decode":
+            for kv_len in (98, 4098):
+                check_indexer(
+                    device,
+                    args.topk_score_atol,
+                    lengths=(kv_len,),
+                    decode_indexer_shape=decode_indexer_shape,
+                )
         elif args.case == "qsfa":
             check_qsfa(fixture(), device, args)
         elif args.case == "dcp":
