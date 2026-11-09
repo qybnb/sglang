@@ -41,6 +41,8 @@ python3 -m torch.distributed.run --standalone --nproc-per-node=2 \
 | `dcp` | 在一张卡上串行跑两个 rank 的 QSFA V2，分别走 decode 和 target verify，覆盖跨页边界、空 Top-K、局部 KV 长度为 0 | 分别比较 output、max、sum、LSE。空行严格为 output=0、LSE=-inf。CPU 合并两个 partial 后与全量参考一致 |
 | `dcp2` | 两卡 HCCL，QSFA V2 走 verify 形状，调用生产 DCP merge | 每个 rank 的合并输出与全量参考相应的 head slice 一致 |
 
+排查 PCP C8 在 quant indexer 处崩溃时，可单独运行 `ASCEND_LAUNCH_BLOCKING=1 python3 "$T/check_ops.py" indexer-cache`。它无需权重，先用生产 pool 方法 scatter 写入 FP8 K 和 scale，再从第二层的带偏移视图调用 native 算子，分别覆盖全部是短行以及存在超过 2048 token 的行。
+
 默认 output 容差为 `atol=0.02, rtol=0.03`，softmax 统计及 LSE 的绝对容差为 0.03。脚本会打印最大误差，这些值是首轮筛查阈值。遇到失败先保留默认阈值结果，再按需用 `--atol`、`--rtol`、`--lse-atol` 或 `--topk-score-atol` 做诊断。
 
 ## 2. 单机整网

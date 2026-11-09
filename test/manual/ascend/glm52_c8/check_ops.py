@@ -96,7 +96,32 @@ def fp8_cpu(tensor):
     return tensor.view(torch.uint8).cpu().view(torch.float8_e4m3fn).float()
 
 
-def check_indexer(device, score_atol):
+def write_indexer_cache(k, scale):
+    import torch
+
+    from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
+
+    # Match the pool's layer-major layout. Use the second slot to exercise a
+    # nonzero storage offset through both scatter writes and the native reader.
+    pool = object.__new__(NPUMLATokenToKVPool)
+    pool.dtype = pool.store_dtype = k.dtype
+    pool.layer_transfer_counter = None
+    pool.index_head_dim = k.shape[-1]
+    pool.index_page_size = PAGE
+    pool.index_size = (k.shape[0] - 1) * PAGE
+    pool.index_page_padding = 1
+    pool.indexer_layer_id_to_slot = {0: 0, 1: 1}
+    pool.index_k_buffer = k.new_zeros((2, *k.shape))
+    pool.index_k_scale_buffer = scale.new_zeros((2, *scale.shape))
+    loc = torch.arange(PAGE, k.shape[0] * PAGE, device=k.device, dtype=torch.int64)
+    pool.set_index_k_scale_buffer(1, loc, scale[1:].clone())
+    pool.set_index_k_buffer(1, loc, k[1:].clone())
+    return pool.get_index_k_buffer(1), pool.get_index_k_scale_buffer(1)
+
+
+def check_indexer(
+    device, score_atol, lengths=(127, 129, 2305, 2561), write_cache=False
+):
     import torch
     import torch_npu
 
@@ -105,7 +130,7 @@ def check_indexer(device, score_atol):
         create_npu_hadamard_128,
     )
 
-    lengths = torch.tensor([127, 129, 2305, 2561], dtype=torch.int32)
+    lengths = torch.tensor(lengths, dtype=torch.int32)
     rows, heads, dim = lengths.numel(), 64, 128
     pages = math.ceil(int(lengths.max()) / PAGE)
     page_ids = torch.arange(1, pages + 1, dtype=torch.int32).flip(0)
@@ -116,12 +141,27 @@ def check_indexer(device, score_atol):
     hadamard = create_npu_hadamard_128(dim, device)
     q8, sq = _quantize_npu_indexer_activation(q, hadamard, torch.float8_e4m3fn)
     k8, sk = _quantize_npu_indexer_activation(k, hadamard, torch.float8_e4m3fn)
+    key, key_scale = k8, sk
+    if write_cache:
+        torch.npu.synchronize()
+        print(f"indexer cache write lengths={lengths.tolist()}", flush=True)
+        key, key_scale = write_indexer_cache(k8, sk)
+        torch.npu.synchronize()
+        # Use the pre-scatter tensors as the score reference. Check the cache
+        # first, so a scatter failure cannot look like a Top-K selection error.
+        torch.testing.assert_close(
+            key[1:].view(torch.uint8).cpu(), k8[1:].view(torch.uint8).cpu()
+        )
+        torch.testing.assert_close(key_scale[1:].cpu(), sk[1:].cpu(), rtol=0, atol=0)
+        print(
+            f"indexer native call K storage_offset={key.storage_offset()}", flush=True
+        )
     result = torch_npu.npu_quant_lightning_indexer(
         query=q8,
-        key=k8,
+        key=key,
         weights=weights,
         query_dequant_scale=sq,
-        key_dequant_scale=sk,
+        key_dequant_scale=key_scale,
         actual_seq_lengths_query=torch.arange(
             1, rows + 1, dtype=torch.int32, device=device
         ),
@@ -416,7 +456,9 @@ def check_dcp2(data, device, args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("case", choices=("env", "indexer", "qsfa", "dcp", "dcp2"))
+    parser.add_argument(
+        "case", choices=("env", "indexer", "indexer-cache", "qsfa", "dcp", "dcp2")
+    )
     parser.add_argument(
         "--device", type=int, default=int(os.environ.get("LOCAL_RANK", "0"))
     )
@@ -442,6 +484,11 @@ def main():
     with torch.inference_mode():
         if args.case == "indexer":
             check_indexer(device, args.topk_score_atol)
+        elif args.case == "indexer-cache":
+            check_indexer(
+                device, args.topk_score_atol, lengths=(2, 4, 6), write_cache=True
+            )
+            check_indexer(device, args.topk_score_atol, write_cache=True)
         elif args.case == "qsfa":
             check_qsfa(fixture(), device, args)
         elif args.case == "dcp":

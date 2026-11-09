@@ -12,6 +12,10 @@ from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
 )
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
+from sglang.srt.model_executor.runner_utils.prefill_graph import (
+    is_in_prefill_graph_scope,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_npu
 
@@ -299,6 +303,20 @@ class DSANPUIndexerMixin:
             device=k.device, dtype=torch.int32
         )
         if use_quant_indexer:
+            if (
+                use_cp_indexer
+                and not get_is_capture_mode()
+                and not is_in_prefill_graph_scope()
+                and self._should_skip_logits_computation(forward_batch)
+            ):
+                # Short contexts keep every causal key. The FP8 cache writes above
+                # are still needed when later chunks grow beyond index_topk.
+                indices = torch.arange(
+                    self.index_topk, dtype=torch.int32, device=q.device
+                )
+                return torch.where(
+                    indices < actual_seq_lengths_kv[:, None], indices, -1
+                )
             query, query_scale = _quantize_npu_indexer_activation(
                 q, pool.indexer_hadamard_128, pool.dtype
             )
