@@ -8,7 +8,23 @@ import sgl_kernel_npu  # noqa: F401  Registers torch.ops.sgl_kernel_npu.
 import torch
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+
+def load_dcp_fp8_sparse_attention() -> Callable:
+    """Resolve the CANN QSFA V2 binding before DCP graph warmup."""
+    try:
+        import cann_ops_transformer  # noqa: F401  Registers the CANN ops.
+
+        return torch.ops.cann_ops_transformer.kv_quant_sparse_flash_attention
+    except (ImportError, AttributeError) as exc:
+        raise RuntimeError(
+            "Ascend DSA DCP with fp8_e4m3 KV requires CANN "
+            "KvQuantSparseFlashAttentionV2 and its cann_ops_transformer "
+            "PyTorch extension with return_softmax_lse support."
+        ) from exc
 
 
 def forward_dcp_sparse_attention(
@@ -23,6 +39,7 @@ def forward_dcp_sparse_attention(
     forward_batch: ForwardBatch,
     speculative_num_draft_tokens: int | None,
     scaling: float,
+    fp8_attention: Callable | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute one rank's sparse partial attention and natural-log LSE."""
 
@@ -60,12 +77,7 @@ def forward_dcp_sparse_attention(
         actual_seq_lengths_query = actual_seq_lengths_query.to(
             device=q_nope.device, dtype=torch.int32
         )
-    attn_out, softmax_max, softmax_sum = torch.ops.npu.sgl_sparse_flash_attention(
-        query=q_nope,
-        key=k_nope,
-        value=k_nope,
-        query_rope=q_rope,
-        key_rope=k_rope,
+    kwargs = dict(
         sparse_indices=topk_indices,
         scale_value=scaling,
         actual_seq_lengths_query=actual_seq_lengths_query,
@@ -80,5 +92,34 @@ def forward_dcp_sparse_attention(
         attention_mode=2,
         return_softmax_lse=True,
     )
+    if fp8_attention is None:
+        attn_out, softmax_max, softmax_sum = torch.ops.npu.sgl_sparse_flash_attention(
+            query=q_nope,
+            key=k_nope,
+            value=k_nope,
+            query_rope=q_rope,
+            key_rope=k_rope,
+            **kwargs,
+        )
+    else:
+        packed = k_nope.view(torch.float8_e4m3fn)
+        attn_out, softmax_max, softmax_sum = fp8_attention(
+            query=torch.cat((q_nope, q_rope), dim=-1),
+            key=packed,
+            value=packed,
+            key_quant_mode=2,
+            value_quant_mode=2,
+            quant_scale_repo_mode=1,
+            tile_size=128,
+            rope_head_dim=q_rope.shape[-1],
+            **kwargs,
+        )
     lse = softmax_max.float() + torch.log(softmax_sum.float())
-    return attn_out, lse.permute(1, 0, 2).reshape(lse.shape[1], -1)
+    lse = lse.permute(1, 0, 2).reshape(lse.shape[1], -1)
+    if fp8_attention is not None:
+        # Remapping packs valid slots first. An empty local row contributes
+        # zero weight to the cross-rank softmax.
+        empty = topk_indices[..., :1] < 0
+        attn_out = attn_out.masked_fill(empty, 0)
+        lse = lse.masked_fill(empty.squeeze(-1), -torch.inf)
+    return attn_out, lse

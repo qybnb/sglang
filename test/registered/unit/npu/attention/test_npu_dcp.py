@@ -341,6 +341,54 @@ class TestNpuDcpSparseAttentionContract(unittest.TestCase):
                 scaling=1.0,
             )
 
+    def test_packed_fp8_uses_qsfa_v2_for_decode_and_verify(self):
+        q = torch.ones(2, 2, 512, dtype=torch.bfloat16)
+        rope = torch.zeros(2, 2, 64, dtype=torch.bfloat16)
+        packed = torch.zeros(3, 128, 1, 656, dtype=torch.float8_e4m3fn)
+        topk = torch.tensor([[[2, -1]], [[-1, -1]]], dtype=torch.int32)
+        metadata = self._metadata()
+        mock_op = MagicMock(
+            return_value=(q, torch.ones(1, 2, 2), torch.full((1, 2, 2), 2.0))
+        )
+        for verify in (False, True):
+            with self.subTest(verify=verify):
+                out, lse = forward_dcp_sparse_attention(
+                    q_nope=q,
+                    q_rope=rope,
+                    k_nope=packed,
+                    k_rope=packed[..., :0],
+                    topk_indices=topk,
+                    actual_seq_lengths_query=torch.tensor([1, 2]),
+                    forward_metadata=metadata,
+                    forward_batch=SimpleNamespace(forward_mode=_Mode(verify)),
+                    speculative_num_draft_tokens=2 if verify else None,
+                    scaling=1.0,
+                    fp8_attention=mock_op,
+                )
+                call = mock_op.call_args.kwargs
+                self.assertEqual(call["query"].shape, (2, 2, 576))
+                self.assertEqual(call["key"].data_ptr(), packed.data_ptr())
+                self.assertIs(call["key"], call["value"])
+                self.assertIs(call["sparse_indices"], topk)
+                self.assertEqual(call["sparse_mode"], 0)
+                self.assertTrue(call["return_softmax_lse"])
+                self.assertIs(
+                    call["block_table"],
+                    metadata.dcp_spec_block_tables
+                    if verify
+                    else metadata.dcp_block_tables,
+                )
+                self.assertIs(
+                    call["actual_seq_lengths_kv"],
+                    metadata.dcp_spec_seq_lens if verify else metadata.dcp_seq_lens,
+                )
+                self.assertTrue(torch.equal(out[0], q[0]))
+                self.assertTrue(torch.equal(out[1], torch.zeros_like(q[1])))
+                self.assertTrue(
+                    torch.allclose(lse[0], 1 + torch.log(torch.full((2,), 2.0)))
+                )
+                self.assertTrue(torch.isneginf(lse[1]).all())
+
     def test_verify_row_mismatch_fails_before_operator(self):
         q, rope, _, _, topk = self._inputs(2)
         metadata = self._metadata(rows=3)
