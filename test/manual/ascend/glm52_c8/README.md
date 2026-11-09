@@ -65,7 +65,7 @@ python3 "$T/run_model.py" run "${COMMON[@]}" --graph decode --cases \
   base pcp dcp base-nextn-fp8 pcp-nextn-fp8 dcp-nextn-fp8
 ```
 
-脚本依次启动各组，执行短请求、4097-token fresh prefill、追加 257-token 后的 prefix hit，以及长短不同的双请求 batch。检查请求完成、生成长度、有限 logprob、前缀命中、NEXTN verify 次数和 decode graph counter。每组保存 `command.json`、`server.log`、`server_info.json`、`results.json` 和前后两份 Prometheus 指标。某个服务退出后可以用 `--cases` 单独重跑，给同名用例指定新的 `--out-dir`。
+脚本依次启动各组，在当前终端实时打印 SGLang 服务日志，并同步保存到各组的 `server.log`。请求覆盖短请求、4097-token fresh prefill、追加 257-token 后的 prefix hit，以及长短不同的双请求 batch。检查请求完成、生成长度、有限 logprob、前缀命中、NEXTN verify 次数和 decode graph counter。每组还保存 `command.json`、`server_info.json`、`results.json` 和前后两份 Prometheus 指标。某个服务退出后可以用 `--cases` 单独重跑，给同名用例指定新的 `--out-dir`。
 
 默认 `--chunk-size 8192`。要覆盖跨 chunk prefill，把三组放在同一新输出目录用 `--chunk-size 2048` 重跑。如果有 logprob 的请求不进入某个 graph 路径，可对 eager 与 graph 同时使用 `--skip-logprobs` 做 token 对照，并确认 graph counter 增长。
 

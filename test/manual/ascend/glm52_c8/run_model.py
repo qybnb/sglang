@@ -11,6 +11,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -266,6 +267,13 @@ def stop_owned_process_group(proc):
     proc.wait()
 
 
+def stream_server_logs(stream, log):
+    for line in stream:
+        log.write(line)
+        log.flush()
+        print(line, end="", flush=True)
+
+
 def snapshot_graph_counter(url, path):
     metrics = http(f"{url}/metrics", 10, text=True)
     path.write_text(metrics, encoding="utf-8")
@@ -291,6 +299,7 @@ def run_case(args, case, prompts, command, revision):
     )
     env.setdefault("PYTORCH_NPU_ALLOC_CONF", "expandable_segments:True")
     env.setdefault("SGLANG_ENABLE_SPEC_V2", "1")
+    env["PYTHONUNBUFFERED"] = "1"
     log_path = out / "server.log"
     print(f"START {case} {args.graph}, log={log_path}", flush=True)
     with log_path.open("w", encoding="utf-8") as log:
@@ -298,11 +307,17 @@ def run_case(args, case, prompts, command, revision):
             command,
             cwd=ROOT,
             env=env,
-            stdout=log,
+            stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            encoding="utf-8",
+            errors="replace",
             start_new_session=True,
         )
+        log_thread = threading.Thread(
+            target=stream_server_logs, args=(proc.stdout, log)
+        )
         try:
+            log_thread.start()
             info = wait_ready(proc, url, args.startup_timeout, log_path)
             dump(out / "server_info.json", info)
             topology, _, draft = case.partition("-")
@@ -333,6 +348,9 @@ def run_case(args, case, prompts, command, revision):
                 )
         finally:
             stop_owned_process_group(proc)
+            if log_thread.ident is not None:
+                log_thread.join()
+            proc.stdout.close()
 
 
 def compare(args):
