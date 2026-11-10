@@ -85,7 +85,7 @@ def launch_command(args, case):
     else:
         command += ["--cuda-graph-bs-decode", "1", "2", "4", "8"]
     if topology == "pcp":
-        command += ["--enable-prefill-cp", "--cp-strategy", "interleave"]
+        command += ["--enable-prefill-cp", "--cp-strategy", args.cp_strategy]
     if args.diagnose_indexer:
         command += ["--skip-server-warmup"]
     if draft:
@@ -204,7 +204,7 @@ def check_response(name, response, prompt, args, expect_spec):
         )
 
 
-def probe(url, args, prompts, out, *, expect_spec):
+def probe(url, args, prompts, out, *, expect_spec, check_extra=None):
     out.mkdir(parents=True, exist_ok=True)
     results = {}
     for name, prompt in prompts:
@@ -232,6 +232,8 @@ def probe(url, args, prompts, out, *, expect_spec):
         }
         try:
             check_response(name, response, prompt, args, expect_spec)
+            if check_extra is not None:
+                check_extra(name, response)
             results[name]["validated"] = True
         finally:
             dump(out / "results.json", results)
@@ -344,6 +346,8 @@ def run_case(args, case, prompts, command, revision):
                 "dcp_size": args.cp_size if topology == "dcp" else 1,
                 "kv_cache_dtype": args.kv_cache_dtype,
             }
+            if topology == "pcp":
+                expected.update(enable_prefill_cp=True, cp_strategy=args.cp_strategy)
             if draft:
                 expected["speculative_draft_kv_cache_dtype"] = DRAFTS[draft]
             for key, value in expected.items():
@@ -473,6 +477,12 @@ def add_launch_args(parser):
     parser.add_argument("--model", required=True)
     parser.add_argument("--tp", type=int, default=8)
     parser.add_argument("--cp-size", type=int, default=2)
+    parser.add_argument(
+        "--cp-strategy",
+        choices=("interleave", "zigzag"),
+        default="interleave",
+        help="Prefill CP strategy for PCP cases",
+    )
     parser.add_argument("--graph", choices=("eager", "decode"), default="eager")
     parser.add_argument(
         "--kv-cache-dtype", choices=("fp8_e4m3", "bf16"), default="fp8_e4m3"

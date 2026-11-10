@@ -73,6 +73,25 @@ python3 -u "$T/run_model.py" serve "${SERVE[@]}" --case dcp-nextn-fp8
 
 启动日志记录实际捕获的 batch size。发请求后用 `Decode batch ... npu graph: True` 确认该批次命中图。
 
+### Zigzag PCP C8 专项
+
+用上面的 `SERVE` 参数启动一组。用例可选 `pcp`、`pcp-nextn-bf16` 或 `pcp-nextn-fp8`。
+
+```bash
+CASE=pcp-nextn-fp8
+python3 -u "$T/run_model.py" serve "${SERVE[@]}" --case "$CASE" --cp-strategy zigzag
+```
+
+服务 ready 后在另一个终端执行。保持 `CASE` 与服务对应，并在该终端设置 `T` 和 `MODEL`。
+
+```bash
+python3 -u "$T/check_zigzag.py" --case pcp-nextn-fp8 --tokenizer "$MODEL" \
+  --url http://127.0.0.1:31266 --cp-size 2 \
+  --out-dir "$PWD/zigzag-pcp2-$(date +%Y%m%d-%H%M%S)"
+```
+
+客户端先核对服务的 zigzag、PCP size 和 target/draft KV dtype，再验证短请求、4097-token fresh prefill、前缀命中和双请求 batch。NEXTN 用例要求实际发生 verify。每条请求的未缓存 token 至少为 `2 * cp_size`，满足 zigzag 的分片条件。通过时打印 `PASS zigzag`，结果写入 `server_info.json` 和 `results.json`。同一服务重复测时可换一个 `--seed` 避免命中上轮的前缀。
+
 ### 自动冒烟
 
 ```bash
