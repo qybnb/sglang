@@ -515,10 +515,13 @@ def main():
         help="Capture PCP C8 indexer inputs, then compare asynchronous requests",
     )
     add_probe_args(run, require_cache_hit=True)
-    serve = subs.add_parser("serve", help="Launch one A5 server in the foreground")
+    serve = subs.add_parser(
+        "serve",
+        help="Launch one A5 server in the foreground (PCP/DCP NEXTN default to decode graph)",
+    )
     add_launch_args(serve)
     serve.add_argument("--case", choices=CASES, required=True)
-    serve.set_defaults(diagnose_indexer=False)
+    serve.set_defaults(diagnose_indexer=False, graph=None)
     client = subs.add_parser(
         "client", help="Probe an already running worker or PD router"
     )
@@ -536,6 +539,12 @@ def main():
     if args.action == "compare":
         return compare(args)
     if args.action == "serve":
+        if args.graph is None:
+            args.graph = (
+                "decode"
+                if args.case.startswith(("pcp-nextn-", "dcp-nextn-"))
+                else "eager"
+            )
         command = launch_command(args, args.case)
         if args.print_command:
             print(shlex.join(command))

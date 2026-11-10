@@ -55,13 +55,13 @@ python3 -m torch.distributed.run --standalone --nproc-per-node=2 \
 
 ### 前台启动 PCP2 和 DCP2 的 NEXTN 服务
 
-每次选择一条启动命令。四组的 target KV 都是 `fp8_e4m3`，draft 都启用 NEXTN。用例名最后一段选择 draft KV 的 BF16 或 FP8。服务在前台持续运行，切换到下一组前由操作者手动结束当前服务。
+每次选择一条启动命令。四组的 target KV 都是 `fp8_e4m3`，draft 都启用 NEXTN。用例名最后一段选择 draft KV 的 BF16 或 FP8。四组默认开启 Decode NPU Graph，Prefill 用 eager。服务在前台持续运行，切换到下一组前由操作者手动结束当前服务。
 
 ```bash
 MODEL=/models/GLM-5.2-w4a8c8
 export NO_PROXY="127.0.0.1,localhost${NO_PROXY:+,$NO_PROXY}"
 export no_proxy="127.0.0.1,localhost${no_proxy:+,$no_proxy}"
-SERVE=(--model "$MODEL" --tp 8 --cp-size 2 --graph eager
+SERVE=(--model "$MODEL" --tp 8 --cp-size 2 --graph decode
   --kv-cache-dtype fp8_e4m3 --quantization modelslim --port 31266
   --extra-args-json '["--max-total-tokens","16384"]')
 
@@ -70,6 +70,8 @@ python3 -u "$T/run_model.py" serve "${SERVE[@]}" --case pcp-nextn-fp8
 python3 -u "$T/run_model.py" serve "${SERVE[@]}" --case dcp-nextn-bf16
 python3 -u "$T/run_model.py" serve "${SERVE[@]}" --case dcp-nextn-fp8
 ```
+
+启动日志记录实际捕获的 batch size。发请求后用 `Decode batch ... npu graph: True` 确认该批次命中图。
 
 ### 自动冒烟
 
