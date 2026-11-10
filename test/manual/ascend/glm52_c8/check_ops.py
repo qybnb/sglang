@@ -51,7 +51,6 @@ def report_env():
         "torch",
         "torch_npu",
         "sgl_kernel_npu",
-        "cann_ops_transformer",
     ):
         try:
             module = importlib.import_module(name)
@@ -84,11 +83,10 @@ def report_env():
             f"native={getattr(torch.ops.npu, 'npu_quant_lightning_indexer', None)!r}",
             flush=True,
         )
-        namespace = torch.ops.cann_ops_transformer
-        v2 = getattr(namespace, "kv_quant_sparse_flash_attention", None)
-        print(f"QSFA V2 binding: {callable(v2)}", flush=True)
-        if v2 is not None:
-            print(v2.default._schema, flush=True)
+        native = getattr(torch.ops.npu, "sgl_kv_quant_sparse_flash_attention", None)
+        print(f"Native DCP FP8 attention: {callable(native)}", flush=True)
+        if native is not None:
+            print(native.default._schema, flush=True)
     print(
         "The numeric subcommands check whether the operators actually launch.",
         flush=True,
@@ -362,7 +360,7 @@ def dcp_shard(data, rank, device, args, *, verify):
     )
     from sglang.srt.layers.dcp.layout import remap_dcp_sparse_indices
 
-    v2 = load_dcp_fp8_sparse_attention()
+    native = load_dcp_fp8_sparse_attention()
     packed, key, rope = pack_kv(data.latent, data.rope, device)
     selected = [0, *data.page_ids[rank::2]]
     packed_local = (
@@ -406,7 +404,7 @@ def dcp_shard(data, rank, device, args, *, verify):
     stats = []
 
     def capture_stats(**kwargs):
-        out, maxes, sums = v2(**kwargs)
+        out, maxes, sums = native(**kwargs)
         stats.extend((maxes, sums))
         return out, maxes, sums
 
@@ -428,7 +426,7 @@ def dcp_shard(data, rank, device, args, *, verify):
     ref, maxes, sums = attention_reference(data, key, rope, data.page_ids, global_topk)
     ref_lse = maxes + sums.log()
     valid = global_topk[:, 0, 0] >= 0
-    label = f"V2 {'verify' if verify else 'decode'} rank={rank}"
+    label = f"Native FP8 {'verify' if verify else 'decode'} rank={rank}"
     check_close(label + " output", out, ref, atol=args.atol, rtol=args.rtol)
     check_close(
         label + " max",
@@ -465,7 +463,11 @@ def check_dcp(data, device, args):
             -1
         ) + out1.float().cpu() * weight1.unsqueeze(-1)
         check_close(
-            "V2 two-shard CPU merge", merged, full, atol=args.atol, rtol=args.rtol
+            "Native FP8 two-shard CPU merge",
+            merged,
+            full,
+            atol=args.atol,
+            rtol=args.rtol,
         )
 
 

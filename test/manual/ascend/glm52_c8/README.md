@@ -20,7 +20,7 @@ python3 "$T/check_ops.py" env 2>&1 | tee "$R/env.log"
 
 脚本从当前 checkout 导入 SGLang。若需构建或安装 Python 依赖，按所用 NPU 镜像的安装方式准备。运行前按本机可用设备设置 `ASCEND_RT_VISIBLE_DEVICES`。算子脚本的 `--device` 使用进程内可见卡号。
 
-DCP C8 需要 `cann_ops_transformer` 注册的 QSFA V2，算子需能在本容器真正启动。先在 `env.log` 看模块路径和 schema，再由下节的 `dcp` 命令确认运行。PCP C8 所需的两个算子通过 `torch_npu` 调用。
+DCP C8 需要 A5 版本的 `sgl-kernel-npu` 注册 `torch.ops.npu.sgl_kv_quant_sparse_flash_attention`。先在 `env.log` 看模块路径和 schema，再由下节的 `dcp` 命令确认运行。PCP C8 所需的两个算子通过 `torch_npu` 调用。
 
 ## 1. 单算子与两卡合并
 
@@ -38,8 +38,8 @@ python3 -m torch.distributed.run --standalone --nproc-per-node=2 \
 | --- | --- | --- |
 | `indexer` | PCP 形状的本地 Q 和逐行页表，FP8 Index K，独立 Q/K scale，128-token 页，短请求和超过 2048 的请求 | CPU 用解量化后的 Q/K 算分数。检查下标范围、数量、唯一性和 `-1` padding，Top-K 入选下标的分数离参考边界最多 0.05 |
 | `qsfa` | 复用 SGLang 的 656-byte KV packer 和普通 QSFA helper，传 PCP 形状的 metadata，覆盖满 2048 Top-K | 输出与同一份 packed KV 解量化后的 CPU FP32 参考一致 |
-| `dcp` | 在一张卡上串行跑两个 rank 的 QSFA V2，分别走 decode 和 target verify，覆盖跨页边界、空 Top-K、局部 KV 长度为 0 | 分别比较 output、max、sum、LSE。空行严格为 output=0、LSE=-inf。CPU 合并两个 partial 后与全量参考一致 |
-| `dcp2` | 两卡 HCCL，QSFA V2 走 verify 形状，调用生产 DCP merge | 每个 rank 的合并输出与全量参考相应的 head slice 一致 |
+| `dcp` | 在一张卡上串行跑两个 rank 的自有 C8 算子，分别走 decode 和 target verify，覆盖跨页边界、空 Top-K、局部 KV 长度为 0 | 分别比较 output、max、sum、LSE。空行严格为 output=0、LSE=-inf。CPU 合并两个 partial 后与全量参考一致 |
+| `dcp2` | 两卡 HCCL，自有 C8 算子走 verify 形状，调用生产 DCP merge | 每个 rank 的合并输出与全量参考相应的 head slice 一致 |
 
 排查 PCP C8 在 quant indexer 处崩溃时，可单独运行 `ASCEND_LAUNCH_BLOCKING=1 python3 "$T/check_ops.py" indexer-cache`。它无需权重，先用生产 pool 方法 scatter 写入 FP8 K 和 scale，再从第二层的带偏移视图调用 native 算子，分别覆盖全部是短行以及存在超过 2048 token 的行。
 

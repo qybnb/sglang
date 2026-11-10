@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import sgl_kernel_npu  # noqa: F401  Registers torch.ops.sgl_kernel_npu.
+import sgl_kernel_npu  # noqa: F401  Registers torch.ops.npu sparse attention ops.
 import torch
 
 if TYPE_CHECKING:
@@ -14,16 +14,13 @@ if TYPE_CHECKING:
 
 
 def load_dcp_fp8_sparse_attention() -> Callable:
-    """Resolve the CANN QSFA V2 binding before DCP graph warmup."""
+    """Resolve the A5 packed-KV kernel before DCP graph warmup."""
     try:
-        import cann_ops_transformer  # noqa: F401  Registers the CANN ops.
-
-        return torch.ops.cann_ops_transformer.kv_quant_sparse_flash_attention
-    except (ImportError, AttributeError) as exc:
+        return torch.ops.npu.sgl_kv_quant_sparse_flash_attention
+    except AttributeError as exc:
         raise RuntimeError(
-            "Ascend DSA DCP with fp8_e4m3 KV requires CANN "
-            "KvQuantSparseFlashAttentionV2 and its cann_ops_transformer "
-            "PyTorch extension with return_softmax_lse support."
+            "Ascend DSA DCP with fp8_e4m3 KV requires an A5 sgl-kernel-npu "
+            "build with torch.ops.npu.sgl_kv_quant_sparse_flash_attention."
         ) from exc
 
 
@@ -83,14 +80,6 @@ def forward_dcp_sparse_attention(
         actual_seq_lengths_query=actual_seq_lengths_query,
         actual_seq_lengths_kv=local_lens,
         block_table=block_tables,
-        sparse_block_size=1,
-        layout_query="TND",
-        layout_kv="PA_BSND",
-        # Global top-k already enforces causal visibility. Local indices no
-        # longer carry enough information for the kernel's causal sparse mode.
-        sparse_mode=0,
-        attention_mode=2,
-        return_softmax_lse=True,
     )
     if fp8_attention is None:
         attn_out, softmax_max, softmax_sum = torch.ops.npu.sgl_sparse_flash_attention(
@@ -99,19 +88,21 @@ def forward_dcp_sparse_attention(
             value=k_nope,
             query_rope=q_rope,
             key_rope=k_rope,
+            sparse_block_size=1,
+            layout_query="TND",
+            layout_kv="PA_BSND",
+            # Global top-k already enforces causal visibility. Local indices no
+            # longer carry enough information for the kernel's causal sparse mode.
+            sparse_mode=0,
+            attention_mode=2,
+            return_softmax_lse=True,
             **kwargs,
         )
     else:
-        packed = k_nope.view(torch.float8_e4m3fn)
         attn_out, softmax_max, softmax_sum = fp8_attention(
-            query=torch.cat((q_nope, q_rope), dim=-1),
-            key=packed,
-            value=packed,
-            key_quant_mode=2,
-            value_quant_mode=2,
-            quant_scale_repo_mode=1,
-            tile_size=128,
-            rope_head_dim=q_rope.shape[-1],
+            query=q_nope,
+            query_rope=q_rope,
+            packed_kv=k_nope.view(torch.uint8),
             **kwargs,
         )
     lse = softmax_max.float() + torch.log(softmax_sum.float())
